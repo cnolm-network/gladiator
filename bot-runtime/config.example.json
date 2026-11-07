@@ -1,0 +1,26 @@
+{
+  "layer1": {
+    "url": "ws://127.0.0.1:8765",
+    "token": "",
+    "heartbeatSeconds": 10,
+    "reconnect": { "initialMs": 1000, "maxMs": 30000, "factor": 2 }
+  },
+  "layer3": {
+    "host": "127.0.0.1",
+    "port": 8766
+  },
+  "bots": [
+    {
+      "botId": "glad-bot-1",
+      "username": "GladiatorBot1",
+      "host": "127.0.0.1",
+      "port": 25565,
+      "mcVersion": "1.8.8",
+      "auth": "offline"
+    }
+  ],
+  "limits": {
+    "maxActionsPerSecond": 10,
+    "observationHz": 5
+  }
+}

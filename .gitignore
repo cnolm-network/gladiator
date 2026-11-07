@@ -1,0 +1,55 @@
+# ---- Java / Gradle ----
+.gradle/
+build/
+out/
+*.class
+*.jar
+# wrapper 必须入库，否则新机器无法执行 ./gradlew；否定规则要放在 *.jar 之后才生效
+!gradle/wrapper/gradle-wrapper.jar
+!libs/*.jar
+
+# ---- IDE ----
+# 其余 .idea 配置是本机状态，不入库；只共享 Gradle 运行配置（IDE 可直接点 Run）
+.idea/*
+!.idea/runConfigurations/
+*.iml
+*.ipr
+*.iws
+.vs/
+.vscode/
+
+# ---- Node.js (Layer 2) ----
+node_modules/
+bot-runtime/logs/
+npm-debug.log*
+
+# ---- Python (Layer 3) ----
+training/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# ---- 运行时产物 ----
+run/
+*.log
+logs/
+codex.toml
+
+# ---- 平台侧记忆（WorkBuddy 自管，不入库）----
+.workbuddy/memory/
+
+# ---- 本地私有配置 ----
+*.local.json
+.env
+.env.*
+
+# ---- 本地开发服务端（体积大，不入库）----
+server/*.jar
+server/world/
+server/world_nether/
+server/world_the_end/
+server/logs/
+server/plugins/
+server/cache/
+server/eula.txt

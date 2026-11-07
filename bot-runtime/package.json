@@ -1,0 +1,20 @@
+{
+  "name": "gladiator-bot-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Layer 2: mineflayer-based bot runtime for the Gladiator framework",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "probe": "node scripts/probe.js"
+  },
+  "dependencies": {
+    "mineflayer": "^4.39.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "ws": "^8.18.0"
+  }
+}

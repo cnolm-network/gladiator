@@ -1,0 +1,61 @@
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow' version '8.3.5'
+}
+
+group = 'top.cnolm'
+version = '0.1.0'
+// Gradle daemon JVM 由 gradle/gradle-daemon-jvm.properties 固定为 JDK 17；
+// 编译目标由下方 Java 8 toolchain 决定，两者互不干扰。
+description = 'Gladiator — Minecraft 1.8.8 AI bot orchestration & training framework'
+
+// ---------------------------------------------------------------------------
+// 仓库：优先国内镜像，Spigot / EngineHub 只能走官方源
+// ---------------------------------------------------------------------------
+repositories {
+    maven { url = 'https://maven.aliyun.com/repository/public' }
+    maven { url = 'https://hub.spigotmc.org/nexus/content/repositories/snapshots/' }
+    maven { url = 'https://maven.enginehub.org/repo/' }
+    mavenCentral()
+}
+
+// ---------------------------------------------------------------------------
+// 目标平台：Java 8 = Spigot 1.8.9 运行时
+// ---------------------------------------------------------------------------
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(8)
+    }
+}
+
+dependencies {
+    // 1.8.9 没有独立 API 构件，官方发布的是 1.8.8-R0.1-SNAPSHOT（同协议 47）
+    // 排除 net.md-5:bungeecord-chat：其 1.8-SNAPSHOT 父 POM 已从各仓库下线，会导致解析失败。
+    // 编译期用不到该依赖（仅用于 ChatColor/BaseComponent 互转），运行时由服务端自带。
+    compileOnly('org.spigotmc:spigot-api:1.8.8-R0.1-SNAPSHOT') {
+        exclude group: 'net.md-5'
+    }
+
+    // WorldGuard 6.2（legacy 世代，覆盖 1.8.x–1.11）。运行时可选，见 core/guard 的降级桥。
+    // 关闭传递依赖：只取其 API 面，避免拉入整个 WorldEdit 依赖树。
+    compileOnly('com.sk89q.worldguard:worldguard-legacy:6.2') { transitive = false }
+    compileOnly('com.sk89q.worldedit:worldedit-bukkit:6.1.5') { transitive = false }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs << '-Xlint:deprecation'
+}
+
+processResources {
+    filesMatching('plugin.yml') {
+        expand(version: project.version)
+    }
+}
+
+shadowJar {
+    archiveClassifier.set('')
+    // 不重定位：本插件不 shade 任何第三方库，jar 内只有自身类
+}
+
+build.dependsOn shadowJar

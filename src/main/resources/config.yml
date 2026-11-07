@@ -1,0 +1,23 @@
+# Gladiator — Layer 1 配置
+# 说明：所有键都带默认值，缺失不会导致启动失败。
+
+bridge:
+  # 仅监听回环地址。切勿改为 0.0.0.0。
+  host: 127.0.0.1
+  port: 8765
+  # 运行时连接时必须在 HELLO 中携带此 token；留空表示不校验（仅限本机调试）。
+  token: ""
+  # 心跳超时（秒），超时判定会话死亡并回收 BotHandle
+  heartbeat-timeout-seconds: 30
+
+training:
+  # 单 bot 每秒允许的动作数上限，超出丢弃并计数
+  max-actions-per-second: 10
+  # 观测采样频率（Hz）
+  observation-hz: 5
+  # 空闲判定：连续无动作且无对局事件超过该秒数后下发 IDLE
+  idle-after-seconds: 15
+
+worldguard:
+  # 未安装 WorldGuard 时是否允许降级运行（全部判定为允许）
+  allow-degraded: true
