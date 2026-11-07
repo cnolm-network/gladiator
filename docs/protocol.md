@@ -28,7 +28,7 @@
 | `v` | int | 协议主版本，不匹配则握手失败 |
 | `type` | string | 见 §2 / §4 |
 | `seq` | int | 单方向单调递增，从 1 开始；用于去重与乱序检测 |
-| `ts` | int | 发送方毫秒时间戳，仅用于诊断，不参与排序 |
+| `ts` | number (ms) | 发送方毫秒时间戳，仅用于诊断，不参与排序。毫秒值超出 32 位整数范围，实现按 64 位整数处理 |
 | `botId` | string | 会话标识；握手前置空 |
 | `replyTo` | int\|null | 请求-响应配对时填对端 `seq` |
 | `payload` | object | 见下文字段表 |
@@ -42,7 +42,7 @@
 ```json
 { "v":1, "type":"HELLO", "seq":1, "ts":0, "botId":"", "payload":{
   "token":"", "botId":"glad-bot-1", "username":"GladiatorBot1",
-  "mcVersion":"1.8.9", "runtimeVersion":"0.1.0"
+  "mcVersion":"1.8.8", "runtimeVersion":"0.1.0"
 }}
 ```
 

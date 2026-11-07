@@ -5,6 +5,7 @@ import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import top.cnolm.gladiator.GladiatorMain;
 import top.cnolm.gladiator.api.GladiatorAPI;
+import top.cnolm.gladiator.bridge.LinkServer;
 import top.cnolm.gladiator.core.GladiatorServiceImpl;
 
 import java.util.Locale;
@@ -34,6 +35,10 @@ public final class GladiatorCommand implements CommandExecutor {
                             + " games=" + service.getActiveGameCount()
                             + " training=" + service.getActiveTrainingCount());
                 }
+                LinkServer link = plugin.getLinkServer();
+                sender.sendMessage("[Gladiator] link="
+                        + (link == null ? "down" : link.getHost() + ":" + link.getPort())
+                        + " sessions=" + (link == null ? 0 : link.getSessions().size()));
                 return true;
             case "list":
             case "game":

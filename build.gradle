@@ -40,6 +40,17 @@ dependencies {
     // 关闭传递依赖：只取其 API 面，避免拉入整个 WorldEdit 依赖树。
     compileOnly('com.sk89q.worldguard:worldguard-legacy:6.2') { transitive = false }
     compileOnly('com.sk89q.worldedit:worldedit-bukkit:6.1.5') { transitive = false }
+
+    // 链路层单元测试（本地缓存已有这些构件，可离线构建）。
+    // compileOnly 不进入 testCompileClasspath，故 gson 需为测试显式声明。
+    testImplementation 'junit:junit:4.10'
+    testImplementation 'com.google.code.gson:gson:2.2.4'
+}
+
+test {
+    testLogging {
+        events 'passed', 'failed', 'skipped'
+    }
 }
 
 tasks.withType(JavaCompile).configureEach {

@@ -6,7 +6,7 @@
 - 架构：四层解耦（Java 编排 / Node 运行时 / Python 训练 / 策略后端）
 - 定位：**不依赖任何竞技场插件**。由竞技场插件调用 `GladiatorAPI.spawnBot()` 发起 Bot，并在 `GladiatorBotReadyEvent` 后自行完成传送、给予套件等对局"壳子"工作。换竞技场插件只改调用方，不改 Gladiator 源码。
 - 反作弊与环境准备（权限组、区域放行、白名单）属于**调用方 init 阶段**；Gladiator 不检测、不配置、不硬编码任何具体反作弊插件。
-- 现状：M0 完成（对外 API 契约 + 最小可用实现 + 可构建工程）；Bot 真实登录与 WebSocket 通道属于 M1，尚未实现。
+- 现状：M0 完成（对外 API 契约 + 最小可用实现 + 可构建工程）；M1 的**通道 A** 已落地（仅回环的 WebSocket 服务端、HELLO/WELCOME 握手、token 校验、会话心跳，含单元测试与真实 `ws` 互操作冒烟）；**Bot 真实登录**（`spawnBot` / `BotHandle`）尚未接通。
 
 ## 目录
 
@@ -15,12 +15,15 @@
 │  ├─ api/                    ★ 对外契约（唯一可被调用方 import 的包）
 │  │  └─ event/              5 个标准 Bukkit 事件
 │  ├─ core/                  API 实现、状态镜像、指标累加器
+│  ├─ bridge/                通道 A：回环 WebSocket 服务端、信封编解码、会话表
 │  └─ command/               管理命令
 ├─ src/main/resources/        plugin.yml / config.yml
+├─ src/test/java/             链路层单元测试（JUnit 4）
 ├─ gradle/
 │  ├─ wrapper/                Gradle 8.10.2 wrapper
 │  └─ gradle-daemon-jvm.properties   daemon 固定 JDK 17
 ├─ bot-runtime/              Layer 2：mineflayer 运行时（Node ≥22）
+│  └─ scripts/link-smoke.js  通道 A 的真实 ws 客户端冒烟测试
 ├─ training/                 Layer 3：Gymnasium 环境（Python ≥3.10）
 └─ docs/
    ├─ api-contract.md         ★ 对外 API 契约（集成唯一入口）
@@ -39,8 +42,25 @@
 Gradle daemon 的 JVM 由 `gradle/gradle-daemon-jvm.properties` 固定为 **JDK 17**：Gradle 8.10.2 最高只支持到 JDK 23，用 Java 25 会报 `Unsupported class file major version 69`。编译目标由 `build.gradle` 的 **Java 8 toolchain** 决定，与 daemon 版本解耦，无需手动设置 `JAVA_HOME`。
 
 把产物放进服务端 `plugins/` 即可；`WorldGuard` 是可选 softdepend，缺失时规则查询降级。
+`./gradlew build` 会同时运行 `src/test/java` 的链路层单元测试。
 
-### 2. 调用 API
+### 2. 链路自检（通道 A）
+
+插件启用后监听 `127.0.0.1:8765`（`config.yml` → `bridge.port`）；`bridge.token` 非空时，
+运行时必须在 HELLO 中携带相同 token。链路只绑定回环地址，非本机来源直接拒绝。
+
+```bash
+cd bot-runtime && npm install
+node scripts/link-smoke.js --port 8765 --token "<与 config.yml 一致，默认留空>"
+# 成功：PASS: HELLO → WELCOME → PING → PONG
+```
+
+`/gladiator status` 可查看链路端口与已注册会话数。
+
+### 3. 调用 API
+
+> 注：`spawnBot()` 的运行时实现属于 M1 后续任务，当前版本调用会抛
+> `UnsupportedOperationException`；下面是契约约定的调用形态。
 
 ```java
 GladiatorAPI api = GladiatorProvider.get();          // 或 Bukkit ServicesManager
@@ -59,7 +79,7 @@ public void onBotReady(GladiatorBotReadyEvent e) {
 
 完整签名、事件、线程约定与调用方 init 职责见 [`docs/api-contract.md`](docs/api-contract.md)。
 
-### 3. Bot 运行时与训练环境
+### 4. Bot 运行时与训练环境
 
 ```bash
 cd bot-runtime && npm install && node scripts/probe.js

@@ -4,14 +4,16 @@ mineflayer 运行时。职责：真实协议登录、物理运动、方块交互
 
 ## 当前状态
 
-M0：仅依赖与探针可用；`src/` 模块在 M1 建立（G-106 起）。
+M1 起点：`scripts/link-smoke.js` 已可验证 Layer 1 的 WebSocket 链路；
+`src/` 正式模块（connection / actions / scheduler / restriction-cache / navigation / observation / link）仍待建立。
 
 ```
 bot-runtime/
 ├─ package.json
 ├─ config.example.json     配置样例（复制为 config.json 后本地修改，不入库）
 ├─ scripts/probe.js        能力探针（离线 + 真连两种模式）
-└─ src/                    M1 建立：connection / actions / scheduler / restriction-cache / navigation / observation / link
+├─ scripts/link-smoke.js   通道 A 冒烟：HELLO → WELCOME → PING → PONG
+└─ src/                    待建立：connection / actions / scheduler / restriction-cache / navigation / observation / link
 ```
 
 ## 使用
@@ -20,6 +22,9 @@ bot-runtime/
 npm install
 node scripts/probe.js
 node scripts/probe.js --host 127.0.0.1 --port 25565 --user ProbeBot
+
+# 链路冒烟：需插件已启用并监听 127.0.0.1:8765
+node scripts/link-smoke.js --port 8765 --token "与 config.yml bridge.token 一致"
 ```
 
 真连模式会在 30 秒内输出 `login / spawn / position / health / game.version`，用于确认协议层握手与服务端 `online-mode=false` 配置正确。
