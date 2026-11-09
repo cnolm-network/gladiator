@@ -7,10 +7,13 @@ softdepend: [WorldGuard]
 commands:
   gladiator:
     description: Gladiator 管理命令
-    usage: /gladiator <status|list|game|analyze|reload>
+    usage: /gladiator <status|spawn|train|list|game|analyze|pvp|spectate|unspectate|reload>
     aliases: [gl]
     permission: gladiator.admin
 permissions:
   gladiator.admin:
     description: 管理 Gladiator 运行时
+    default: op
+  gladiator.spectate:
+    description: 只读观战 Bot 训练（旁观者模式）
     default: op

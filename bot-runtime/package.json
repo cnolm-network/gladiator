@@ -10,7 +10,8 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "probe": "node scripts/probe.js"
+    "probe": "node scripts/probe.js",
+    "test": "node --test"
   },
   "dependencies": {
     "mineflayer": "^4.39.0",

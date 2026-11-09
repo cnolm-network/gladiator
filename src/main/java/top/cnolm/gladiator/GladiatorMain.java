@@ -3,6 +3,7 @@ package top.cnolm.gladiator;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
+import org.bukkit.entity.Player;
 import org.bukkit.plugin.ServicePriority;
 import org.bukkit.plugin.java.JavaPlugin;
 import top.cnolm.gladiator.api.GladiatorAPI;
@@ -13,7 +14,14 @@ import top.cnolm.gladiator.bridge.LinkHandler;
 import top.cnolm.gladiator.bridge.LinkServer;
 import top.cnolm.gladiator.bridge.SessionRegistry;
 import top.cnolm.gladiator.command.GladiatorCommand;
+import top.cnolm.gladiator.core.BotSpawnService;
+import top.cnolm.gladiator.core.SpectatorService;
 import top.cnolm.gladiator.core.GladiatorServiceImpl;
+import top.cnolm.gladiator.core.PlayerStateListener;
+import top.cnolm.gladiator.core.guard.GuardBridge;
+import top.cnolm.gladiator.core.guard.NoopGuardBridge;
+import top.cnolm.gladiator.core.guard.WorldGuardBridge;
+import top.cnolm.gladiator.core.guard.WorldGuardPvpListener;
 
 import java.io.IOException;
 import java.util.logging.Level;
@@ -31,6 +39,8 @@ public final class GladiatorMain extends JavaPlugin {
 
     private boolean worldGuardPresent;
     private GladiatorServiceImpl service;
+    private BotSpawnService spawnService;
+    private SpectatorService spectatorService;
     private LinkServer linkServer;
 
     @Override
@@ -39,6 +49,21 @@ public final class GladiatorMain extends JavaPlugin {
         worldGuardPresent = detectWorldGuard();
 
         service = new GladiatorServiceImpl(this);
+        GuardBridge guardBridge = worldGuardPresent
+                ? new WorldGuardBridge(getLogger()) : new NoopGuardBridge();
+        service.setGuardBridge(guardBridge);
+        long spawnTimeout = getConfig().getLong("bridge.spawn-timeout-seconds", 30L);
+        spawnService = new BotSpawnService(this, service, spawnTimeout);
+        service.attachSpawner(spawnService);
+        getServer().getPluginManager().registerEvents(spawnService, this);
+        getServer().getPluginManager().registerEvents(new PlayerStateListener(service), this);
+        registerPvpListener();
+
+        // 只读观战：玩家进服后可用 /gladiator spectate 旁观 Bot 训练。
+        spectatorService = new SpectatorService(this, getConfig().getBoolean("spectate.enabled", true));
+        getServer().getPluginManager().registerEvents(
+                new SpectatorService.QuitListener(spectatorService), this);
+
         getServer().getServicesManager()
                 .register(GladiatorAPI.class, service, this, ServicePriority.Normal);
         GladiatorProvider.install(service);
@@ -62,6 +87,16 @@ public final class GladiatorMain extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        // 先还原观战者，避免插件卸载后玩家卡在旁观者模式。
+        if (spectatorService != null) {
+            spectatorService.shutdown();
+            spectatorService = null;
+        }
+        // 再停 spawn：取消超时任务并静默丢弃 pending，避免停服过程中派发 Ready/Failed。
+        if (spawnService != null) {
+            spawnService.shutdown();
+            spawnService = null;
+        }
         if (linkServer != null) {
             linkServer.stop();
             linkServer = null;
@@ -86,6 +121,9 @@ public final class GladiatorMain extends JavaPlugin {
         try {
             server.start();
             linkServer = server;
+            if (spawnService != null) {
+                spawnService.attachLinkServer(server);
+            }
         } catch (IllegalArgumentException e) {
             getLogger().log(Level.SEVERE, "链路配置非法（仅允许回环地址）: " + e.getMessage(), e);
         } catch (IOException e) {
@@ -93,9 +131,37 @@ public final class GladiatorMain extends JavaPlugin {
         }
     }
 
-    /** WorldGuard 以 softdepend 引入，运行时按类存在性判断，避免硬耦合。 */
-    private boolean detectWorldGuard() {
+    /**
+     * 被动 PVP 拒绝通知（G-203）。
+     *
+     * <p>监听 {@code DisallowedPVPEvent} 只用于感知规则，<strong>绝不 setCancelled</strong>：
+     * 该事件可能被其他插件用于放行 PVP，取消会改变外部行为。未装 WorldGuard 时静默跳过。
+     */
+    private void registerPvpListener() {
+        if (!worldGuardPresent) {
+            return;
+        }
         try {
+            WorldGuardPvpListener listener = new WorldGuardPvpListener(
+                    new WorldGuardPvpListener.Sink() {
+                        @Override
+                        public void onPvpDenied(Player attacker, Player defender, String cause) {
+                            GladiatorServiceImpl current = service;
+                            if (current != null) {
+                                current.handlePvpDenied(attacker, defender, cause);
+                            }
+                        }
+                    });
+            getServer().getPluginManager().registerEvents(listener, this);
+            getLogger().info("已注册 DisallowedPVPEvent 监听（只观察，不取消）");
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING,
+                    "DisallowedPVPEvent 监听注册失败，规则感知降级为主动查询: " + t.getMessage(), t);
+        }
+    }
+
+    /** WorldGuard 以 softdepend 引入，运行时按类存在性判断，避免硬耦合。 */
+    private boolean detectWorldGuard() {        try {
             Class.forName("com.sk89q.worldguard.bukkit.WorldGuardPlugin");
             return getServer().getPluginManager().getPlugin("WorldGuard") != null;
         } catch (ClassNotFoundException e) {
@@ -118,6 +184,10 @@ public final class GladiatorMain extends JavaPlugin {
     }
 
     /** 通道 A 链路；未成功监听时为 null。 */
+    public SpectatorService getSpectatorService() {
+        return spectatorService;
+    }
+
     public LinkServer getLinkServer() {
         return linkServer;
     }
@@ -155,17 +225,45 @@ public final class GladiatorMain extends JavaPlugin {
             getLogger().info("[Link] HELLO bot=" + session.getBotId()
                     + " username=" + session.getUsername()
                     + " session=" + session.getSessionId());
+            BotSpawnService spawn = spawnService;
+            if (spawn != null) {
+                spawn.onHello(server, session, hello);
+            }
         }
 
         @Override
         public void onMessage(LinkServer server, SessionRegistry.Session session, Envelope message) {
             // 链路层线程，禁止直接调用 Bukkit API 或 GladiatorAPI（后者要求主线程）。
             getLogger().info("[Link] " + message.type() + " from " + session.getBotId());
+            BotSpawnService spawn = spawnService;
+            if (spawn != null) {
+                spawn.onMessage(server, session, message);
+            }
         }
 
         @Override
         public void onDisconnect(LinkServer server, SessionRegistry.Session session, String reason) {
             getLogger().info("[Link] disconnected bot=" + session.getBotId() + " reason=" + reason);
+            BotSpawnService spawn = spawnService;
+            if (spawn != null) {
+                spawn.onDisconnect(server, session, reason);
+            }
+        }
+
+        @Override
+        public String playerUuid(String username) {
+            BotSpawnService spawn = spawnService;
+            return spawn == null ? null : spawn.playerUuid(username);
+        }
+
+        @Override
+        public void onQueryPvp(LinkServer server, SessionRegistry.Session session, Envelope query) {
+            BotSpawnService spawn = spawnService;
+            if (spawn == null) {
+                super.onQueryPvp(server, session, query);
+                return;
+            }
+            spawn.onQueryPvp(server, session, query);
         }
 
         @Override

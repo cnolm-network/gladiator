@@ -45,6 +45,14 @@ dependencies {
     // compileOnly 不进入 testCompileClasspath，故 gson 需为测试显式声明。
     testImplementation 'junit:junit:4.10'
     testImplementation 'com.google.code.gson:gson:2.2.4'
+    // G-104 起测试会引用 Bukkit 类型（User.asPlayer 返回 Player），只用于编译/类加载，
+    // 运行期无服务端实例也不调用这些 API。
+    testCompileOnly('org.spigotmc:spigot-api:1.8.8-R0.1-SNAPSHOT') {
+        exclude group: 'net.md-5'
+    }
+    testRuntimeOnly('org.spigotmc:spigot-api:1.8.8-R0.1-SNAPSHOT') {
+        exclude group: 'net.md-5'
+    }
 }
 
 test {
@@ -70,3 +78,83 @@ shadowJar {
 }
 
 build.dependsOn shadowJar
+
+// ---------------------------------------------------------------------------
+// G-108 零绑定门禁：Gladiator 必须能脱离任何竞技场/反作弊插件独立部署。
+//
+// 不用黑名单罗列第三方插件名（那等于把它们写进本仓库），而是用**白名单**：
+// 源码只允许 import 标准库、Bukkit/Spigot API、WorldGuard API、Gson 与自身包；
+// plugin.yml 的 depend/softdepend 只允许 WorldGuard；主类必须在本插件包内。
+// 任何对竞技场插件或反作弊插件的新依赖都会在 `check` 阶段失败。
+// ---------------------------------------------------------------------------
+def STANDALONE_ALLOWED_PACKAGES = ['java', 'javax', 'org.bukkit', 'org.spigotmc',
+                                   'com.sk89q', 'com.google', 'top.cnolm.gladiator'] as Set
+def STANDALONE_ALLOWED_PLUGIN_DEPS = ['WorldGuard'] as Set
+
+tasks.register('verifyStandalone') {
+    group = 'verification'
+    description = '校验 Gladiator 未绑定竞技场/反作弊插件（G-108 零绑定门禁）'
+
+    def javaDir = layout.projectDirectory.dir('src/main/java').asFile
+    def pluginYml = layout.projectDirectory.file('src/main/resources/plugin.yml').asFile
+    inputs.dir(javaDir)
+    inputs.file(pluginYml).optional()
+
+    doLast {
+        def violations = []
+
+        // 1) import 白名单（含 static import）
+        def importPattern = ~/^\s*import\s+(?:static\s+)?([A-Za-z_][\w.]*)/
+        fileTree(javaDir).matching { include '**/*.java' }.each { f ->
+            f.eachLine { line ->
+                def m = importPattern.matcher(line)
+                if (m.find()) {
+                    def fqn = m.group(1)
+                    def allowed = STANDALONE_ALLOWED_PACKAGES.any { pkg ->
+                        fqn == pkg || fqn.startsWith(pkg + '.')
+                    }
+                    if (!allowed) {
+                        violations << "${javaDir.toPath().relativize(f.toPath())}: 禁止的 import ${fqn}"
+                    }
+                }
+            }
+        }
+
+        // 2) plugin.yml 的 depend / softdepend 白名单
+        if (pluginYml.exists()) {
+            def depPattern = ~/^\s*(softdepend|depend)\s*:\s*(.*)$/
+            pluginYml.eachLine { line ->
+                def m = depPattern.matcher(line)
+                if (m.find()) {
+                    def raw = m.group(2).replace('[', ' ').replace(']', ' ')
+                    raw.split(',').each { dep ->
+                        def name = dep.trim()
+                        if (name && !STANDALONE_ALLOWED_PLUGIN_DEPS.contains(name)) {
+                            violations << "plugin.yml ${m.group(1)} 出现非白名单插件：${name}"
+                        }
+                    }
+                }
+            }
+
+            // 3) 主类必须在本插件包内，防止被换成外部插件的入口
+            def mainPattern = ~/^\s*main\s*:\s*(\S+)/
+            def mainClass = null
+            pluginYml.eachLine { line ->
+                def m = mainPattern.matcher(line)
+                if (m.find()) {
+                    mainClass = m.group(1).trim()
+                }
+            }
+            if (mainClass == null || !mainClass.startsWith('top.cnolm.gladiator.')) {
+                violations << "plugin.yml main 不在 top.cnolm.gladiator 包内：${mainClass}"
+            }
+        }
+
+        if (!violations.isEmpty()) {
+            throw new GradleException('零绑定门禁失败：\n  ' + violations.join('\n  '))
+        }
+        logger.lifecycle('verifyStandalone: PASS（import 白名单 / plugin.yml 依赖 / 主类包名）')
+    }
+}
+
+check.dependsOn verifyStandalone

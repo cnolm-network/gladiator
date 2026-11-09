@@ -1,0 +1,16 @@
+name: CallerSample
+version: 0.1.0
+main: top.cnolm.sample.CallerSamplePlugin
+author: cnolm
+description: Gladiator 示例调用方（独立插件，G-506 验收用）
+depend: [Gladiator]
+softdepend: [BetterNameTag]
+commands:
+  caller:
+    description: 示例调用方控制台
+    usage: /caller <arena|duel|reset|info|tag|reloadtags> ...
+    permission: callersample.admin
+permissions:
+  callersample.admin:
+    description: 允许使用示例调用方命令
+    default: op

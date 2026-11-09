@@ -54,6 +54,11 @@
 
 **关键**：Gladiator 不碰 `Player` 的传送、背包、GameMode；调用方在 `BotReadyEvent` 之后自己做。
 
+**方块与 PVP 放行（G-208）**：WorldGuard / 领地插件 / 反作弊常会拦截 Bot 的放置、破坏与攻击。这些拦截属于**调用方环境准备**：
+请在调用方 `init`（或 Ready 事件）里让 Bot 通过区域/权限/白名单的放行检查，例如把 Bot 加入区域成员、
+给予对应权限节点或调整服务端规则。**Gladiator 不注册任何方块/PVP 放行或取消监听器**，也不会替你修改外部插件的配置。
+如果 Bot 的动作被外部插件拒绝，Gladiator 只能通过 STAT 观测/`ACTION_RESULT` 体现，具体放行必须由调用方完成。
+
 ---
 
 ## 3. API 包（`top.cnolm.gladiator.api`）
@@ -62,7 +67,9 @@
 > （接口、枚举、不可变值类型）与 G-007 的 5 个事件；实现时只做追加，不得变更已有签名。
 > **G-008 已提供实现类** `core/GladiatorServiceImpl` 并在 `onEnable()` 注册到 `ServicesManager`，
 > 因此插件 enable 后 `GladiatorProvider.get()` 返回非 null；未 enable 时仍返回 null，调用方必须判空。
-> `spawnBot()` 目前显式抛 `UnsupportedOperationException`（真实登录属 G-107），其余方法已可用。
+> `spawnBot()` 已在 G-107 接线：立即返回 `BotRequest(PENDING)`，真实登录由外部 mineflayer
+> 运行时完成，成功后在主线程派发 `GladiatorBotReadyEvent`，失败派发 `GladiatorBotFailedEvent`；
+> 详见 §10 与 `docs/protocol.md` §2.10。
 
 ### 3.1 值类型
 
@@ -155,16 +162,56 @@ public interface GladiatorAPI {
     void eliminate(User user);
 
     UserState stateOf(User user);
+
+    /** api 1.1.0：坐标处的 PVP 是否允许（等价于 queryPvp(...).isAllowed()） */
+    boolean isPvpAllowed(Location location, User user);
+
+    /** api 1.1.0：带来源与区域信息的判定；永不返回 null */
+    PvpVerdict queryPvp(Location location, User user);
+}
+```
+
+**规则查询语义（G-204）**：`queryPvp` 只读区域配置，**绝不修改区域、绝不取消任何事件**。
+`PvpVerdict.source` 取值 `FLAG`（区域里显式配置了 PVP flag）/ `GLOBAL`（无显式 flag，按全局）/ `DEGRADED`（未装 WorldGuard，一律 allow）/ `UNKNOWN`（坐标或世界不可用）。
+`regionIds` 为命中区域 id（可能多个），`box` 为这些区域的并集包围盒（可能为 null）。未装 WorldGuard 时首次查询会打印一次降级说明（G-205）。
+
+```java
+public final class PvpVerdict {
+    public boolean isAllowed();
+    public List<String> getRegionIds();
+    public Source getSource();   // FLAG / GLOBAL / DEGRADED / UNKNOWN
+    public Box getBox();         // minX/minY/minZ/maxX/maxY/maxZ
 }
 ```
 
 ### 3.5 辅助类型
+
+> **单 Bot 手感（G-507）**：`BotProfile` 只描述运行时的手感与模型标识，不参与规则判定，也不改变 Gladiator 的状态机。
+> 约束：`cps ∈ (0,100]`、`cpsJitter ∈ [0,cps)`、`reactionMs ≥ 0`、`reach ∈ (0,6]`；非法值在构造时抛异常，运行时会逐字段回落默认值。
+> `/gladiator spawn <username> cps=17 jitter=3 reaction=180 rjitter=30 reach=4.2 model=aggressive` 是等价的管理命令写法。
+
 
 ```java
 public final class BotSpec {
     private final String username;      // 合法 MC 用户名，建议统一前缀
     private final String group;         // 不透明元数据：调用方自行解释（权限组名等），Gladiator 不应用权限
     private final Map<String,String> metadata;  // 调用方自定义，不参与规则
+    private final BotProfile profile;   // G-507：该 Bot 的手感配置，默认 BotProfile.defaults()
+}
+
+public final class BotProfile {
+    public static final double DEFAULT_CPS = 15.0;              // 每秒点击数
+    public static final double DEFAULT_CPS_JITTER = 2.0;        // 点击间隔抖动
+    public static final double DEFAULT_REACTION_MS = 220.0;     // 反应延时
+    public static final double DEFAULT_REACTION_JITTER_MS = 40.0;
+    public static final double DEFAULT_REACH = 3.99;            // 原版攻击距离（格）
+    public static final String DEFAULT_MODEL = "default";       // 训练模型标识
+
+    public static BotProfile defaults();
+    public static BotProfile of(double cps, double cpsJitter,
+                                double reactionMs, double reactionJitterMs,
+                                double reach, String model);
+    public static Builder builder();
 }
 
 public final class BotRequest {
@@ -322,8 +369,26 @@ public void initArenaEnvironment() {
 1. 不出现 `Intave` / `intave.bypass` / 任何反作弊插件名或权限节点（文档中的示例说明除外）。
 2. 不在 `config.yml` 中提供反作弊开关或豁免配置。
 3. 不在 `spawnBot` / `BotReadyEvent` 中修改权限、组、白名单。
-4. 相应验收项：`G-009` 的零依赖门禁扩展为"零环境绑定检查"（源码 grep 反作弊名/权限节点）。
+4. 相应验收项：`G-009` / `G-108` 的零依赖门禁扩展为"零环境绑定检查"，已落地为 Gradle 任务
+   `verifyStandalone`（`gradlew check` 会先跑它，见 `build.gradle`）。
+   门禁**故意不用黑名单罗列第三方插件名**（那等于把名字写进本仓库），而是用白名单：
+   - `src/main/java` 的 `import` 只允许 `java` / `javax` / `org.bukkit` / `org.spigotmc` /
+     `com.sk89q`（WorldGuard API）/ `com.google`（Gson）/ `top.cnolm.gladiator`；
+   - `plugin.yml` 的 `depend` / `softdepend` 只允许 `WorldGuard`；
+   - `plugin.yml` 的 `main` 必须位于 `top.cnolm.gladiator` 包内。
+   任何对竞技场插件、反作弊插件或其它服务端插件的新依赖都会让 `check` 失败。
 5. `A7` 不再是 Gladiator 的验收项；改为由调用方在各自环境自行验证豁免是否生效。
+6. 门禁只能证明"没有**静态**绑定"；运行期是否真的不需要某个插件，要靠
+   `plugin.yml` 依赖白名单 + 真实无插件服务端启动验证（`G-003` 的服务器矩阵）。
+
+### 8.4 调用方统计隔离（G-505）
+
+Gladiator 不提供全局战绩/榜单，但 Bot 同样是 `User`，很容易被调用方已有的统计逻辑一把捞进去。
+调用方在写统计、排行榜、赛季积分前**必须**判 `user.isBot()` 并跳过，否则训练数据会污染真人榜单。
+
+示例见 `src/main/java/top/cnolm/gladiator/example/StatsBoard.java`（`recordWin(User)` 对 Bot 直接返回
+`false`），单测 `StatsBoardTest` 覆盖"Bot 不计入 / null 不计入 / 真人正常排名"。
+
 
 ---
 
@@ -376,10 +441,59 @@ public void initArenaEnvironment() {
 - `endSession(sessionId, reason)` / `registerBot` / `unregisterBot` 是 M1 内部钩子，
   不属于 `GladiatorAPI` 接口，调用方不得依赖。
 
-**仍未实现**（M1）：`spawnBot()` 真实登录与 `GladiatorBotReadyEvent` 派发（G-107）、
-`BotHandle` / WS 通道 / 心跳（G-101~G-106）。`spawnBot()` 现阶段直接抛
-`UnsupportedOperationException`，不返回假的 PENDING 票据、不伪造 Player。
+### G-104 / G-105 / G-107 追加：BotHandle、会话登记与 spawnBot（2026-11-07）
 
-**验证**：IntelliJ MCP `execute_run_configuration("cbot-gladiator [build]")` → BUILD SUCCESSFUL；
-`build_project(rebuild=true)` → `isSuccess:true, problems:[]`；`get_file_problems` 仅风格类 WARNING；
+| 项 | 落地位置 | 状态 |
+|---|---|---|
+| `Bot` 代理 | `core/BotHandle.java` | ✅ `implements Bot`，Player 操作全部委托真实 `CraftPlayer`；未绑定时 UUID 退化为离线 UUID（与 `OfflinePlayer:` 算法一致），`asPlayer()` 为 null |
+| Bot 三向索引 | `core/BotRegistry.java` | ✅ botId / UUID / username；`botIdFor(username) = "glad-" + lowercase`，两端统一 |
+| 会话登记 | `core/GameRegistry.java` | ✅ 只登记 sessionId/参与者/开始时间；不传送、不发套件、不判胜负（G-105） |
+| spawn 编排 | `core/BotSpawnService.java` | ✅ pending → HELLO 下发 SPAWN → PlayerJoin 绑定 → 主线程 `GladiatorBotReadyEvent`；超时/SPAWN_FAILED/链路断开 → `GladiatorBotFailedEvent` |
+| `spawnBot()` | `GladiatorServiceImpl` | ✅ 主线程校验后委托 spawn 服务并立即返回 `BotRequest`；未接线时抛 `IllegalStateException` |
+| WELCOME.playerUuid | `bridge/LinkServer` + `LinkHandler.playerUuid` | ✅ 已绑定时填真实 UUID，未生成时为空串（G-103 收尾） |
+| 事件时序 | `BotSpawnService.bind()` | ✅ Ready 在玩家 join 的 MONITOR 阶段、主线程派发；此时 `bot.asPlayer().isOnline()` 为 true |
+
+**行为约定**：
+- `pushPlace(Bot)` 要求 `bot.isReady()`，否则抛 `IllegalStateException`（必须等 Ready 事件）。
+- 同一用户名重复 `spawnBot` 时：已就绪或正在发起均抛 `IllegalStateException`。
+- 链路断开不会回收已绑定的 BotHandle（mineflayer 进程可能仍在）；进程真死时 MC 断线，
+  `PlayerQuitEvent` 负责 `unregisterBot` 与 `BotHandle.unbind()`。
+- 超时时间由 `bridge.spawn-timeout-seconds`（默认 30）控制，失败 reason 以 `TIMEOUT:` 开头。
+- 运行时断线重连由 `bot-runtime/src/connection.js` 指数退避（1s→2s→…→30s，抖动 ±20%），
+  重连后必须重新 HELLO。
+
+**仍未实现（M1 剩余）**：动作执行/观测面（G-108 之后的 M2）、`/gladiator list|game|analyze`（M3）、
+WorldGuard 规则桥实际判定（M2）。`spawnBot()` 不再抛 `UnsupportedOperationException`。
+
+**验证**：`.\gradlew.bat test --offline` → 20 tests PASSED（LinkServer 9 + BotRegistry 6 + GameRegistry 4 + 1 汇总）；
+`node --test`（bot-runtime）→ 12 tests PASSED；`.\gradlew.bat clean build --offline` → BUILD SUCCESSFUL；
 Java 8 toolchain 编译；产物 bytecode 52。
+
+### M2 / M3 追加：规则感知、状态机与训练编排（2026-11-07，api 1.1.0）
+
+| 项 | 落地位置 | 状态 |
+|---|---|---|
+| PVP 判定值类型 | `api/PvpVerdict.java` | ✅ `allowed` / `regionIds` / `source{FLAG,GLOBAL,DEGRADED,UNKNOWN}` / `box`（不可变） |
+| 主动规则查询 | `GladiatorAPI#isPvpAllowed` / `#queryPvp` | ✅ api 1.1.0 纯增量；未装 WG 时 `DEGRADED` 且日志明示一次 |
+| WorldGuard 桥接 | `core/guard/WorldGuardBridge.java` | ✅ 只读；`getApplicableRegions(Location)` 因 `worldedit-core` 不在编译类路径而走反射，区域 id / PVP flag / 包围盒均反射读取 |
+| 无 WG 降级 | `core/guard/NoopGuardBridge.java` | ✅ `describe()=noop`，`isAvailable()=false` |
+| 被动规则拒绝 | `core/guard/WorldGuardPvpListener.java` | ✅ MONITOR 优先级，只观察；**不调用 `setCancelled`/`setCancelled(false)`**（ADR-015、AGENTS.md） |
+| 状态机 | `core/UserStateMachine.java` + `core/PlayerStateListener.java` | ✅ UUID→UserState 唯一存储；`PlayerDeathEvent`→DEAD、`PlayerRespawnEvent`→RESPAWNING→ALIVE、`eliminate()`/`Mode.allowsRespawn=false`→ELIMINATED |
+| 状态事件 | `GladiatorServiceImpl.transition(user,to,reason)` | ✅ 唯一写入点；先下发 SPAWN 通道 STATE 帧，再派发 `GladiatorStateChangedEvent`（from==to 不发） |
+| 指标快照 | `core/AnalyzeService.java` | ✅ 组合存活时长与 `SessionCounters`；计数器自带锁，可在任意线程采样（当前 `analyze()` 主线程同步调用） |
+| 管理命令 | `command/GladiatorCommand.java` | ✅ `list` / `game` / `analyze [session] [window]` / `reload` / `spawn <name>` / `train <name>` / `pvp <x> <y> <z>` / `spectate [bot]` / `unspectate` / `status` |
+| 参考实现 | `example/DeathmatchMode.java`、`example/MockArenaCaller.java` | ✅ 只 import Bukkit + `api` 包；演示 Ready 里传送后 `pushGame`，不含任何竞技场插件类型 |
+
+**行为约定（M2/M3）**：
+- 方块放置/破坏、伤害、聊天等事件只读：Gladiator **不注册任何放行/取消逻辑**；服务器保护（WorldGuard、领地插件等）
+  的放行由调用方在自己的 `init` 里完成（G-208）。请把「放行 Bot 的方块与 PVP」视为调用方环境准备的一部分。
+- 伤害统计会忽略 `<= 0`、非有限值或 `> 1000` 的伤害（虚空/`/kill` 之类哨兵值会让指标失真）。
+- `analyze()` 的 `aliveSeconds`：有活动会话取会话开始时间，否则退化为 Bot Ready 时间；`windowSeconds` 会裁剪上限。
+- 取消伤害/方块事件的插件不受影响：Gladiator 全部监听器使用 MONITOR 且从不取消。
+
+**仍未实现（M4 起）**：Gymnasium 环境（`GladiatorEnv.reset/step/close`）、RESET 指令的 Layer 3 侧闭环、
+服务器矩阵与观测 schema 文档收尾（G-003 / G-004）。
+
+**验证**：`.\gradlew.bat test --offline` → 33 PASSED（LinkServer 9 / BotRegistry 7 / GameRegistry 4 /
+PvpVerdict 5 / UserStateMachine 5 / AnalyzeService 3）；`node --test`（bot-runtime）→ 45 PASSED；
+`.\gradlew.bat clean build --offline` → BUILD SUCCESSFUL；真实 Paper 1.8.8 + mineflayer + 通道 B 端到端联调通过。

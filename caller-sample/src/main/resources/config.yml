@@ -1,0 +1,17 @@
+# CallerSample 的 Bot 名字标签（G-619）
+#
+# 键 = 角色名，值 = 前缀（支持 & 颜色码，自动转成 §）。
+# 训练环境调用 `/caller tag <player> <role>`，role 来自：
+#   - 被训练方：BotConfig.role（默认 trained）
+#   - 代码驱动方：对手策略名（rusher / aimbot / scripted / wander / random / idle）
+# 想给某个脚本或模型单独配色时，在这里加一行即可，例如：
+#   my_script: "&5&o[MyScript] "
+# 改完执行 `/caller reloadtags` 生效，不需要重启服务器。
+tags:
+  trained: "&c&o[训练] "
+  rusher: "&6&o[Rush] "
+  aimbot: "&b&o[Aim] "
+  scripted: "&a&o[Script] "
+  wander: "&e&o[Wander] "
+  random: "&d&o[Random] "
+  idle: "&7&o[Idle] "

@@ -19,8 +19,9 @@ public final class BotSpec {
     private final String username;
     private final String group;
     private final Map<String, String> metadata;
+    private final BotProfile profile;
 
-    private BotSpec(String username, String group, Map<String, String> metadata) {
+    private BotSpec(String username, String group, Map<String, String> metadata, BotProfile profile) {
         Objects.requireNonNull(username, "username");
         if (!NAME.matcher(username).matches()) {
             throw new IllegalArgumentException("Invalid bot username: " + username);
@@ -32,14 +33,25 @@ public final class BotSpec {
             copy.putAll(metadata);
         }
         this.metadata = Collections.unmodifiableMap(copy);
+        this.profile = profile == null ? BotProfile.defaults() : profile;
     }
 
     public static BotSpec of(String username, String group) {
-        return new BotSpec(username, group, null);
+        return new BotSpec(username, group, null, null);
     }
 
     public static BotSpec of(String username, String group, Map<String, String> metadata) {
-        return new BotSpec(username, group, metadata);
+        return new BotSpec(username, group, metadata, null);
+    }
+
+    /**
+     * 带行为配置的规格（G-507）。
+     *
+     * @param profile 每个 Bot 独立的 CPS / 反应延时 / 攻击距离 / 模型标签；null 取默认值
+     */
+    public static BotSpec of(String username, String group, Map<String, String> metadata,
+                             BotProfile profile) {
+        return new BotSpec(username, group, metadata, profile);
     }
 
     public String getUsername() {
@@ -52,5 +64,10 @@ public final class BotSpec {
 
     public Map<String, String> getMetadata() {
         return metadata;
+    }
+
+    /** 该 Bot 的行为配置，永不为 null。 */
+    public BotProfile getProfile() {
+        return profile;
     }
 }

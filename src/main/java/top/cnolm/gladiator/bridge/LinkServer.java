@@ -163,6 +163,19 @@ public final class LinkServer {
         return write(session, Envelope.of(type, outboundSeq.incrementAndGet(), botId, replyTo, payload));
     }
 
+    /**
+     * 直接向某个会话发送出站报文（G-107：SPAWN / BOT_BOUND 不依赖 botId 反查，
+     * 因为会话可能尚未进入 {@link SessionRegistry} 的正常索引路径或已被替换）。
+     */
+    public boolean send(SessionRegistry.Session session, String type, JsonObject payload,
+                        Long replyTo) {
+        if (session == null) {
+            return false;
+        }
+        return write(session, Envelope.of(type, outboundSeq.incrementAndGet(),
+                session.getBotId(), replyTo, payload));
+    }
+
     private boolean write(SessionRegistry.Session session, Envelope envelope) {
         try {
             session.connection().sendText(envelope.toJson());
@@ -247,6 +260,9 @@ public final class LinkServer {
                     } else if (session == null) {
                         reject(connection, "SESSION_UNKNOWN", "HELLO required before " + type);
                         break;
+                    } else if ("QUERY_PVP".equals(type)) {
+                        session.touch();
+                        handler.onQueryPvp(LinkServer.this, session, envelope);
                     } else {
                         session.touch();
                         handler.onMessage(LinkServer.this, session, envelope);
@@ -306,8 +322,10 @@ public final class LinkServer {
 
         JsonObject payload = new JsonObject();
         payload.addProperty("sessionId", session.getSessionId());
-        // G-103 之后由 BotHandle 绑定真实 Player UUID；当前为空表示玩家实体尚未就绪。
-        payload.addProperty("playerUuid", "");
+        // G-103/G-104：已绑定 BotHandle 时为真实 Player UUID；玩家实体尚未生成时为空串，
+        // 运行时需以此判断是否需要等待/重试（见 protocol.md §2.2）。
+        String playerUuid = handler.playerUuid(username);
+        payload.addProperty("playerUuid", playerUuid == null ? "" : playerUuid);
         payload.addProperty("serverVersion", "unknown");
         JsonArray features = new JsonArray();
         features.add(new JsonPrimitive("state.machine"));

@@ -9,6 +9,8 @@ bridge:
   token: ""
   # 心跳超时（秒），超时判定会话死亡并回收 BotHandle
   heartbeat-timeout-seconds: 30
+  # spawnBot 后等待运行时登录完成的最长秒数；超时派发 GladiatorBotFailedEvent(TIMEOUT)
+  spawn-timeout-seconds: 30
 
 training:
   # 单 bot 每秒允许的动作数上限，超出丢弃并计数
@@ -21,3 +23,8 @@ training:
 worldguard:
   # 未安装 WorldGuard 时是否允许降级运行（全部判定为允许）
   allow-degraded: true
+
+# 只读观战：玩家可用 /gladiator spectate [bot] 切旁观者模式观看 Bot 训练。
+# 观战者无法攻击/破坏方块；训练环境只把参赛 Bot 当目标，不会追观战者。
+spectate:
+  enabled: true

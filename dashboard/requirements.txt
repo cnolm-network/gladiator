@@ -1,0 +1,2 @@
+# 本 Dashboard 只使用 Python 3 标准库，无第三方依赖。
+# 训练任务使用 training/.venv 中已安装的 gymnasium 等依赖，不需要在此重复安装。

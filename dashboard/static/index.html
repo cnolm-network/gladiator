@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gladiator Dashboard · MC 1.8.9 Bot 训练控制台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">⚔</div>
+      <div>
+        <div class="brand-title">Gladiator Dashboard</div>
+        <div class="brand-sub">Minecraft 1.8.9 · Bot 训练控制台</div>
+      </div>
+    </div>
+    <div class="top-status" id="top-status"></div>
+    <div class="top-actions">
+      <button class="btn ghost" id="btn-refresh" type="button">刷新</button>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="overview" type="button">总览</button>
+    <button class="tab" data-tab="server" type="button">服务管理</button>
+    <button class="tab" data-tab="runtime" type="button">运行时</button>
+    <button class="tab" data-tab="training" type="button">训练计划</button>
+    <button class="tab" data-tab="match" type="button">人机对战</button>
+    <button class="tab" data-tab="models" type="button">模型</button>
+    <button class="tab" data-tab="data" type="button">数据可视化</button>
+    <button class="tab" data-tab="terminal" type="button">实时终端</button>
+  </nav>
+
+  <main>
+    <!-- 总览 -->
+    <section class="panel active" id="panel-overview">
+      <div class="grid cards" id="overview-cards"></div>
+      <div class="two-col">
+        <div class="card join-card">
+          <div class="card-head">
+            <h2>进服地址</h2>
+            <span class="pill neutral">1.8.9 · offline</span>
+          </div>
+          <div class="address" id="overview-address">127.0.0.1:25566</div>
+          <p class="muted">使用 Minecraft 1.8.9 客户端，直接连接上面的地址；服务器为离线模式（任意用户名）。</p>
+          <div class="command-row">
+            <code id="overview-spectate">/gladiator spectate &lt;bot&gt;</code>
+            <button class="btn tiny ghost" data-copy="#overview-spectate" type="button">复制</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>快捷操作</h2></div>
+          <div class="quick-actions">
+            <button class="btn primary" id="btn-quick-server" type="button">启动 Paper 服务器</button>
+            <button class="btn" data-goto="match" type="button">打开人机对战</button>
+            <button class="btn" data-goto="training" type="button">配置训练计划</button>
+            <button class="btn" data-goto="data" type="button">查看训练数据</button>
+          </div>
+          <p class="muted small">提示：训练与对战需要先启动服务器，再由 Dashboard 拉起 bot-runtime。</p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>最近服务器日志</h2><span class="muted small" id="overview-log-path"></span></div>
+        <pre class="log" id="overview-log">尚未连接服务器。</pre>
+      </div>
+    </section>
+
+    <!-- 服务管理 -->
+    <section class="panel" id="panel-server">
+      <div class="section-head">
+        <div><h2>Paper 服务端</h2><p class="muted small">进程、端口、gladiator status 与 TPS 实时状态。</p></div>
+        <div class="actions">
+          <button class="btn primary" id="btn-server-start" type="button">启动服务器</button>
+          <button class="btn danger" id="btn-server-stop" type="button">停止服务器</button>
+        </div>
+      </div>
+      <div class="grid cards" id="server-cards"></div>
+      <div class="two-col">
+        <div class="card"><div class="card-head"><h3>插件 / 端口</h3></div><div id="server-details"></div></div>
+        <div class="card"><div class="card-head"><h3>堆内存</h3></div><div id="server-heap"></div></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>控制台</h3><span class="muted small" id="server-log-path"></span></div>
+        <form class="inline-form" id="console-form">
+          <input id="console-line" autocomplete="off" placeholder="输入命令（不含斜杠），例如：say 准备开战">
+          <button class="btn" type="submit">发送</button>
+        </form>
+        <pre class="log tall" id="server-log">未启动由 Dashboard 托管的服务器。</pre>
+      </div>
+    </section>
+
+    <!-- 运行时 -->
+    <section class="panel" id="panel-runtime">
+      <div class="section-head">
+        <div><h2>Bot 运行时</h2><p class="muted small">每个 Bot 一个 node 进程，通道 B 端口默认从 8770 起；外部启动的同范围进程会被只读识别。</p></div>
+        <div class="actions"><button class="btn danger" id="btn-runtime-stop-all" type="button">停止所有 Bot</button></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>启动运行时</h3></div>
+        <form class="inline-form" id="runtime-form">
+          <label class="field inline"><span>用户名</span><input id="runtime-username" value="Glad_Bot_1" autocomplete="off"></label>
+          <label class="field inline"><span>通道 B 端口</span><input id="runtime-port" type="number" min="1024" max="65535" value="8770"></label>
+          <button class="btn primary" type="submit">启动</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>进程列表</h3><span class="muted small" id="runtime-count"></span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>用户名</th><th>通道 B</th><th>状态</th><th>PID</th><th>运行时长</th><th>监听</th><th>操作</th></tr></thead>
+            <tbody id="runtime-body"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="runtime-empty">还没有由 Dashboard 启动的运行时。</div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>运行日志</h3><span class="muted small" id="runtime-log-title">点击上方「日志」查看</span></div>
+        <pre class="log tall" id="runtime-log">—</pre>
+      </div>
+    </section>
+
+    <!-- 训练计划 -->
+    <section class="panel" id="panel-training">
+      <div class="section-head">
+        <div><h2>训练计划</h2><p class="muted small">后台运行 gladiator_train.train / multi_train，实时解析 episode 与 reward。<span id="tr-game-note"></span></p></div>
+        <div class="actions">
+          <button class="btn primary" id="btn-training-start" type="button">开始训练</button>
+          <button class="btn danger" id="btn-training-stop" type="button">停止训练</button>
+        </div>
+      </div>
+      <div class="layout-side">
+        <div class="stack">
+          <form class="card form" id="training-form">
+            <div class="card-head"><h3>参数</h3></div>
+            <label class="field"><span>任务类型</span>
+              <select id="tr-kind">
+                <option value="train">单场地训练（train）</option>
+                <option value="multi">多场地并行（multi_train）</option>
+              </select>
+            </label>
+            <div data-kind="train">
+              <label class="field"><span>Bot 用户名（逗号分隔，至少 2 个）</span><input id="tr-users" value="Bot_T1, Bot_T2"></label>
+              <label class="field"><span>通道 B 端口（与用户名一一对应）</span><input id="tr-ports" value="8770, 8771"></label>
+            </div>
+            <div data-kind="multi" class="hidden">
+              <label class="field"><span>场地对数</span><input id="tr-pairs" type="number" min="1" max="8" value="2"></label>
+              <label class="field"><span>用户名前缀</span><input id="tr-prefix" value="Bot_P"></label>
+              <label class="field"><span>起始端口</span><input id="tr-base-port" type="number" min="1024" max="65000" value="8770"></label>
+              <label class="field"><span>权重融合（多场地→唯一权重）</span>
+                <select id="tr-merge">
+                  <option value="mean">平均（等权）· 可持久化写回</option>
+                  <option value="weighted">按步数加权 · 可持久化写回</option>
+                  <option value="none">不融合 · 不写回模型</option>
+                </select>
+              </label>
+            </div>
+            <label class="field"><span>Reward 预设</span>
+              <div class="field-row">
+                <select id="tr-reward-preset" aria-label="Reward 预设"></select>
+                <button class="btn tiny ghost" id="btn-reward-manage" type="button">编辑预设…</button>
+              </div>
+            </label>
+            <div class="form-grid">
+              <label class="field"><span>每回合最大步数</span><input id="tr-max-steps" type="number" min="1" value="200"></label>
+              <label class="field"><span>随机种子</span><input id="tr-seed" type="number" min="0" value="7"></label>
+              <label class="field"><span>训练回合（每回合跑一遍计划）</span><input id="tr-epochs" type="number" min="1" max="200" value="1" title="每个回合按计划从上到下执行一遍；每个轮次结束更新一次参数"></label>
+              <label class="field" id="tr-eval-field"><span>评估回合（训练后，贪心不学习）</span><input id="tr-eval" type="number" min="0" max="50" value="1"></label>
+              <label class="field"><span>场地中心</span><input id="tr-center" value="0.5,4,0.5"></label>
+              <label class="field"><span>间距</span><input id="tr-spacing" type="number" step="0.5" value="6"></label>
+              <label class="field"><span>开局准备期（秒）</span><input id="tr-prep" type="number" step="0.5" min="0" max="30" value="3"></label>
+            </div>
+            <label class="field"><span>训练模型（初始化权重）</span>
+              <div class="field-row">
+                <select id="tr-model" aria-label="训练模型"></select>
+                <button class="btn tiny ghost" id="btn-model-manage" type="button">模型管理…</button>
+              </div>
+            </label>
+            <label class="check" id="tr-persist-row"><input id="tr-persist" type="checkbox" checked> 持久化训练（训练结束写回该模型）</label>
+            <p class="muted small" id="tr-persist-note">开启后，正常完成的训练会把最终权重写回所选模型（累加局数/步数）；失败或被停止的训练不写回。关闭则只读起点，产物仅留在本次 run 里。</p>
+            <div class="actions hidden" id="tr-gmod-actions">
+              <span class="muted small" id="tr-gmod-note">文件模型只读，可先导入为策略模型</span>
+              <button class="btn tiny primary" id="btn-model-import-continue" type="button">导入并继续训练</button>
+            </div>
+            <p class="muted small hidden" id="tr-eval-note">多场地训练不支持评估回合（multi_train 没有评估阶段），该字段已隐藏。</p>
+            <p class="muted small">一层：<b>回合</b>（把计划完整跑一遍）→ 二层：<b>计划</b>（按顺序的若干段）→ 三层：<b>轮次</b>（一局对局，直到一方死亡或步数耗尽）。每个训练轮次结束算回报并更新一次参数；评估回合同样跑完整计划，但贪心、不学习。</p>
+            <label class="check"><input id="tr-auto-spawn" type="checkbox" checked> 自动 spawn 并放置 Bot</label>
+            <label class="check"><input id="tr-auto-cleanup" type="checkbox" checked> 训练结束后自动停止本次拉起的运行时</label>
+            <p class="muted small">训练前请先确保对应通道 B 端口已有 bot-runtime 在监听；否则会拒绝启动并提示缺失端口。训练开始前已存在的运行时不会被自动清理。</p>
+          </form>
+          <div class="card">
+            <div class="card-head"><h3>脚本 / 模型</h3>
+              <div class="actions">
+                <span class="muted small">代码驱动类型</span>
+                <button class="btn tiny ghost" id="btn-script-folder" type="button">打开文件夹</button>
+                <button class="btn tiny ghost" id="btn-script-manage" type="button">编辑脚本…</button>
+              </div>
+            </div>
+            <div class="script-list" id="tr-script-list"></div>
+            <div class="empty hidden" id="tr-script-empty">训练选项尚未加载。</div>
+            <button class="btn tiny ghost" id="tr-add-model" type="button" disabled title="模型装载待接入">添加模型…</button>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>预设</h3>
+              <div class="actions">
+                <button class="btn tiny ghost" id="btn-preset-folder" type="button">打开文件夹</button>
+                <button class="btn tiny" id="btn-preset-save" type="button">保存为预设…</button>
+              </div>
+            </div>
+            <div class="preset-list" id="tr-presets"></div>
+            <div class="empty" id="tr-presets-empty">还没有预设；先配置计划再保存。</div>
+            <p class="small hidden" id="tr-presets-note"></p>
+          </div>
+        </div>
+        <div class="stack">
+          <div class="card" id="training-plan-card">
+            <div class="card-head"><h3>训练计划</h3><span class="muted small">拖拽排序；每个轮次 = 一局对局</span></div>
+            <div class="plan-list" id="tr-plan-list"></div>
+            <div class="empty" id="tr-plan-empty">计划为空，请在下方添加一段。</div>
+            <div class="plan-summary"><span class="pill neutral" id="tr-plan-total">共 0 段 · 总回合 0</span></div>
+            <div class="plan-add">
+              <select id="tr-add-script" aria-label="训练内容"></select>
+              <input id="tr-add-episodes" type="number" min="1" max="500" step="1" value="4" aria-label="轮次">
+              <button class="btn tiny primary" id="btn-plan-add" type="button">添加到计划</button>
+            </div>
+            <div class="plan-io">
+              <input id="tr-plan-input" autocomplete="off" placeholder="scripted:4,rusher:4" aria-label="计划字符串">
+              <button class="btn tiny" id="btn-plan-import" type="button">从字符串加载</button>
+              <button class="btn tiny ghost" id="btn-plan-copy" type="button">复制</button>
+              <button class="btn tiny danger" id="btn-plan-clear" type="button">清空计划</button>
+            </div>
+            <p class="muted small plan-text-line">当前计划：<code id="tr-plan-text">—</code></p>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>进度</h3><span id="training-status" class="pill neutral">未运行</span></div>
+            <div id="training-progress-body"><p class="muted">还没有训练任务。</p></div>
+            <div class="progress"><div class="progress-bar" id="training-progress-bar"></div></div>
+          </div>
+          <div class="card"><div class="card-head"><h3>Reward 曲线</h3><span class="muted small" id="training-chart-meta"></span></div><div id="training-chart" class="chart"></div></div>
+          <div class="card"><div class="card-head"><h3>训练日志</h3></div><pre class="log tall" id="training-log">—</pre></div>
+          <div class="card" id="training-report-card" style="display:none"><div class="card-head"><h3>报告摘要</h3></div><div id="training-report"></div></div>
+          <div class="card">
+            <div class="card-head"><h3>对局查询</h3><span class="muted small" id="training-episodes-meta"></span></div>
+            <div class="table-wrap">
+              <table><thead><tr><th>#</th><th>开始时间</th><th>耗时</th><th>步数</th><th>reward</th><th>winner</th></tr></thead><tbody id="training-episodes"></tbody></table>
+            </div>
+            <div class="empty" id="training-episodes-empty">还没有回合数据。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 人机对战 -->
+    <section class="panel" id="panel-match">
+      <div class="section-head">
+        <div><h2>人机对战</h2><p class="muted small">启动 N 个 bot-runtime，通过 RCON 让插件 spawn，人类玩家直接进服观战/对战。</p></div>
+        <div class="actions">
+          <button class="btn primary" id="btn-match-start" type="button">启动人机对战</button>
+          <button class="btn danger" id="btn-match-stop" type="button">结束对战</button>
+        </div>
+      </div>
+      <div class="card">
+        <form class="inline-form" id="match-form">
+          <label class="field inline"><span>Bot 数量</span><input id="match-count" type="number" min="1" max="8" value="2"></label>
+          <label class="field inline"><span>用户名前缀</span><input id="match-prefix" value="Glad_Bot"></label>
+          <label class="field inline"><span>起始端口</span><input id="match-base" type="number" min="1024" max="65000" value="8770"></label>
+        </form>
+      </div>
+      <div class="grid cards" id="match-cards"></div>
+      <div class="two-col">
+        <div class="card join-card">
+          <div class="card-head"><h2>进入服务器</h2><span class="pill neutral">1.8.9 · offline</span></div>
+          <div class="address" id="match-address">127.0.0.1:25566</div>
+          <p class="muted">观战前请先以普通玩家身份进入服务器。</p>
+          <div class="command-list" id="match-commands"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>Bot 状态</h3></div>
+          <div class="table-wrap">
+            <table><thead><tr><th>用户名</th><th>通道 B</th><th>runtime</th><th>ready</th><th>PID</th></tr></thead><tbody id="match-bots"></tbody></table>
+          </div>
+          <div class="empty" id="match-bots-empty">还没有启动对战。</div>
+        </div>
+      </div>
+      <div class="card"><div class="card-head"><h3>启动日志</h3></div><pre class="log tall" id="match-log">—</pre></div>
+    </section>
+
+
+    <!-- 模型 -->
+    <section class="panel" id="panel-models">
+      <div class="section-head">
+        <div><h2>模型</h2><p class="muted small">训练初始化权重的注册表；<code>default</code> 表示全新初始化（无文件）。</p>
+          <p class="muted small">把 <code>.gmod</code> 放进 <code id="models-gmod-dir">models/</code> 目录，刷新即可出现；删除文件后自动消失。</p></div>
+        <div class="actions">
+          <button class="btn tiny ghost" id="btn-models-reload" type="button">刷新</button>
+          <button class="btn tiny ghost" id="btn-models-folder" type="button">打开文件夹</button>
+          <button class="btn primary" id="btn-model-import-open" type="button">从 run 导入…</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>模型列表</h3><span class="muted small" id="models-meta"></span></div>
+        <div class="table-wrap">
+          <table><thead><tr><th>名称</th><th>id</th><th>来源</th><th>大小</th><th>状态</th><th>obs × actions</th><th>回合</th><th>均 reward</th><th>更新时间</th><th></th></tr></thead><tbody id="models-rows"></tbody></table>
+        </div>
+        <div class="empty" id="models-empty">还没有模型；点「从 run 导入…」把某次训练的 policy.npz 注册进来。</div>
+      </div>
+      <div class="card hidden" id="model-detail">
+        <div class="card-head"><h3 id="model-detail-title">模型详情</h3>
+          <div class="actions">
+            <button class="btn tiny primary" id="btn-model-viz" type="button">可视化</button>
+            <button class="btn tiny ghost" id="btn-model-detail-folder" type="button">打开模型文件夹</button>
+            <button class="btn tiny ghost" id="btn-model-detail-close" type="button">收起</button>
+          </div>
+        </div>
+        <div id="model-detail-body"></div>
+        <div class="card-head" style="margin-top:12px"><h3>编辑</h3></div>
+        <div class="form-grid">
+          <label class="field"><span>名称</span><input id="model-edit-name"></label>
+          <label class="field"><span>说明</span><input id="model-edit-description"></label>
+          <label class="field wide"><span>备注</span><input id="model-edit-note"></label>
+        </div>
+        <div class="actions" style="margin-top:8px">
+          <button class="btn tiny primary" id="btn-model-save" type="button">保存修改</button>
+          <button class="btn tiny danger" id="btn-model-delete" type="button">删除模型</button>
+          <span class="muted small" id="model-status"></span>
+        </div>
+        <div class="card-head" style="margin-top:14px"><h3>最近使用</h3></div>
+        <div id="model-recent-runs"></div>
+      </div>
+      <div class="card hidden" id="model-viz">
+        <div class="card-head"><h3 id="model-viz-title">模型可视化</h3>
+          <div class="actions">
+            <button class="btn tiny ghost" id="btn-model-viz-copy" type="button">复制直达链接</button>
+            <button class="btn tiny ghost" id="btn-model-viz-close" type="button">收起</button>
+          </div>
+        </div>
+        <div id="model-viz-body"></div>
+      </div>
+      <div class="card hidden" id="model-import-card">
+        <div class="card-head"><h3>从 run 导入模型</h3><button class="btn tiny ghost" id="btn-model-import-close" type="button">收起</button></div>
+        <div class="form-grid">
+          <label class="field"><span>来源 run</span><select id="model-source-run"></select></label>
+          <label class="field"><span>名称</span><input id="model-import-name" placeholder="默认用 run 名"></label>
+          <label class="field"><span>说明</span><input id="model-import-description"></label>
+          <label class="field"><span>备注</span><input id="model-import-note"></label>
+          <label class="field wide"><span>或直接填 npz 绝对路径（必须在 training/artifacts 内）</span><input id="model-policy-path" placeholder="D://cbot-gladiator//training//artifacts//runs//...//policy.npz"></label>
+        </div>
+        <div class="actions" style="margin-top:8px">
+          <button class="btn tiny primary" id="btn-model-import" type="button">导入</button>
+          <span class="muted small" id="model-import-status"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 数据 -->
+    <section class="panel" id="panel-data">
+      <div class="section-head">
+        <div><h2>数据可视化</h2><p class="muted small">读取 training/artifacts，不修改任何训练产物。</p></div>
+        <div class="actions"><button class="btn" id="btn-data-refresh" type="button">重新读取</button></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>训练运行（runs）</h3><span class="muted small" id="data-runs-meta"></span></div>
+        <div class="data-select-bar">
+          <label class="check"><input id="data-check-all" type="checkbox"> 全选</label>
+          <label class="field inline"><span>开始</span><input id="data-from" type="datetime-local"></label>
+          <label class="field inline"><span>结束</span><input id="data-to" type="datetime-local"></label>
+          <button class="btn tiny" id="btn-data-range" type="button">按时间选择</button>
+          <button class="btn tiny primary" id="btn-data-merge" type="button">合并选中</button>
+          <button class="btn tiny ghost" id="btn-data-clear" type="button">清空选择</button>
+          <span class="muted small" id="data-select-meta">未选择</span>
+        </div>
+        <div class="table-wrap">
+          <table><thead><tr><th class="check-col"><input id="data-check-all-head" type="checkbox" aria-label="全选运行"></th><th>运行</th><th>kind</th><th>阶段</th><th>回合</th><th>步数</th><th>平均 reward</th><th>状态</th></tr></thead><tbody id="data-runs"></tbody></table>
+        </div>
+        <div class="empty" id="data-runs-empty">还没有运行目录；旧的扁平报告会显示为 legacy。</div>
+      </div>
+      <div class="card hidden" id="data-run-detail">
+        <div class="card-head"><h3 id="data-run-title">运行详情</h3>
+          <div class="actions">
+            <button class="btn tiny ghost" id="btn-run-folder" type="button">打开 run 文件夹</button>
+            <button class="btn tiny ghost" id="btn-run-reviews-folder" type="button">打开复盘文件夹</button>
+            <button class="btn tiny ghost" id="btn-run-close" type="button">收起</button>
+          </div>
+        </div>
+        <div id="data-run-body"></div>
+        <div class="chart" id="data-run-chart"></div>
+        <div class="card-head" style="margin-top:14px"><h3>该运行回合</h3><span class="muted small" id="data-run-episodes-meta"></span></div>
+        <div class="table-wrap">
+          <table><thead><tr><th>#</th><th>开始时间</th><th>耗时</th><th>步数</th><th>reward</th><th>winner</th><th></th></tr></thead><tbody id="data-run-episodes"></tbody></table>
+        </div>
+        <div class="empty" id="data-run-episodes-empty">该运行没有回合数据。</div>
+        <div class="card-head" style="margin-top:14px"><h3>该运行复盘</h3><span class="muted small" id="data-run-review-count"></span></div>
+        <div id="data-run-reviews"></div>
+      </div>
+      <div class="grid cards" id="data-cards"></div>
+      <div class="two-col">
+        <div class="card"><div class="card-head"><h3>Reward 曲线</h3><span class="muted small" id="data-chart-meta"></span></div><div id="data-chart" class="chart"></div><div id="data-consistency" class="consistency-note hidden"></div></div>
+        <div class="card"><div class="card-head"><h3>压力测试 TPS / 步频</h3></div><div id="data-stress" class="chart"></div></div>
+      </div>
+      <div class="card"><div class="card-head"><h3>多场地训练</h3></div><div id="data-multi"></div></div>
+      <div class="card">
+        <div class="card-head"><h3>逐局复盘</h3><span class="muted small" id="data-review-count"></span></div>
+        <div class="review-list" id="data-reviews"></div>
+        <div class="empty" id="data-reviews-empty">reviews 目录为空。</div>
+      </div>
+    </section>
+    <!-- 实时终端 -->
+    <section class="panel" id="panel-terminal">
+      <div class="section-head">
+        <div><h2>实时终端</h2><p class="muted small">只读 SSE 日志流；不会执行任何命令。路径由服务端白名单限定。</p></div>
+        <div class="actions">
+          <button class="btn primary" id="btn-terminal-connect" type="button">连接</button>
+          <button class="btn" id="btn-terminal-pause" type="button">暂停</button>
+          <button class="btn" id="btn-terminal-clear" type="button">清屏</button>
+        </div>
+      </div>
+      <div class="card">
+        <form class="inline-form" id="terminal-form">
+          <label class="field inline"><span>来源</span>
+            <select id="terminal-source">
+              <option value="server">Paper 服务端</option>
+              <option value="training">训练 run.log</option>
+              <option value="runtime">Bot 运行时</option>
+            </select>
+          </label>
+          <label class="field inline" id="terminal-name-wrap"><span>目标</span><select id="terminal-name"></select></label>
+          <label class="check"><input id="terminal-autoscroll" type="checkbox" checked> 自动滚动</label>
+        </form>
+        <p class="muted small" id="terminal-status">未连接。</p>
+        <pre class="log terminal" id="terminal-output">—</pre>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="review-dialog">
+    <div class="modal-head">
+      <h2 id="review-title">复盘</h2>
+      <button class="btn tiny ghost" id="btn-review-close" type="button">关闭</button>
+    </div>
+    <div class="markdown" id="review-content"></div>
+  </dialog>
+
+  <dialog id="reward-dialog">
+    <div class="modal-head">
+      <h2 id="reward-title">Reward 预设</h2>
+      <div class="actions">
+        <button class="btn tiny ghost" id="btn-reward-folder" type="button">打开文件夹</button>
+        <button class="btn tiny ghost" id="btn-reward-copy" type="button">复制默认预设</button>
+        <button class="btn tiny ghost" id="btn-reward-close" type="button">关闭</button>
+      </div>
+    </div>
+    <div class="reward-editor">
+      <div class="reward-meta">
+        <label class="field"><span>预设 id（1–32 位小写字母/数字/下划线/连字符）</span><input id="reward-id" autocomplete="off" placeholder="default"></label>
+        <label class="field"><span>名称</span><input id="reward-name" autocomplete="off" placeholder="均衡（默认）"></label>
+        <label class="field wide"><span>说明</span><input id="reward-description" autocomplete="off" placeholder="这份权重用来引导什么行为"></label>
+      </div>
+
+      <div class="card-head"><h3>基础权重（base）</h3><span class="muted small">每步/每事件结算；留空或非数字会被后端拒绝</span></div>
+      <div class="reward-base" id="reward-base"></div>
+      <p class="muted small">走位本身零惩罚：<code>inactive</code> 默认 0（消极不扣分），<code>still</code> 为负值，只在连续 3 秒水平位移 &lt; 0.05 格时按秒扣分。</p>
+
+      <div class="card-head"><h3>条件式附加项（terms）</h3><span class="muted small" id="reward-terms-meta"></span></div>
+      <div class="reward-terms" id="reward-terms"></div>
+      <p class="muted small">同一个 term 内的多个条件为 <b>AND</b>；不同 term 之间自然叠加（需要「或」就写两条 term）。<code>unit=second</code> 按秒结算，<code>step</code> 按决策步结算。</p>
+
+      <div class="reward-actions">
+        <button class="btn tiny" id="btn-reward-add-term" type="button">添加 term</button>
+        <button class="btn tiny primary" id="btn-reward-save" type="button">保存预设</button>
+        <button class="btn tiny danger" id="btn-reward-delete" type="button">删除当前预设</button>
+        <span class="muted small" id="reward-status"></span>
+      </div>
+    </div>
+  </dialog>
+
+
+  <dialog id="script-dialog">
+    <div class="modal-head">
+      <h2>脚本注册表</h2>
+      <div class="actions">
+        <button class="btn tiny ghost" id="btn-script-new" type="button">新建脚本</button>
+        <button class="btn tiny ghost" id="btn-script-close" type="button">关闭</button>
+      </div>
+    </div>
+    <div class="script-editor">
+      <div class="script-editor-list" id="script-editor-list"></div>
+      <div class="script-editor-form">
+        <label class="field"><span>id（小写字母/数字/下划线/连字符，1–24 位）</span><input id="script-id" autocomplete="off" placeholder="mine-hold"></label>
+        <label class="field"><span>名称（≤40 字）</span><input id="script-name" autocomplete="off" placeholder="Hold Center"></label>
+        <label class="field"><span>颜色（Minecraft 单色码）</span><select id="script-color"></select></label>
+        <label class="field"><span>说明（≤200 字）</span><input id="script-description" autocomplete="off"></label>
+        <p class="muted small">颜色同时用于 Web 显示和训练前的 <code>/caller tagcolor &lt;role&gt; &lt;color&gt;</code>；内置脚本可改颜色与名称，但不能删除。</p>
+        <div class="script-editor-actions">
+          <button class="btn tiny primary" id="btn-script-save" type="button">保存</button>
+          <button class="btn tiny danger" id="btn-script-delete" type="button">删除</button>
+          <span class="muted small" id="script-status"></span>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+
+  <dialog id="episode-dialog">
+    <div class="modal-head">
+      <h2 id="episode-title">对局详情</h2>
+      <div class="actions">
+        <button class="btn tiny ghost" id="btn-episode-folder" type="button">打开复盘文件夹</button>
+        <button class="btn tiny ghost" id="btn-episode-close" type="button">关闭</button>
+      </div>
+    </div>
+    <div class="episode-body" id="episode-body"></div>
+  </dialog>
+
+  <div class="toast-wrap" id="toast-wrap"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

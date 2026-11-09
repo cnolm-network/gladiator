@@ -58,6 +58,9 @@
 
 `features` 用于能力协商：运行时不得调用未声明的能力。WorldGuard 未安装时 `guard.worldguard` 缺席，运行时不得发送 `QUERY_PVP`。
 
+`playerUuid`：已绑定真实玩家时为其 UUID；玩家实体尚未生成（或运行时先于玩家连上链路）时为空串 `""`。
+运行时以此判断是否需要等待 `BOT_BOUND` 或继续指数退避重试（`BOT_NOT_READY`）。
+
 ### 2.3 REJECT（L1 → L2）
 
 ```json
@@ -146,6 +149,46 @@
 
 双向，`payload: {}`；超过 `heartbeat-timeout-seconds`（默认 30s）无 PING 即判死并回收会话。
 
+### 2.10 SPAWN / BOT_BOUND / SPAWN_FAILED（spawnBot 编排，G-107）
+
+`GladiatorAPI.spawnBot(BotSpec)` 在主线程立即返回 `BotRequest`（`PENDING`），真正的登录由运行时完成：
+
+1. 运行时先建立链路并发送 HELLO；
+2. 插件下发 `SPAWN`（若 HELLO 早于 `spawnBot`，则在 `spawnBot` 调用时补发）；
+3. 运行时用 mineflayer 以真实协议登录（不伪造服务端连接）；
+4. 服务端 `PlayerJoinEvent` 绑定 `BotHandle` 后回 `BOT_BOUND`，并在主线程派发 `GladiatorBotReadyEvent`；
+5. 登录失败回 `SPAWN_FAILED`，插件派发 `GladiatorBotFailedEvent`；超过 `bridge.spawn-timeout-seconds`（默认 30s）未完成同样派发 Failed，`reason` 以 `TIMEOUT:` 开头。
+
+SPAWN（L1 → L2）：
+```json
+{ "type":"SPAWN", "payload": {
+  "requestId":"req-1", "botId":"glad-bot-1", "username":"Glad_Bot_1", "group":"",
+  "server":{ "host":"127.0.0.1", "port":25565 }, "metadata":{},
+  "profile":{ "cps":15.0, "cpsJitter":2.0, "reactionMs":220.0, "reactionJitterMs":40.0,
+              "reach":3.99, "model":"default" }
+}}
+```
+`server` 是插件视角的 MC 地址（`Bukkit.getIp()`/`getPort()`），运行时可用它覆盖自身启动参数。`metadata` 原样透传 `BotSpec` 的自定义键。
+`profile` 是该 Bot 的手感配置（`BotProfile`，G-507）：`cps` 每秒点击数、`cpsJitter` 点击间隔抖动、`reactionMs` 反应延时、`reactionJitterMs` 延时抖动、`reach` 攻击距离（格，原版 3.99）、`model` 训练模型标识（默认 `default`，不参与协议语义）。运行时应以 `profile` 覆盖自身 CLI/env 默认值；字段缺失时逐项回落默认值。
+
+BOT_BOUND（L1 → L2）：
+```json
+{ "type":"BOT_BOUND", "payload": {
+  "sessionId":"3f2a…", "playerUuid":"…", "username":"Glad_Bot_1",
+  "state":"Alive", "ready":true
+}}
+```
+
+SPAWN_FAILED（L2 → L1）：
+```json
+{ "type":"SPAWN_FAILED", "payload": {
+  "requestId":"req-1", "botId":"glad-bot-1",
+  "code":"ONLINE_MODE", "message":"服务端开启了 online-mode，但 Bot 以离线身份登录…"
+}}
+```
+
+`botId` 两端统一为 `glad-<小写用户名>`（`BotRegistry.botIdFor`），运行时必须使用同一公式，否则对不上请求。
+
 ## 3. 错误码
 
 | code | 方向 | 含义 | 运行时行为 |
@@ -159,7 +202,19 @@
 | `RULE_DENIED` | L1→L2 | 规则拒绝 | 写缓存 + 不重试同一动作 |
 | `INTERNAL` | 双向 | 未预期异常 | 记录日志，会话可继续 |
 
+`SPAWN_FAILED.payload.code` 取值（登录期专用，随 Failed 事件交给调用方）：
+
+| code | 含义 | 典型修复 |
+|---|---|---|
+| `VERSION_MISMATCH` | mineflayer 协议版本与服务端不符 | 1.8.9 服务端用 `version:"1.8.8"` |
+| `ONLINE_MODE` | 服务端 online-mode 与 Bot 的 auth 方式不匹配 | 服务端 `online-mode=false` 或改用正版账号 |
+| `NOT_WHITELISTED` | Bot 用户名不在白名单 | 加入 `whitelist.json` |
+| `SERVER_UNREACHABLE` | MC 端口不可达 | 检查地址/端口与服务端状态 |
+| `LOGIN_FAILED` | 其余登录错误 | 看 `message` 原始信息 |
+
 ## 4. 通道 B：Layer 2 ↔ Layer 3
+
+> 字段级 schema（每个 payload 字段的类型、单位、缺省值、19 维观测向量逐维定义、11 个离散动作与协议帧的映射）见 [`docs/observation.md`](observation.md)。本节只定义帧与信封。
 
 ### 4.1 HELLO / WELCOME
 

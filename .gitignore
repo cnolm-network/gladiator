@@ -30,6 +30,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+training/artifacts/
+
 # ---- 运行时产物 ----
 run/
 *.log
@@ -53,3 +55,19 @@ server/logs/
 server/plugins/
 server/cache/
 server/eula.txt
+server/banned-ips.json
+server/banned-players.json
+server/ops.json
+server/usercache.json
+server/whitelist.json
+server/bukkit.yml
+server/commands.yml
+server/help.yml
+server/paper.yml
+server/spigot.yml
+server/permissions.yml
+# 只随仓库发布三只内置模型，其余 .gmod 是本机自测产物
+models/*.gmod
+!models/default.gmod
+!models/release.gmod
+!models/flash.gmod

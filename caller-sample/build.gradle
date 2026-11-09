@@ -1,0 +1,46 @@
+// ---------------------------------------------------------------------------
+// caller-sample：G-506 的"第二个插件"验证载体
+//
+// 用途：证明 Gladiator 是独立插件——调用方只需要在编译期依赖 Gladiator 的 jar，
+// 不需要改 Gladiator 一行源码，也不需要在 Gladiator 的 plugin.yml 里登记。
+//
+// 这个子工程不属于发布物：它只是示例调用方，产物不进入 shadowJar。
+// ---------------------------------------------------------------------------
+plugins {
+    id 'java'
+}
+
+group = 'top.cnolm.sample'
+version = '0.1.0'
+description = 'Gladiator 示例调用方（独立插件，G-506 验收用）'
+
+repositories {
+    maven { url = 'https://maven.aliyun.com/repository/public' }
+    maven { url = 'https://hub.spigotmc.org/nexus/content/repositories/snapshots/' }
+    // BetterNameTag（头顶名称标签）：只用于示例调用方，Gladiator 本体不依赖它。
+    maven { url = 'https://repo.cnolm.top' }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(8)
+    }
+}
+
+dependencies {
+    // 只依赖 Spigot API 与 Gladiator 的编译产物；运行期由服务端提供。
+    compileOnly('org.spigotmc:spigot-api:1.8.8-R0.1-SNAPSHOT') {
+        exclude group: 'net.md-5'
+    }
+    // 直接依赖主工程的 classes 目录，而不是 jar：
+    // 主工程的 jar 与 shadowJar 同名同路径，依赖 jar 会触发 Gradle 的输出重叠校验。
+    compileOnly rootProject.files(rootProject.layout.buildDirectory.dir('classes/java/main'))
+    compileOnly 'top.cnolm.betterNameTag:BetterNameTag:1.0.0'
+}
+
+compileJava.dependsOn ':classes'
+
+jar {
+    archiveBaseName = 'caller-sample'
+    archiveVersion = ''
+}

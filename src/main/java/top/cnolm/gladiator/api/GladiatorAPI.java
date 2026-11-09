@@ -36,4 +36,19 @@ public interface GladiatorAPI {
     void eliminate(User user);
 
     UserState stateOf(User user);
+
+    /**
+     * 查询某坐标是否允许 PVP（G-204）。
+     *
+     * <p>返回完整判定：是否允许、命中区域 id、来源（区域 flag / 全局默认 / WG 未装降级 /
+     * 无法判定），见 {@link PvpVerdict}。未安装 WorldGuard 时按 allow 降级并记录日志。
+     * 需要区域边界时用 {@link #queryPvp(org.bukkit.Location, User)}。
+     */
+    boolean isPvpAllowed(org.bukkit.Location location, User user);
+
+    /**
+     * 与 {@link #isPvpAllowed(org.bukkit.Location, User)} 同源，额外返回区域 id 与边界，
+     * 供 Layer 2 写入 RestrictionCache（G-206）与寻路代价（G-207）。
+     */
+    PvpVerdict queryPvp(org.bukkit.Location location, User user);
 }

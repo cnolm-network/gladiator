@@ -1,1 +1,4 @@
 rootProject.name = 'gladiator'
+
+// G-506：示例调用方是独立插件，仅用于验收"换插件只改调用方"。
+include 'caller-sample'

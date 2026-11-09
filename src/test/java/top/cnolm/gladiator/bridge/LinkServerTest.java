@@ -94,8 +94,35 @@ public class LinkServerTest {
         assertTrue(payload.get("sessionId").getAsString().length() > 0);
         assertNotNull(payload.get("limits"));
         assertNotNull(payload.get("features"));
+        // G-103：接口默认不提供 playerUuid，WELCOME 必须写空串而不是 null/缺失。
+        assertEquals("", payload.get("playerUuid").getAsString());
         assertEquals(1, server.getSessions().size());
         assertEquals(1, handler.hellos.size());
+    }
+
+    @Test
+    public void welcomeCarriesPlayerUuidWhenBound() throws Exception {
+        final String uuid = "3f1c2a44-8f7e-3f0a-9d6b-1c2d3e4f5a6b";
+        LinkServer boundServer = new LinkServer("127.0.0.1", 0, "", 30L,
+                new LinkHandler.Adapter() {
+                    @Override
+                    public String playerUuid(String username) {
+                        return "Glad_Bot_1".equals(username) ? uuid : null;
+                    }
+                });
+        boundServer.start();
+        WsClient boundClient = null;
+        try {
+            boundClient = new WsClient(boundServer.getPort());
+            boundClient.send(hello("", "glad-bot-1"));
+            JsonObject welcome = parse(boundClient.readText());
+            assertEquals(uuid, welcome.getAsJsonObject("payload").get("playerUuid").getAsString());
+        } finally {
+            if (boundClient != null) {
+                boundClient.close();
+            }
+            boundServer.stop();
+        }
     }
 
     @Test
