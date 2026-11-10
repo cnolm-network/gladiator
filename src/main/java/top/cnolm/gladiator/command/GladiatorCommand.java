@@ -48,7 +48,9 @@ public final class GladiatorCommand implements CommandExecutor {
                 if (service != null) {
                     sender.sendMessage("[Gladiator] bots=" + service.getKnownBotCount()
                             + " games=" + service.getActiveGameCount()
-                            + " training=" + service.getActiveTrainingCount());
+                            + " training=" + service.getActiveTrainingCount()
+                            + " pending=" + service.getPendingSpawnCount()
+                            + " spawn=" + plugin.getSpawnMode());
                 }
                 LinkServer link = plugin.getLinkServer();
                 sender.sendMessage("[Gladiator] link="
@@ -180,7 +182,10 @@ public final class GladiatorCommand implements CommandExecutor {
                     BotSpec.of(username, "default", null, profile.build()));
             sender.sendMessage("[Gladiator] spawn 已受理 request=" + request.getRequestId()
                     + " botId=" + request.getBotId() + " state=" + request.getState()
-                    + "（等待运行时登录 + PlayerJoin）");
+                    + " mode=" + plugin.getSpawnMode()
+                    + ("golem".equals(plugin.getSpawnMode())
+                            ? "（golem 进程内身体，无需登录）"
+                            : "（等待运行时登录 + PlayerJoin）"));
         } catch (RuntimeException ex) {
             sender.sendMessage("[Gladiator] spawn 失败: " + ex.getMessage());
         }

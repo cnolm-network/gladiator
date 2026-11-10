@@ -46,8 +46,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * 对局与训练会话登记、{@code notice()} 投递、{@code analyze()} 快照、
  * {@code eliminate()} / {@code stateOf()} 状态机、WorldGuard PVP 规则查询。
  *
- * <p>{@code spawnBot()} 委托 {@link BotSpawnService}（G-107）：本类只签发请求票据，
- * 真实登录、绑定与 Ready 事件由 spawn 服务在主线程完成。未接线（M0 独立测试）时
+ * <p>{@code spawnBot()} 委托 {@link BotSpawner}（G-107 / B1）：本类只签发请求票据，
+ * 真实登录（运行时）或身体生成（Golem）由具体 spawner 在主线程完成。未接线（M0 独立测试）时
  * 显式抛 {@link IllegalStateException}，绝不伪造 Bot。
  *
  * <p>本类同时实现 {@link UserStateRegistry.Lookup}，让 {@code Users.of(Player).getState()}
@@ -65,7 +65,7 @@ public final class GladiatorServiceImpl implements GladiatorAPI, UserStateRegist
     private final AtomicLong sequence = new AtomicLong();
     private final GameRegistry gameRegistry = new GameRegistry();
     private final UserStateMachine stateMachine = new UserStateMachine();
-    private volatile BotSpawnService spawner;
+    private volatile BotSpawner spawner;
     private volatile GuardBridge guard = new NoopGuardBridge();
     private volatile boolean ready;
     private volatile boolean degradeWarned;
@@ -103,11 +103,11 @@ public final class GladiatorServiceImpl implements GladiatorAPI, UserStateRegist
     }
 
     /** G-107：由 GladiatorMain 在链路起来后接上 spawn 服务。 */
-    public void attachSpawner(BotSpawnService spawner) {
+    public void attachSpawner(BotSpawner spawner) {
         this.spawner = Objects.requireNonNull(spawner, "spawner");
     }
 
-    public BotSpawnService getSpawner() {
+    public BotSpawner getSpawner() {
         return spawner;
     }
 
@@ -143,12 +143,12 @@ public final class GladiatorServiceImpl implements GladiatorAPI, UserStateRegist
     }
 
     public int getPendingSpawnCount() {
-        BotSpawnService current = spawner;
+        BotSpawner current = spawner;
         return current == null ? 0 : current.getPendingCount();
     }
 
     public BotRegistry getBotRegistry() {
-        BotSpawnService current = spawner;
+        BotSpawner current = spawner;
         return current == null ? null : current.getRegistry();
     }
 
@@ -187,7 +187,7 @@ public final class GladiatorServiceImpl implements GladiatorAPI, UserStateRegist
         if (!isReady()) {
             throw new IllegalStateException("Gladiator 尚未就绪，不能 spawnBot");
         }
-        BotSpawnService current = spawner;
+        BotSpawner current = spawner;
         if (current == null) {
             // 未接线（M0 独立测试场景）：绝不返回"假成功"的票据，也不伪造 Bukkit Player。
             throw new IllegalStateException(
@@ -257,7 +257,7 @@ public final class GladiatorServiceImpl implements GladiatorAPI, UserStateRegist
         Objects.requireNonNull(information, "information");
 
         String key = bot.getBotId();
-        BotSpawnService current = spawner;
+        BotSpawner current = spawner;
         if (current != null && current.sendNotice(key, information)) {
             ensureCounters(key).recordAction(false);
             return;
@@ -408,7 +408,7 @@ public final class GladiatorServiceImpl implements GladiatorAPI, UserStateRegist
         if (!changed) {
             return;
         }
-        BotSpawnService current = spawner;
+        BotSpawner current = spawner;
         if (current != null) {
             current.sendState(user, from, to, reason);
         }
@@ -535,7 +535,7 @@ public final class GladiatorServiceImpl implements GladiatorAPI, UserStateRegist
         if (bot != null) {
             return bot;
         }
-        BotSpawnService current = spawner;
+        BotSpawner current = spawner;
         if (current == null) {
             return null;
         }

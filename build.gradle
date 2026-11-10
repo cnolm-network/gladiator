@@ -41,6 +41,10 @@ dependencies {
     compileOnly('com.sk89q.worldguard:worldguard-legacy:6.2') { transitive = false }
     compileOnly('com.sk89q.worldedit:worldedit-bukkit:6.1.5') { transitive = false }
 
+    // Golem API（B1，spawn.mode=golem 用）：本地构建、不入库，见 docs/ENVIRONMENT.md §11。
+    // compileOnly 表示运行期必须由 Golem 插件提供 —— 不打进 shadowJar，也不引入任何 NMS 类。
+    compileOnly files('libs/golem-api-0.1.0.jar')
+
     // 链路层单元测试（本地缓存已有这些构件，可离线构建）。
     // compileOnly 不进入 testCompileClasspath，故 gson 需为测试显式声明。
     testImplementation 'junit:junit:4.10'
@@ -53,6 +57,9 @@ dependencies {
     testRuntimeOnly('org.spigotmc:spigot-api:1.8.8-R0.1-SNAPSHOT') {
         exclude group: 'net.md-5'
     }
+    // 单测要构造 golem spawner 的签名（GolemService/BotBody 为接口，测试里用动态代理）
+    testCompileOnly files('libs/golem-api-0.1.0.jar')
+    testRuntimeOnly files('libs/golem-api-0.1.0.jar')
 }
 
 test {
@@ -83,13 +90,16 @@ build.dependsOn shadowJar
 // G-108 零绑定门禁：Gladiator 必须能脱离任何竞技场/反作弊插件独立部署。
 //
 // 不用黑名单罗列第三方插件名（那等于把它们写进本仓库），而是用**白名单**：
-// 源码只允许 import 标准库、Bukkit/Spigot API、WorldGuard API、Gson 与自身包；
-// plugin.yml 的 depend/softdepend 只允许 WorldGuard；主类必须在本插件包内。
+// 源码只允许 import 标准库、Bukkit/Spigot API、WorldGuard API、Golem API（api 面，可选）、
+// Gson 与自身包；plugin.yml 的 depend/softdepend 只允许 WorldGuard 与 Golem；主类必须在本插件包内。
 // 任何对竞技场插件或反作弊插件的新依赖都会在 `check` 阶段失败。
 // ---------------------------------------------------------------------------
+// top.cnolm.golem 仅允许 api 面（top.cnolm.golem.api.*）：golem-api 里没有任何 NMS 类型，
+// 且 Golem 在 plugin.yml 中只是 softdepend，缺失时走 UnavailableSpawner 降级。
 def STANDALONE_ALLOWED_PACKAGES = ['java', 'javax', 'org.bukkit', 'org.spigotmc',
-                                   'com.sk89q', 'com.google', 'top.cnolm.gladiator'] as Set
-def STANDALONE_ALLOWED_PLUGIN_DEPS = ['WorldGuard'] as Set
+                                   'com.sk89q', 'com.google', 'top.cnolm.gladiator',
+                                   'top.cnolm.golem.api'] as Set
+def STANDALONE_ALLOWED_PLUGIN_DEPS = ['WorldGuard', 'Golem'] as Set
 
 tasks.register('verifyStandalone') {
     group = 'verification'

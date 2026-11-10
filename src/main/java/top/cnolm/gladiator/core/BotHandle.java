@@ -35,7 +35,8 @@ public final class BotHandle implements Bot {
     private volatile Player player;
     private volatile boolean ready;
 
-    BotHandle(String botId, String username) {
+    /** 由 spawner 创建；{@code bind} 前处于未就绪状态（UUID 退化为离线 UUID）。 */
+    public BotHandle(String botId, String username) {
         this.botId = Objects.requireNonNull(botId, "botId");
         this.username = Objects.requireNonNull(username, "username");
         this.offlineUuid = UUID.nameUUIDFromBytes(
@@ -44,7 +45,7 @@ public final class BotHandle implements Bot {
     }
 
     /** 真实玩家实体已登录；此后 UUID/名称/在线状态全部以 Bukkit 为准。 */
-    void bind(Player player) {
+    public void bind(Player player) {
         Objects.requireNonNull(player, "player");
         this.player = player;
         this.uuid = player.getUniqueId();
@@ -52,7 +53,7 @@ public final class BotHandle implements Bot {
     }
 
     /** 玩家退出/被踢；保留 handle 以便调用方读取历史身份，但不再当作就绪。 */
-    void unbind() {
+    public void unbind() {
         this.ready = false;
         this.player = null;
         this.uuid = offlineUuid;
@@ -66,7 +67,7 @@ public final class BotHandle implements Bot {
     @Override
     public boolean isReady() {
         Player current = player;
-        return ready && current != null && current.isOnline();
+        return ready && current != null && isLive(current);
     }
 
     @Override
@@ -97,7 +98,7 @@ public final class BotHandle implements Bot {
     @Override
     public Player asPlayer() {
         Player current = player;
-        if (current != null && current.isOnline()) {
+        if (current != null && isLive(current)) {
             return current;
         }
         if (!ready) {
@@ -106,8 +107,25 @@ public final class BotHandle implements Bot {
         return Bukkit.getPlayer(uuid);
     }
 
-    /** 请求时的原始用户名（不随 Player 改名变化，用于匹配 pending 请求）。 */
-    String getUsername() {
+    /**
+     * 「这个 Player 还能用吗」。
+     *
+     * <p>不能只看 {@code Player#isOnline()}：1.8.8 的 {@code isOnline()} 实现是
+     * {@code CraftServer.getPlayer(uuid) != null}，也就是<strong>必须登录进 PlayerList</strong>。
+     * golem 身体是进程内 NMS 实体、从不进 PlayerList，因此 {@code isOnline()} 恒为 false，
+     * 但实体在世界里真实存在（{@code isValid()} 为 true）。两者取并集：
+     * <ul>
+     *   <li>runtime 模式：真实登录的玩家 isOnline=true；退出时由 PlayerQuitEvent 解绑。</li>
+     *   <li>golem 模式：实体有效即可用；despawn 后 golem 侧返回 null {@code bukkitPlayer()}，
+     *       由 {@code GolemBodySpawner} 的对账任务解绑。</li>
+     * </ul>
+     */
+    private static boolean isLive(Player player) {
+        return player.isOnline() || player.isValid();
+    }
+
+    /** 请求时的原始用户名（不随 Player 改名变化，用于匹配 pending 请求与 golem 身体）。 */
+    public String getUsername() {
         return username;
     }
 

@@ -497,3 +497,33 @@ Java 8 toolchain 编译；产物 bytecode 52。
 **验证**：`.\gradlew.bat test --offline` → 33 PASSED（LinkServer 9 / BotRegistry 7 / GameRegistry 4 /
 PvpVerdict 5 / UserStateMachine 5 / AnalyzeService 3）；`node --test`（bot-runtime）→ 45 PASSED；
 `.\gradlew.bat clean build --offline` → BUILD SUCCESSFUL；真实 Paper 1.8.8 + mineflayer + 通道 B 端到端联调通过。
+
+### B1 追加：`spawnBot` 的两种来源（runtime / golem，2026-11-11）
+
+对外 API **未变**（还是 `spawnBot(BotSpec) → BotRequest` + `GladiatorBotReadyEvent`），
+变化只在服务端内部：Bot 由谁创建，由 `config.yml` 的 `spawn.mode` 决定。
+
+| 模式 | Bot 来自 | 登录 | 依赖 |
+|---|---|---|---|
+| `runtime`（默认） | 外部 mineflayer 运行时经通道 A（WS `127.0.0.1:8765`）真实登录 | 是 | `bot-runtime/` |
+| `golem` | Golem 插件在进程内生成的 NMS 身体（`GolemService.spawn`） | 否 | 服务器装 Golem（`softdepend`） |
+
+调用方只需要知道四条语义：
+
+1. **票据与事件不变**：golem 模式通常在同一 tick 内返回 `READY`；若身体晚一 tick 就绪，
+   仍是 `PENDING` + 后续 `GladiatorBotReadyEvent`。超时派发 `GladiatorBotFailedEvent`
+   （reason 前缀 `GOLEM_TIMEOUT:`），`spawn-timeout-seconds` 复用 `bridge.*` 的配置值。
+2. **没有通道 B**：golem 模式没有 WebSocket 会话，
+   - `notice(bot, info)` 不下发帧，落到 Gladiator 本地队列（`MAX_PENDING_NOTICES` 上限内），
+   - `STATE` 帧不存在，状态变化只走 `GladiatorStateChangedEvent`。
+   需要动作级控制的调用方（训练循环）必须走 golem 的 `BotBody` 原语，而不是 `notice`。
+3. **`User.asPlayer()` 可用**：golem 身体不是登录玩家，`Player#isOnline()` 在 1.8.8 恒为 false
+   （实现是 `CraftServer.getPlayer(uuid) != null`），因此 `BotHandle` 的可用判定放宽为
+   `isOnline() || isValid()`。调用方可以正常 `teleport` / 读写背包。
+4. **回收语义**：golem 侧 `despawn` 不发 Bukkit 事件，Gladiator 用 2 秒一次的对账任务
+   （`GolemBodySpawner#reconcile`）清理注册表，并派发 `GladiatorBotRemovedEvent(reason="golem-body-gone")`；
+   未结束的训练/对局会话一并 `endSession`。身体死亡但被 `DeathPolicy.KEEP` 保留时不回收，
+   交给状态机走 `DEAD` / `RESPAWNING`。
+
+调用方**不要**根据 `spawn.mode` 分支写代码：两种模式下 `Bot` / `User` 语义一致，
+差异（登录、通道 B、动作原语）都属于服务端配置与训练侧实现细节。

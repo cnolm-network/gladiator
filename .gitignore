@@ -6,7 +6,9 @@ out/
 *.jar
 # wrapper 必须入库，否则新机器无法执行 ./gradlew；否定规则要放在 *.jar 之后才生效
 !gradle/wrapper/gradle-wrapper.jar
-!libs/*.jar
+# libs/*.jar 是本地构建的编译期依赖（如 golem-api），不入库；占位文件保留目录
+libs/*.jar
+!libs/.gitkeep
 
 # ---- IDE ----
 # 其余 .idea 配置是本机状态，不入库；只共享 Gradle 运行配置（IDE 可直接点 Run）

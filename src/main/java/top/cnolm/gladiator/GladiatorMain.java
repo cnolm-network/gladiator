@@ -15,7 +15,10 @@ import top.cnolm.gladiator.bridge.LinkServer;
 import top.cnolm.gladiator.bridge.SessionRegistry;
 import top.cnolm.gladiator.command.GladiatorCommand;
 import top.cnolm.gladiator.core.BotSpawnService;
+import top.cnolm.gladiator.core.BotSpawner;
 import top.cnolm.gladiator.core.SpectatorService;
+import top.cnolm.gladiator.core.UnavailableSpawner;
+import top.cnolm.gladiator.core.golem.GolemBootstrap;
 import top.cnolm.gladiator.core.GladiatorServiceImpl;
 import top.cnolm.gladiator.core.PlayerStateListener;
 import top.cnolm.gladiator.core.guard.GuardBridge;
@@ -24,6 +27,7 @@ import top.cnolm.gladiator.core.guard.WorldGuardBridge;
 import top.cnolm.gladiator.core.guard.WorldGuardPvpListener;
 
 import java.io.IOException;
+import java.util.Locale;
 import java.util.logging.Level;
 
 /**
@@ -39,7 +43,13 @@ public final class GladiatorMain extends JavaPlugin {
 
     private boolean worldGuardPresent;
     private GladiatorServiceImpl service;
+    /** 运行时模式（通道 A + bot-runtime）的编排器；golem 模式下为 null。 */
     private BotSpawnService spawnService;
+    /** 已接线的 spawn 来源：runtime / golem / 不可用占位。 */
+    private BotSpawner spawner;
+    /** golem 模式的关停钩子；非 golem 模式为 null（避免加载 golem-api 类）。 */
+    private Runnable spawnShutdown;
+    private String spawnMode = "runtime";
     private SpectatorService spectatorService;
     private LinkServer linkServer;
 
@@ -53,9 +63,7 @@ public final class GladiatorMain extends JavaPlugin {
                 ? new WorldGuardBridge(getLogger()) : new NoopGuardBridge();
         service.setGuardBridge(guardBridge);
         long spawnTimeout = getConfig().getLong("bridge.spawn-timeout-seconds", 30L);
-        spawnService = new BotSpawnService(this, service, spawnTimeout);
-        service.attachSpawner(spawnService);
-        getServer().getPluginManager().registerEvents(spawnService, this);
+        wireSpawner(spawnTimeout);
         getServer().getPluginManager().registerEvents(new PlayerStateListener(service), this);
         registerPvpListener();
 
@@ -76,6 +84,7 @@ public final class GladiatorMain extends JavaPlugin {
         getLogger().info("Gladiator " + getDescription().getVersion() + " enabled"
                 + " | api=" + service.getApiVersion()
                 + " | ready=" + service.isReady()
+                + " | spawn=" + spawnMode
                 + " | link=" + (linkServer != null && linkServer.isRunning()
                         ? "127.0.0.1:" + linkServer.getPort() : "down")
                 + " | server=" + getServer().getVersion()
@@ -97,6 +106,11 @@ public final class GladiatorMain extends JavaPlugin {
             spawnService.shutdown();
             spawnService = null;
         }
+        if (spawnShutdown != null) {
+            spawnShutdown.run();
+            spawnShutdown = null;
+        }
+        spawner = null;
         if (linkServer != null) {
             linkServer.stop();
             linkServer = null;
@@ -109,6 +123,61 @@ public final class GladiatorMain extends JavaPlugin {
         GladiatorProvider.uninstall();
         getLogger().info("Gladiator disabled (链路与 API 服务已注销)");
         service = null;
+    }
+
+    /**
+     * 按 {@code spawn.mode} 接线 spawn 来源（B1）。
+     *
+     * <p>{@code runtime}（默认）：通道 A + 外部 mineflayer 运行时，行为与之前一致。
+     * <p>{@code golem}：交给 Golem 插件生成进程内身体；golem 缺失时<strong>不崩溃</strong>，
+     * 挂一个只报错的占位实现，让 {@code /gladiator spawn} 给出中文原因。
+     */
+    private void wireSpawner(long spawnTimeout) {
+        String configured = getConfig().getString("spawn.mode", "runtime");
+        String mode = configured == null ? "runtime" : configured.trim().toLowerCase(Locale.ROOT);
+        if (mode.isEmpty()) {
+            mode = "runtime";
+        }
+        spawnMode = mode;
+
+        if (!"golem".equals(mode)) {
+            if (!"runtime".equals(mode)) {
+                getLogger().warning("未知 spawn.mode=" + configured + "，回落到 runtime");
+                spawnMode = "runtime";
+            }
+            spawnService = new BotSpawnService(this, service, spawnTimeout);
+            spawner = spawnService;
+            service.attachSpawner(spawnService);
+            getServer().getPluginManager().registerEvents(spawnService, this);
+            getLogger().info("spawn mode=runtime（外部 mineflayer 运行时经通道 A 登录）");
+            return;
+        }
+
+        BotSpawner golemSpawner = null;
+        try {
+            golemSpawner = GolemBootstrap.install(this, service, spawnTimeout);
+        } catch (Throwable t) {
+            // golem-api 不在运行期（未装 Golem）时这里会拿到 NoClassDefFoundError，必须降级而不是崩服。
+            getLogger().log(Level.WARNING, "Golem 装配失败（spawn.mode=golem）: " + t, t);
+        }
+        if (golemSpawner == null) {
+            getLogger().warning("spawn.mode=golem 但未检测到 Golem 插件，spawnBot 将失败"
+                    + "（装好 Golem 后重启，或把 spawn.mode 改回 runtime）");
+            UnavailableSpawner unavailable =
+                    new UnavailableSpawner("spawn.mode=golem 但未检测到可用的 Golem 插件");
+            spawner = unavailable;
+            service.attachSpawner(unavailable);
+            return;
+        }
+        final BotSpawner attached = golemSpawner;
+        spawner = golemSpawner;
+        service.attachSpawner(golemSpawner);
+        spawnShutdown = new Runnable() {
+            @Override
+            public void run() {
+                GolemBootstrap.shutdown(attached);
+            }
+        };
     }
 
     /** 从 config.yml 读取链路参数；绑定失败只降级，不阻止插件启用。 */
@@ -171,6 +240,16 @@ public final class GladiatorMain extends JavaPlugin {
 
     public boolean isWorldGuardPresent() {
         return worldGuardPresent;
+    }
+
+    /** {@code spawn=runtime|golem}，供命令与日志使用。 */
+    public String getSpawnMode() {
+        return spawnMode;
+    }
+
+    /** 已接线的 spawn 来源；未启用时为 null。 */
+    public BotSpawner getSpawner() {
+        return spawner;
     }
 
     /** 对外 API 实例；插件未 enable 时为 null。 */

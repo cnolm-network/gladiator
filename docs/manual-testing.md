@@ -140,6 +140,7 @@ $env:PYTHONIOENCODING = "utf-8"
 | 15 | 对手风格 | `--opponent-mode rusher` / `aimbot` | 对手会主动贴脸/几乎每步命中 | ☐ |
 | 16 | 计划与回合（G-620） | 计划设为 `scripted:2` + `rusher:3`，训练回合 2、评估回合 1 | 计划卡显示「共 2 段 · 每回合 5 局 · 训练合计 10 局」；进度卡出现「回合 1/2 · 第 1/2 段」；`report.json` 的 `history` 10 条、`evaluation` 5 条；页面上不存在「阶段计划」「对手模式」控件 | ☐ |
 | 17 | 预设（G-621） | 「保存为预设…」→ 刷新页面 → 加载该预设 | 计划与 max-steps/seed/间距等参数恢复；`dashboard/var/presets/*.json` 出现且不含用户名/端口；删除后卡片消失 | ☐ |
+| 18 | golem 模式（B1） | `config.yml` 设 `spawn.mode: golem`、`server/plugins/` 放 `golem-0.1.0.jar` → 重启 → `/gladiator spawn Goblin_A` → `/gladiator list` | 回显 `state=READY mode=golem（golem 进程内身体，无需登录）`；`list` 显示 `bots=1`、该 Bot `ready=true`；`/golem remove Goblin_A` 后 ≤4s `bots=0` 且日志 `reason=golem-body-gone`。完整清单见 [`golem-integration.md`](golem-integration.md) §8 | ☐ |
 
 ## 8. 常见问题
 

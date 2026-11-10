@@ -27,6 +27,11 @@ Minecraft│ Gladiator 插件                                                   
 | 8766, 8767, … | bot-runtime | 通道 B（观测/动作），每个 Bot 一个 | `--env-port` / `GLADIATOR_ENV_PORT` |
 | 25575 | Paper | RCON，供训练环境摆位/回血/查询 | `server.properties` |
 
+> **`spawn.mode=golem` 时不需要 bot-runtime**：Bot 身体由 Golem 插件在服务端进程内生成，
+> 没有通道 A 会话、也没有 8770+ 的通道 B 端口（因此不可训练）。此时只需 `server/plugins/` 有
+> `gladiator-0.1.0.jar` + `golem-0.1.0.jar`，通道 A（8765）仍照常监听。
+> 配置与验收见 [`golem-integration.md`](golem-integration.md)。
+
 ## 2. 启动顺序
 
 ### 2.1 推荐：启动器 + 浏览器（进程与终端解耦）
@@ -78,6 +83,8 @@ cd training
 | `config.yml` | `bridge.spawn-timeout-seconds` | spawn 后等待登录的上限（默认 30s，超时 `TIMEOUT:`） |
 | `config.yml` | `spectate.enabled` | 是否允许 `/gladiator spectate`（默认 true） |
 | `config.yml` | `training.max-actions-per-second` | 动作节流（默认 10/s/Bot） |
+| `config.yml` | `spawn.mode` | `runtime`（默认，mineflayer 登录）或 `golem`（Golem 进程内身体）；启动期参数，需重启 |
+| `config.yml` | `spawn.golem.world` / `spawn.golem.location` | golem 身体的生成世界（空=第一个世界）与坐标 `x,y,z`（空=世界出生点） |
 | 环境/参数 | `GLADIATOR_TEST_DROP_MS` | **仅测试**：runtime 启动 N ms 后掐一次链路，用于故障注入 |
 
 ## 3.1 Dashboard 的 Java 探测与配置（G-621）
@@ -203,6 +210,8 @@ $env:GLADIATOR_JAVA = 'D:\jdk8\bin\java.exe'
 | `SPAWN_FAILED` 里 `VERSION_MISMATCH` | 客户端版本与服务端不一致 | runtime 用 `--version 1.8.8`（1.8.9 服务端也用该协议版本） |
 | `ONLINE_MODE` / `NOT_WHITELISTED` | 正版校验或白名单拒绝 | 改 `online-mode=false` 或把 Bot 名加入白名单 |
 | `spawn 失败：Bot 已就绪，不能重复 spawn` | 同一用户名已 Ready 或正在 spawn | 先 `/gladiator list`；需要重建时先让 Bot 退出 |
+| `spawn 失败: spawnBot 不可用：spawn.mode=golem 但未检测到可用的 Golem 插件` | `config.yml` 配了 `spawn.mode=golem`，但 `server/plugins/` 里没有 `golem-0.1.0.jar`（或 Golem 未成功装配） | 放入 golem jar 后重启，或把 `spawn.mode` 改回 `runtime`；插件本身仍正常启用 |
+| golem Bot 消失后 `bots` 未立刻归零 | golem 侧 `despawn` 不发 Bukkit 事件，靠 2s 周期对账回收 | 等 ≤4s 再看 `bots`；日志会打印 `Bot 退出: <name> reason=golem-body-gone` |
 | `/gladiator spectate` 后仍是生存模式 | `server/plugins` 里是旧 jar（只跑了 `compileJava`） | `gradlew build` → 重启服务端 → 重新 `spawn` |
 | 观战被 Bot 追打 | 训练环境未启用 `opponents` 过滤（旧版本） | 升级 `training/gladiator_env`；目标只取参赛 Bot |
 | 动作全部 `ACTION_RATE_LIMITED` | 超过 `training.max-actions-per-second` | 降频或调大配置；检查是否重复发同一 seq（应走 `deduped`） |

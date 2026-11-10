@@ -32,7 +32,8 @@ public final class BotRegistry {
         return "glad-" + username.toLowerCase(Locale.ROOT);
     }
 
-    void register(BotHandle handle) {
+    /** 供 spawner（含 golem 模式）在主线程写入。 */
+    public void register(BotHandle handle) {
         Objects.requireNonNull(handle, "handle");
         BotHandle previous = byBotId.put(handle.getBotId(), handle);
         if (previous != null && previous != handle) {
@@ -42,7 +43,8 @@ public final class BotRegistry {
         byUsername.put(key(handle.getUsername()), handle);
     }
 
-    void unregister(BotHandle handle) {
+    /** 供 spawner（含 golem 模式）在主线程移除。 */
+    public void unregister(BotHandle handle) {
         if (handle == null) {
             return;
         }
@@ -81,7 +83,8 @@ public final class BotRegistry {
         return byBotId.size();
     }
 
-    void clear() {
+    /** 供 spawner 在 shutdown 时整体清空。 */
+    public void clear() {
         byBotId.clear();
         byUuid.clear();
         byUsername.clear();

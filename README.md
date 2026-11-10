@@ -27,6 +27,19 @@
 | 只读观战 | 玩家用自己的客户端旁观训练，切 SPECTATOR、退出还原；旁观者不参与对局，也不污染 `nearest_player` 决策 | `docs/spectating.md` |
 | Dashboard + 启动器 | 零第三方依赖的本地 Web 控制台：起停 Paper/runtime、跑训练、人机对战、实时终端、产物与模型可视化、模型导出 | `dashboard/README.md` |
 
+### 两种 Bot 来源
+
+`spawn.mode` 决定 `spawnBot` 的 Bot 从哪来，对外 API 与事件完全一致：
+
+| 模式 | Bot 身体 | 需要 bot-runtime | 通道 B（可训练） | 适用 |
+|---|---|---|---|---|
+| `runtime`（默认） | mineflayer 真实登录，服务端拿到真实 `CraftPlayer` | 是（每 Bot 一个 Node 进程） | 有 | 训练、压测、协议行为验证 |
+| `golem` | Golem 插件在服务端进程内生成的 NMS 身体（不登录） | 否 | 无 | 对局 / 陪练 / 演出，启动快、无登录失败 |
+
+golem 是独立插件（`softdepend: [Golem]`），未安装时 Gladiator 照常启用、`spawnBot` 返回中文错误。
+配置、装配时序、验收命令与已知限制（无通道 B、部分交互事件不触发、出生无敌 60 tick 等）见
+[`docs/golem-integration.md`](docs/golem-integration.md)。
+
 ---
 
 ## 架构
@@ -207,6 +220,7 @@ npm install
 | `docs/training-plan-ui.md` | 训练计划 / 预设 / reward 预设的 UI 与接口口径（含多场地边界） |
 | `docs/scripting.md` | 脚本与颜色现状、`.gmod` 装载、阶段规划 |
 | `docs/models.md` | 模型注册表、`.gmod` 格式与热扫描、持久化训练、多场地融合、可视化、导出与可移植性 |
+| `docs/golem-integration.md` | **golem 接入**：两种 Bot 来源对比、`spawn.mode=golem` 配置与装配、`spawnBot` 行为、验收命令、已知限制 |
 | `docs/spectating.md` | 只读观战：命令、权限、行为，以及为什么不会干扰训练 |
 | `docs/operations.md` | 端口与启动顺序、Java 探测、打开文件夹、日志/锁/trash、排障表 |
 | `docs/manual-testing.md` | 真机联调步骤与期望日志 |
@@ -245,7 +259,7 @@ npm install
 1. **Bot 是外部进程**：bot-runtime 独立于服务端 JVM，训练/对局期间必须保证进程与通道 B 端口存活；Dashboard 只托管它自己拉起的实例。
 2. **Bot 目前一律离线登录**：`auth: 'offline'` + 服务端 `online-mode=false`，因此 Bot 与真人共用用户名空间，`BotSpec` 只校验格式、不校验占用（与在线玩家/历史玩家重名会被顶号或被踢）。命名空间、占用前置检查与正版/代理两条长期路线的方案见 `docs/identity-and-action-space.md`。
 3. **动作空间是「宏动作」**：11 个离散动作把「选槽 + 右键 + 按住」写死，新增物品要加动作并重训；物品无关的 v2 动作空间（能力表 + `slot`/`use` 正交 + action mask）同见 `docs/identity-and-action-space.md`。
-4. **不做 NMS 伪玩家**：不伪造 `PlayerConnection` / `CraftPlayer`，每个 Bot 都是真实协议登录；也因此没有「离线假人」这类捷径。
+4. **不做 NMS 伪玩家**：Gladiator 本体不伪造 `PlayerConnection` / `CraftPlayer`；`runtime` 模式下每个 Bot 都是真实协议登录，也因此没有「离线假人」这类捷径。需要进程内身体时改用 `spawn.mode=golem`，NMS 由独立插件 Golem 承担（见 `docs/golem-integration.md`）。
 5. **反作弊与环境准备归调用方**：权限组、区域放行、白名单、反作弊豁免都在调用方 `init` 阶段完成；Gladiator 源码、配置与默认值中不出现任何反作弊插件名或权限节点。
 6. **A1–A9 待真机实测**：方块放置朝向、物品使用时序、WG 事件时机、高频攻击、pathfinder 代价、竞技场插件取消死亡/重生事件时状态机是否仍迁移等，仍需在真实服上逐项验收（见 `docs/feasibility.md`、`TASKS.md` §A）。
 7. **训练是单智能体 + 脚本对手**：当前学到的是「打脚本/随机对手」的策略；自博弈与真实人类对手需要扩展 Trainer。

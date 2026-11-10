@@ -3,7 +3,9 @@ main: top.cnolm.gladiator.GladiatorMain
 version: ${version}
 author: cnolm
 description: AI bot orchestration and training framework (Layer 1)
-softdepend: [WorldGuard]
+# Golem 是可选依赖：仅 spawn.mode=golem 时需要。绝不能写成 depend，
+# 否则没装 Golem 的服务器会直接跳过 Gladiator 的加载。
+softdepend: [WorldGuard, Golem]
 commands:
   gladiator:
     description: Gladiator 管理命令

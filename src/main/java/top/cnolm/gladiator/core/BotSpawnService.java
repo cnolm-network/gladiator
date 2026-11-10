@@ -44,7 +44,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * 已绑定成功的 handle 不会因为链路断开而被回收：只要 mineflayer 进程还活着，玩家实体就仍在服务器里；
  * 进程真正死亡时 Minecraft 连接会断，{@link PlayerQuitEvent} 负责最终清理。
  */
-public final class BotSpawnService implements Listener {
+public final class BotSpawnService implements BotSpawner, Listener {
 
     private static final Gson GSON = new Gson();
 
@@ -76,10 +76,12 @@ public final class BotSpawnService implements Listener {
         this.linkServer = linkServer;
     }
 
+    @Override
     public BotRegistry getRegistry() {
         return registry;
     }
 
+    @Override
     public int getPendingCount() {
         return byRequestId.size();
     }
@@ -88,6 +90,7 @@ public final class BotSpawnService implements Listener {
     // 调用方入口（主线程）
     // ------------------------------------------------------------------
 
+    @Override
     public BotRequest spawn(BotSpec spec) {
         Objects.requireNonNull(spec, "spec");
         String username = spec.getUsername();
@@ -202,6 +205,7 @@ public final class BotSpawnService implements Listener {
      * WELCOME 的 {@code playerUuid}（G-103 收尾）：已绑定则返回真实 UUID，
      * 已登录但尚未绑定则按用户名解析 Bukkit Player，未知返回 {@code null}（链路层写空串）。
      */
+    @Override
     public String playerUuid(String username) {
         BotHandle handle = registry.findByUsername(username);
         if (handle != null) {
@@ -349,6 +353,7 @@ public final class BotSpawnService implements Listener {
      *
      * @return false 表示链路/会话不可用，调用方应回落到本地队列
      */
+    @Override
     public boolean sendNotice(String botId, Information information) {
         SessionRegistry.Session session = sessionFor(botId);
         if (session == null || information == null) {
@@ -363,6 +368,7 @@ public final class BotSpawnService implements Listener {
     }
 
     /** 向该 Bot 的会话推送 STATE（协议 §2.4）；Bot 不在或未连链路时静默跳过。 */
+    @Override
     public void sendState(User user, UserState previous, UserState state, String reason) {
         if (user == null || state == null) {
             return;

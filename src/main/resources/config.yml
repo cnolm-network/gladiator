@@ -20,6 +20,17 @@ training:
   # 空闲判定：连续无动作且无对局事件超过该秒数后下发 IDLE
   idle-after-seconds: 15
 
+spawn:
+  # runtime = 外部 mineflayer 运行时（默认，走通道 A 真实登录）
+  # golem   = 进程内 NMS 身体（需要 Golem 插件；不登录、不依赖 bot-runtime）
+  # golem 缺失时插件仍会启用，但 spawnBot 会返回"未检测到 Golem"的中文错误。
+  mode: runtime
+  golem:
+    # 身体生成世界；留空取第一个世界
+    world: ""
+    # 生成坐标 x,y,z；留空取该世界的出生点
+    location: ""
+
 worldguard:
   # 未安装 WorldGuard 时是否允许降级运行（全部判定为允许）
   allow-degraded: true
