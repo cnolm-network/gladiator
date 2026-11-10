@@ -443,8 +443,10 @@ motX/motY/motZ 修正（击退，方向由 yaw 决定）
 
 要点：
 
-- **暴击 = `fallDistance > 0 && !onGround && !isInWater() && !isPassenger() && !hasEffect(BLINDNESS)
-  && vehicle == null`**。想模拟"跳砍暴击"，只需让实体真的跳起来并保持 `fallDistance > 0` 时调 `attack`——
+- **暴击判定的字段组合**：`fallDistance > 0` + `!onGround` + `!k_()` + `!V()` + `!hasEffect(BLINDNESS)` + `vehicle == null`
+  （`k_()` / `V()` 在 1.8.9 的语义按 1.9+ 对应关系推定为"在水中"/"骑乘中"，**未逐一验证**；
+  但 `fallDistance > 0 && !onGround` 这一对是确定的核心条件）。
+  想模拟"跳砍暴击"，只需让实体真的跳起来并在下落时调 `attack`——
   这也是为什么移动必须走原版 `g()`/`move()`，而不是瞬移。
 - **击退走 `motX/motZ` 增量**，方向由实体 `yaw` 决定。所以 `look` 必须先于 `attack` 生效（本项目 11 个
   动作本来就都以 `look` 开头，见 `docs/observation.md` §5.2），否则击退方向会错。
