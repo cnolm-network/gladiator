@@ -54,6 +54,7 @@ $include = @(
     'docs/next-steps.md',
     'docs/identity-and-action-space.md',
     'docs/production-deployment.md',
+    'docs/golem-integration.md',
     'docs/research-server-side-bots.md',
     'docs/training-env-api.md',
     'docs/training-plan-ui.md',
