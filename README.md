@@ -216,6 +216,7 @@ npm install
 | `docs/decisions.md` | ADR 决策记录（只追加） |
 | `docs/feasibility.md` | 可行性验证与风险清单（含 A1–A9） |
 | `docs/integration-ultrapvp.md` | 参考调用方的只读勘察结论（不是依赖） |
+| `docs/identity-and-action-space.md` | 身份（离线登录/重名/正版/代理）与动作空间 v2（能力表 + 槽位/使用分离）方案 |
 | `ARCHITECTURE.md` | 四层划分、进程拓扑、关键数据流、状态机 |
 | `HANDOVER.md` / `TASKS.md` / `PROJECT_PLAN.md` | 交接记录、任务台账、验收计划（**内部文档，不发布**） |
 
@@ -241,12 +242,14 @@ npm install
 ## 已知限制
 
 1. **Bot 是外部进程**：bot-runtime 独立于服务端 JVM，训练/对局期间必须保证进程与通道 B 端口存活；Dashboard 只托管它自己拉起的实例。
-2. **不做 NMS 伪玩家**：不伪造 `PlayerConnection` / `CraftPlayer`，每个 Bot 都是真实协议登录；也因此没有「离线假人」这类捷径。
-3. **反作弊与环境准备归调用方**：权限组、区域放行、白名单、反作弊豁免都在调用方 `init` 阶段完成；Gladiator 源码、配置与默认值中不出现任何反作弊插件名或权限节点。
-4. **A1–A9 待真机实测**：方块放置朝向、物品使用时序、WG 事件时机、高频攻击、pathfinder 代价、竞技场插件取消死亡/重生事件时状态机是否仍迁移等，仍需在真实服上逐项验收（见 `docs/feasibility.md`、`TASKS.md` §A）。
-5. **训练是单智能体 + 脚本对手**：当前学到的是「打脚本/随机对手」的策略；自博弈与真实人类对手需要扩展 Trainer。
-6. **模型颜色尚未下发**：`.gmod` 的 `color` 目前仅作元数据展示，Bot 名字前缀颜色仍由 `dashboard/var/scripts.json` + 调用方 `tagcolor` 决定。
-7. **Windows 优先**：Dashboard 的进程管理、打开文件夹、启动器为 Windows 实现；其它平台可只跑插件 + CLI 训练。
+2. **Bot 目前一律离线登录**：`auth: 'offline'` + 服务端 `online-mode=false`，因此 Bot 与真人共用用户名空间，`BotSpec` 只校验格式、不校验占用（与在线玩家/历史玩家重名会被顶号或被踢）。命名空间、占用前置检查与正版/代理两条长期路线的方案见 `docs/identity-and-action-space.md`。
+3. **动作空间是「宏动作」**：11 个离散动作把「选槽 + 右键 + 按住」写死，新增物品要加动作并重训；物品无关的 v2 动作空间（能力表 + `slot`/`use` 正交 + action mask）同见 `docs/identity-and-action-space.md`。
+4. **不做 NMS 伪玩家**：不伪造 `PlayerConnection` / `CraftPlayer`，每个 Bot 都是真实协议登录；也因此没有「离线假人」这类捷径。
+5. **反作弊与环境准备归调用方**：权限组、区域放行、白名单、反作弊豁免都在调用方 `init` 阶段完成；Gladiator 源码、配置与默认值中不出现任何反作弊插件名或权限节点。
+6. **A1–A9 待真机实测**：方块放置朝向、物品使用时序、WG 事件时机、高频攻击、pathfinder 代价、竞技场插件取消死亡/重生事件时状态机是否仍迁移等，仍需在真实服上逐项验收（见 `docs/feasibility.md`、`TASKS.md` §A）。
+7. **训练是单智能体 + 脚本对手**：当前学到的是「打脚本/随机对手」的策略；自博弈与真实人类对手需要扩展 Trainer。
+8. **模型颜色尚未下发**：`.gmod` 的 `color` 目前仅作元数据展示，Bot 名字前缀颜色仍由 `dashboard/var/scripts.json` + 调用方 `tagcolor` 决定。
+9. **Windows 优先**：Dashboard 的进程管理、打开文件夹、启动器为 Windows 实现；其它平台可只跑插件 + CLI 训练。
 
 ---
 

@@ -51,6 +51,8 @@ $include = @(
     'docs/api-contract.md',
     'docs/protocol.md',
     'docs/observation.md',
+    'docs/next-steps.md',
+    'docs/identity-and-action-space.md',
     'docs/training-env-api.md',
     'docs/training-plan-ui.md',
     'docs/scripting.md',
