@@ -65,6 +65,23 @@
 做法：直接复用 `docs/manual-testing.md` 的清单 + `training/scripts/chaos.py` 的故障注入；
 每项通过后在 `TASKS.md` 附录 A 勾掉并写一条变更日志。**这一批不需要写新代码**，只补脚本与记录。
 
+## P0-C · 生产化：让陪练 Bot 合法进正版服（详见 `docs/production-deployment.md`）
+
+现状：只有离线登录（`auth:'offline'`），只能在自有 Paper 里跑；训练侧没问题，**交付侧不成立**。
+关键结论：NMS 假玩家不登录、出不了自家服，解决不了「进正版生产服」；唯一合法路径是
+**真实客户端 + 正版账号**（mineflayer `auth:'microsoft'` 或插件内 Java 协议客户端）。
+
+1. **C1 · 正版登录打通（1–2 天，最高优先）**：`--auth microsoft` + `profilesFolder` 账号池
+   （`config/accounts.json` 不入库）；失败码补 `INVALID_SESSION` / `RATE_LIMITED` / `AUTH_REQUIRED`；
+   验收 = `online-mode=true` 服上真实登录、真实 UUID、白名单放行、重连复用 session。
+2. **C2 · `.gmod` 进插件（2–3 天）**：Java 侧解 `npz`（zip 内 `.npy`）+ MLP 前向（1995 float），
+   与 Python `Policy.forward` 交叉验证（1e-6）；插件扫描 `models/*.gmod`，`/gladiator models` 管理。
+3. **C3 · 单 jar 形态（2–4 周，按需）**：若生产服不能跑 Node，用 MCProtocolLib 或自写 1.8.9 协议子集
+   把客户端搬进 JVM（仍是真实登录），动作/观测语义与 `bot-runtime` 保持一致。
+4. **C+ · NMS 假玩家（可选，需 ADR-018 批准）**：仅自有服、默认关；代价是自实现攻击冷却/击退/reach/暴击。
+
+决策请求：①是否批准 ADR-018（放开 NMS 的唯一例外）；②生产服形态是 A（可跑 Node）/ B（只给 jar）/ C（只自家服）。
+
 ## P1 · 把策略从「会打」推到「能赢」（主线，1–2 周）
 
 现在 reward 与胜率脱节（mean reward 高但命中少），三个改动按顺序做：
@@ -107,5 +124,5 @@
 
 ## 一句话
 
-**先把身份（命名空间 + 占用检查）和 A1–A9 用真机钉死，再把动作空间换成 v2、把「胜率」变成唯一优化目标，
-最后才谈更花哨的模型。**
+**先让 Bot 能合法登录正版服（P0-C1）、把身份与 A1–A9 用真机钉死，再换动作空间 v2、
+把「胜率」变成唯一优化目标，最后才谈更花哨的模型。**

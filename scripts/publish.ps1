@@ -25,7 +25,7 @@
 param(
     [string] $SourceDir = 'D:\cbot-gladiator',
     [string] $ExportDir = 'D:\cbot-gladiator-public',
-    [string] $Remote = 'https://github.com/CnolmLab/gladiator.git',
+    [string] $Remote = 'https://github.com/cnolm-network/gladiator.git',
     [string] $Message = 'release: sync Gladiator public snapshot',
     [switch] $NoPush
 )
@@ -53,6 +53,7 @@ $include = @(
     'docs/observation.md',
     'docs/next-steps.md',
     'docs/identity-and-action-space.md',
+    'docs/production-deployment.md',
     'docs/training-env-api.md',
     'docs/training-plan-ui.md',
     'docs/scripting.md',

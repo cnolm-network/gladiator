@@ -216,6 +216,7 @@ npm install
 | `docs/decisions.md` | ADR 决策记录（只追加） |
 | `docs/feasibility.md` | 可行性验证与风险清单（含 A1–A9） |
 | `docs/integration-ultrapvp.md` | 参考调用方的只读勘察结论（不是依赖） |
+| `docs/production-deployment.md` | 生产化部署：正版登录 / 单 jar 客户端 / NMS 可选项的取舍与路线 |
 | `docs/identity-and-action-space.md` | 身份（离线登录/重名/正版/代理）与动作空间 v2（能力表 + 槽位/使用分离）方案 |
 | `ARCHITECTURE.md` | 四层划分、进程拓扑、关键数据流、状态机 |
 | `HANDOVER.md` / `TASKS.md` / `PROJECT_PLAN.md` | 交接记录、任务台账、验收计划（**内部文档，不发布**） |
