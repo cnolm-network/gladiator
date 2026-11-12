@@ -401,27 +401,55 @@ public final class GladiatorCommand implements CommandExecutor {
             sender.sendMessage("[Gladiator] pvp 失败：API 尚未就绪");
             return;
         }
-        if (!(sender instanceof Player)) {
-            sender.sendMessage("[Gladiator] pvp 需要玩家执行（提供世界上下文）");
+        if (args.length < 4 || args.length > 5) {
+            sender.sendMessage("[Gladiator] 用法: /" + label + " pvp <x> <y> <z> [botName]");
+            sender.sendMessage("[Gladiator] 省略 botName 时以执行者身份查询；"
+                    + "给 botName 时以该 Bot 身份查询（控制台可用，能命中观测式 deny 缓存）");
             return;
         }
-        if (args.length < 4) {
-            sender.sendMessage("[Gladiator] 用法: /" + label + " pvp <x> <y> <z>");
+        // 带 botName：以 Bot 身份查（观测式 deny 按 Bot 隔离，控制台没有玩家上下文）
+        org.bukkit.World world = null;
+        User user = null;
+        if (args.length == 5) {
+            String botName = args[4];
+            Bot bot = plugin.getService() == null
+                    ? null : plugin.getService().findBot(BotRegistry.botIdFor(botName));
+            if (bot == null) {
+                sender.sendMessage("[Gladiator] 找不到这个 Bot：" + botName);
+                return;
+            }
+            user = bot;
+            Player asPlayer = bot.asPlayer();
+            world = asPlayer != null ? asPlayer.getWorld() : null;
+        } else {
+            if (!(sender instanceof Player)) {
+                sender.sendMessage("[Gladiator] pvp 需要玩家执行，或追加 botName 以 Bot 身份查询");
+                return;
+            }
+            Player player = (Player) sender;
+            user = Users.of(player);
+            world = player.getWorld();
+        }
+        if (world == null) {
+            world = org.bukkit.Bukkit.getWorlds().isEmpty()
+                    ? null : org.bukkit.Bukkit.getWorlds().get(0);
+        }
+        if (world == null) {
+            sender.sendMessage("[Gladiator] pvp 失败：服务端没有可用世界");
             return;
         }
-        Player player = (Player) sender;
         try {
             double x = Double.parseDouble(args[1]);
             double y = Double.parseDouble(args[2]);
             double z = Double.parseDouble(args[3]);
             PvpVerdict verdict = api.queryPvp(
-                    new org.bukkit.Location(player.getWorld(), x, y, z), Users.of(player));
+                    new org.bukkit.Location(world, x, y, z), user);
             sender.sendMessage("[Gladiator] pvp allowed=" + verdict.isAllowed()
                     + " source=" + verdict.getSource().name().toLowerCase(Locale.ROOT)
                     + " regions=" + verdict.getRegionIds()
                     + " box=" + verdict.getBox());
         } catch (NumberFormatException e) {
-            sender.sendMessage("[Gladiator] 坐标必须是数字: /" + label + " pvp <x> <y> <z>");
+            sender.sendMessage("[Gladiator] 坐标必须是数字: /" + label + " pvp <x> <y> <z> [botName]");
         }
     }
 }

@@ -171,15 +171,42 @@ public interface GladiatorAPI {
 }
 ```
 
-**规则查询语义（G-204）**：`queryPvp` 只读区域配置，**绝不修改区域、绝不取消任何事件**。
-`PvpVerdict.source` 取值 `FLAG`（区域里显式配置了 PVP flag）/ `GLOBAL`（无显式 flag，按全局）/ `DEGRADED`（未装 WorldGuard，一律 allow）/ `UNKNOWN`（坐标或世界不可用）。
-`regionIds` 为命中区域 id（可能多个），`box` 为这些区域的并集包围盒（可能为 null）。未装 WorldGuard 时首次查询会打印一次降级说明（G-205）。
+**规则查询语义（G-204 / A3）**：`queryPvp` 只读区域配置，**绝不修改区域、绝不取消任何事件**。
+查询顺序自 A3 起是两步：
+
+1. **先查「观测到的拒绝」**（`ObservedDenials`，按 Bot 隔离）：该 Bot 在最近
+   `guard.observed-ttl-seconds` 秒内、在查询点 `guard.observed-radius` 格范围内，
+   被任意插件取消过攻击/交互 → 直接返回 `allow=false, source=OBSERVED`，**不再查询 WorldGuard**；
+2. 未命中才走 WorldGuard 桥接（或未装时的降级实现）。
+
+`PvpVerdict.source` 取值 `FLAG`（区域里显式配置了 PVP flag）/ `GLOBAL`（无显式 flag，按全局）/ `DEGRADED`（未装 WorldGuard，一律 allow）/ `UNKNOWN`（坐标或世界不可用）/ `OBSERVED`（来自实时观测的拒绝，见下）。
+`regionIds` 为命中区域 id（可能多个；`OBSERVED` 恒为空列表——Gladiator 不知道是谁拒的），`box` 为这些区域的并集包围盒（`OBSERVED` 时为观测点 ± 半径的立方体，可能为 null）。未装 WorldGuard 时首次查询会打印一次降级说明（G-205）。
+
+**观测式反馈（A3，2026-11-13 追加）**：Gladiator 不调用任何领地/反作弊插件的 API，只从 Bukkit 事件
+（`EntityDamageByEntityEvent` / `PlayerInteractEvent` / `BlockPlaceEvent` / `BlockBreakEvent` 的
+`isCancelled()`）学习「这个 Bot 在这里被拒了」，并：
+
+* 累计 `Analysis` 里的 `ruleDenials`；
+* 写短期缓存 `ObservedDenials`（每 Bot 最多 16 条，TTL 默认 60s，半径默认 8 格）；
+* 给该 Bot 推一条 `RULE_DENIED` 通知（payload：`action` / `reason` / `regionIds=[]` /
+  `source="observed"` / `location` / `expiresAt`）。
+
+配置项（`config.yml`）：
+
+```yaml
+guard:
+  observed-ttl-seconds: 60   # 观测记录有效期
+  observed-radius: 8.0       # 观测记录作用半径（格）
+```
+
+语义边界：观测式判定**只对观测到的那只 Bot 生效**，且只在 TTL 内、半径内生效；
+TTL 到期后自动回到 WorldGuard / 降级判定。它不产生 `regionIds`，也不代表「这里永久禁止 PVP」。
 
 ```java
 public final class PvpVerdict {
     public boolean isAllowed();
     public List<String> getRegionIds();
-    public Source getSource();   // FLAG / GLOBAL / DEGRADED / UNKNOWN
+    public Source getSource();   // FLAG / GLOBAL / DEGRADED / UNKNOWN / OBSERVED
     public Box getBox();         // minX/minY/minZ/maxX/maxY/maxZ
 }
 ```

@@ -65,6 +65,10 @@ public final class GladiatorMain extends JavaPlugin {
         long spawnTimeout = getConfig().getLong("bridge.spawn-timeout-seconds", 30L);
         wireSpawner(spawnTimeout);
         getServer().getPluginManager().registerEvents(new PlayerStateListener(service), this);
+        // A3：观测式 deny 反馈。无条件注册——不依赖 WorldGuard 或任何其它插件，
+        // 只要有插件取消了 Bot 的伤害/交互，就会被记成一次 deny。
+        getServer().getPluginManager().registerEvents(
+                new top.cnolm.gladiator.core.guard.DenialFeedbackListener(service), this);
         registerPvpListener();
 
         // 只读观战：玩家进服后可用 /gladiator spectate 旁观 Bot 训练。

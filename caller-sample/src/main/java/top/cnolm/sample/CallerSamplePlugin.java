@@ -62,6 +62,8 @@ public final class CallerSamplePlugin extends JavaPlugin {
 
     private GladiatorAPI api;
     private Listener active;
+    /** A3 验收用的假领地插件（不依赖 WorldGuard）。 */
+    private DenyZone denyZone;
     private String activeName;
 
     @Override
@@ -138,6 +140,9 @@ public final class CallerSamplePlugin extends JavaPlugin {
             sender.sendMessage("§e[A8] 开始：两场独立对局的数据隔离探针（4 只 Bot，约 2–10 秒）");
             new top.cnolm.sample.probe.A8Probe(this, api, sender, spawn).start();
             return true;
+        }
+        if ("denyzone".equals(sub)) {
+            return handleDenyZone(sender, label, args);
         }
         if ("a9".equals(sub)) {
             if (args.length < 2) {
@@ -337,6 +342,65 @@ public final class CallerSamplePlugin extends JavaPlugin {
     }
 
     /** [x y z] 可省略；省略时用执行者（或世界出生点）当前位置。 */
+    /**
+     * A3 验收：假领地插件。<b>不依赖 WorldGuard</b>，只是用 LOWEST 取消球体内的伤害。
+     *
+     * <pre>
+     * /caller denyzone &lt;x&gt; &lt;y&gt; &lt;z&gt; &lt;radius&gt;
+     * /caller denyzone list
+     * /caller denyzone clear
+     * </pre>
+     */
+    private boolean handleDenyZone(CommandSender sender, String label, String[] args) {
+        if (denyZone == null) {
+            denyZone = new DenyZone(this);
+        }
+        if (args.length < 2) {
+            sender.sendMessage("用法: /" + label + " denyzone <x> <y> <z> <radius> | list | clear");
+            return true;
+        }
+        String action = args[1].toLowerCase(java.util.Locale.ROOT);
+        if ("list".equals(action)) {
+            if (denyZone.isEmpty()) {
+                sender.sendMessage("§e[denyzone] 当前没有保护区");
+                return true;
+            }
+            sender.sendMessage("§e[denyzone] 共 " + denyZone.list().size() + " 个保护区：");
+            for (DenyZone.Zone zone : denyZone.list()) {
+                sender.sendMessage("§7- §f" + zone);
+            }
+            return true;
+        }
+        if ("clear".equals(action)) {
+            int count = denyZone.list().size();
+            denyZone.clear();
+            sender.sendMessage("§e[denyzone] 已清除 " + count + " 个保护区（监听器已注销）");
+            return true;
+        }
+        if (args.length < 5) {
+            sender.sendMessage("用法: /" + label + " denyzone <x> <y> <z> <radius>");
+            return true;
+        }
+        try {
+            double x = Double.parseDouble(args[1]);
+            double y = Double.parseDouble(args[2]);
+            double z = Double.parseDouble(args[3]);
+            double radius = Double.parseDouble(args[4]);
+            org.bukkit.World world = defaultWorld();
+            if (world == null) {
+                sender.sendMessage("§c没有可用世界");
+                return true;
+            }
+            DenyZone.Zone zone = new DenyZone.Zone(new Location(world, x, y, z), radius);
+            denyZone.add(zone);
+            sender.sendMessage("§a[denyzone] 已建立保护区 §f" + zone
+                    + " §7（LOWEST 取消其中的玩家伤害）");
+        } catch (NumberFormatException ex) {
+            sender.sendMessage("§c坐标/半径必须是数字");
+        }
+        return true;
+    }
+
     /** 用于把 `/caller a9 normal A9_R1` 与 `/caller a9 normal 0 4 0` 区分开。 */
     private static boolean isNumber(String text) {
         if (text == null || text.isEmpty()) {

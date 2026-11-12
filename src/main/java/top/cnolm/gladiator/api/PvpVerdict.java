@@ -13,7 +13,9 @@ import java.util.Objects;
  *   <li>{@link Source#FLAG}：命中的 WorldGuard 区域显式设置了 pvp flag；</li>
  *   <li>{@link Source#GLOBAL}：无区域覆盖或区域未设置该 flag，回落到全局默认；</li>
  *   <li>{@link Source#DEGRADED}：未安装 WorldGuard，按 allow 降级；</li>
- *   <li>{@link Source#UNKNOWN}：无法判定（世界未加载等），按 allow 放行并由调用方记录。</li>
+ *   <li>{@link Source#UNKNOWN}：无法判定（世界未加载等），按 allow 放行并由调用方记录；</li>
+ *   <li>{@link Source#OBSERVED}：来自<b>观测到的拒绝</b>（A3）——别的插件取消过该 Bot 的
+ *       攻击/交互，Gladiator 据此在短期内直接判 deny，不再查询 WorldGuard。</li>
  * </ul>
  *
  * <p>不可变对象，可跨线程读取。
@@ -25,7 +27,9 @@ public final class PvpVerdict {
         FLAG,
         GLOBAL,
         DEGRADED,
-        UNKNOWN
+        UNKNOWN,
+        /** 观测式判定：近期该 Bot 在同一区域被别的插件拒绝过（见 {@code ObservedDenials}）。 */
+        OBSERVED
     }
 
     /** 轴对齐三维包围盒（世界坐标，含边界）。 */

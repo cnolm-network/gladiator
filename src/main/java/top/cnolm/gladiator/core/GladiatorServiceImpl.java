@@ -24,6 +24,7 @@ import top.cnolm.gladiator.api.event.GladiatorBotRemovedEvent;
 import top.cnolm.gladiator.api.event.GladiatorSessionEndedEvent;
 import top.cnolm.gladiator.api.event.GladiatorStateChangedEvent;
 import top.cnolm.gladiator.core.guard.GuardBridge;
+import top.cnolm.gladiator.core.guard.ObservedDenials;
 import top.cnolm.gladiator.core.guard.NoopGuardBridge;
 
 import java.util.ArrayDeque;
@@ -78,8 +79,20 @@ public final class GladiatorServiceImpl implements GladiatorAPI, UserStateRegist
     private final Map<String, SessionCounters> counters =
             new ConcurrentHashMap<String, SessionCounters>();
 
+    /** 观测到的拒绝（A3）：短期缓存，命中即判 deny，不再查 WorldGuard。 */
+    private final ObservedDenials observedDenials = new ObservedDenials();
+    /** 观测记录有效期（毫秒）；{@code guard.observed-ttl-seconds}。 */
+    private final long observedTtlMillis;
+    /** 观测记录的作用半径（格）；{@code guard.observed-radius}。 */
+    private final double observedRadius;
+
     public GladiatorServiceImpl(Plugin plugin) {
         this.plugin = Objects.requireNonNull(plugin, "plugin");
+        org.bukkit.configuration.file.FileConfiguration config = plugin.getConfig();
+        long ttlSeconds = config == null ? 60L : config.getLong("guard.observed-ttl-seconds", 60L);
+        this.observedTtlMillis = Math.max(1L, ttlSeconds) * 1000L;
+        double radius = config == null ? 8.0D : config.getDouble("guard.observed-radius", 8.0D);
+        this.observedRadius = radius > 0D ? radius : 8.0D;
     }
 
     // ------------------------------------------------------------------
@@ -316,6 +329,11 @@ public final class GladiatorServiceImpl implements GladiatorAPI, UserStateRegist
     public PvpVerdict queryPvp(Location location, User user) {
         requirePrimaryThread();
         Objects.requireNonNull(location, "location");
+        // A3：先看「有没有观测到过拒绝」——命中就不必再去问 WorldGuard。
+        PvpVerdict observed = observedVerdict(location, user);
+        if (observed != null) {
+            return observed;
+        }
         GuardBridge current = guard;
         if (!current.isAvailable() && !degradeWarned) {
             degradeWarned = true;
@@ -412,6 +430,9 @@ public final class GladiatorServiceImpl implements GladiatorAPI, UserStateRegist
         if (current != null) {
             current.sendState(user, from, to, reason);
         }
+        // 状态迁移同时落控制台：排障时不必挂插件即可确认「死亡→重生」是否真的走了。
+        plugin.getLogger().info("STATE " + user.getName() + " " + from + " \u2192 " + to
+                + " (" + reason + ")");
         Bukkit.getPluginManager().callEvent(new GladiatorStateChangedEvent(user, from, to));
     }
 
@@ -477,6 +498,86 @@ public final class GladiatorServiceImpl implements GladiatorAPI, UserStateRegist
         } else {
             current.addBlockBroken();
         }
+    }
+
+    /**
+     * 观测式拒绝（A3）：别的插件取消了 Bot 的攻击/交互，这里记一条 deny。
+     *
+     * <p>三件事：累计 {@code ruleDenials}、写 {@link ObservedDenials} 短期缓存、
+     * 给该 Bot 推一条 {@code RULE_DENIED} 通知（{@code source=observed}）。
+     * <strong>不依赖任何外部插件 API</strong>，也不关心是谁取消的。
+     */
+    public void handleActionDenied(Bot bot, String action, Location location, String reason) {
+        if (bot == null) {
+            return;
+        }
+        requirePrimaryThread();
+        String safeAction = action == null || action.isEmpty() ? "unknown" : action;
+        String safeReason = reason == null || reason.isEmpty() ? "denied" : reason;
+        Location at = location != null ? location : bot.asPlayer() == null
+                ? null : bot.asPlayer().getLocation();
+
+        long expiresAt = System.currentTimeMillis() + observedTtlMillis;
+        ensureCounters(bot.getBotId()).addRuleDenial();
+        if (at != null) {
+            observedDenials.record(new ObservedDenials.Entry(bot.getBotId(),
+                    at.getX(), at.getY(), at.getZ(), observedRadius, safeAction, expiresAt));
+        }
+
+        notice(bot, Information.of(InformationKind.RULE_DENIED,
+                deniedPayload(safeAction, safeReason, at, expiresAt)));
+
+        plugin.getLogger().info("RULE_DENIED bot=" + bot.getName()
+                + " action=" + safeAction + " reason=" + safeReason
+                + " source=observed location=" + (at == null ? "-" : describeLocation(at))
+                + " ttl=" + (observedTtlMillis / 1000L) + "s radius=" + observedRadius);
+    }
+
+    /**
+     * 观测式 deny 的通知载荷。
+     *
+     * <p>字段固定：{@code action / reason / regionIds=[] / source="observed" / location / expiresAt}；
+     * 观测式反馈不产出区域 id（Gladiator 并不知道是哪个领地拒的），因此 {@code regionIds} 恒为空列表。
+     */
+    static Map<String, Object> deniedPayload(String action, String reason,
+                                             Location location, long expiresAt) {
+        Map<String, Object> payload = new LinkedHashMap<String, Object>();
+        payload.put("action", action);
+        payload.put("reason", reason);
+        payload.put("regionIds", new ArrayList<String>());
+        payload.put("source", "observed");
+        payload.put("location", location == null ? "" : describeLocation(location));
+        payload.put("expiresAt", Long.valueOf(expiresAt));
+        return payload;
+    }
+
+    /** 命中观测缓存时给出 deny；未命中返回 null（继续走 guard bridge）。 */
+    private PvpVerdict observedVerdict(Location location, User user) {
+        if (user == null) {
+            return null;
+        }
+        Bot bot = findBotByUniqueId(user.getUniqueId());
+        if (bot == null) {
+            return null;
+        }
+        ObservedDenials.Entry hit = observedDenials.match(bot.getBotId(),
+                location.getX(), location.getY(), location.getZ(), System.currentTimeMillis());
+        if (hit == null) {
+            return null;
+        }
+        return PvpVerdict.of(false, Collections.<String>emptyList(),
+                PvpVerdict.Source.OBSERVED, hit.box());
+    }
+
+    /** 只读：观测缓存（诊断/单测用）。 */
+    public ObservedDenials getObservedDenials() {
+        return observedDenials;
+    }
+
+    private static String describeLocation(Location location) {
+        String world = location.getWorld() == null ? "?" : location.getWorld().getName();
+        return String.format(java.util.Locale.ROOT, "%s,%.1f,%.1f,%.1f",
+                world, location.getX(), location.getY(), location.getZ());
     }
 
     /**

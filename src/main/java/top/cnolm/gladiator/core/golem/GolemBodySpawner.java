@@ -238,9 +238,14 @@ public final class GolemBodySpawner implements BotSpawner, Listener {
      */
     private BotSpawnSpec golemSpec(BotSpec spec) {
         BotProfile profile = spec.getProfile();
+        // golem 后端必须用 RESPAWN 策略：KEEP 会让尸体永远留在世界里，Gladiator 状态机
+        // 停在 DEAD 出不来（B4 复现的根因）。复活时 golem 会补发 PlayerRespawnEvent。
+        int respawnDelay = plugin.getConfig().getInt("spawn.golem.respawn-delay-ticks", 40);
         return BotSpawnSpec.builder(BotId.of(spec.getUsername()), spawnLocation())
                 .reach(profile.getReach())
                 .cps((int) Math.round(profile.getCps()))
+                .deathPolicy(top.cnolm.golem.api.DeathPolicy.RESPAWN)
+                .respawnDelayTicks(Math.max(0, respawnDelay))
                 .build();
     }
 

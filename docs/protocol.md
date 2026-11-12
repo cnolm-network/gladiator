@@ -94,11 +94,29 @@
 }}
 ```
 
+**`source=observed` 语义（A3，2026-11-13 追加）**：Gladiator 不查 WorldGuard、不查任何插件 API，
+只在「别的插件取消了 Bot 的攻击/交互」时记一条 deny（`EntityDamageByEntityEvent` /
+`PlayerInteractEvent` / `BlockPlaceEvent` / `BlockBreakEvent` 的 `isCancelled()`）。
+对应通知的 `data` 形如：
+
+```json
+{ "action":"attack", "reason":"damage-cancelled", "source":"observed",
+  "regionIds":[], "location":"world,-2160.5,4.0,-430.5", "expiresAt":1762500060123 }
+```
+
+它与 `source=worldguard` 的区别：
+* 没有区域信息（`regionIds` 为空、`box` 由 `guard.observed-radius` 推出），因此**不能**当作领地边界使用；
+* 有有效期（`guard.observed-ttl-seconds`，默认 60s），到期自动失效；
+* 只对**被拒的那只 Bot** 生效（缓存按 botId 隔离）。
+
+Layer 2 建议把 `source=observed` 的条目当作短 TTL 的软限制写入 `RestrictionCache`：
+到期即丢，不要持久化。
+
 `kind` 取值：
 
 | kind | data 关键字段 | 语义 |
 |---|---|---|
-| `RESTRICTED` | action, reason, location, regionIds, box?, expiresAt | 规则拒绝，写入 `RestrictionCache` |
+| `RESTRICTED` | action, reason, location, regionIds, box?, expiresAt, source? | 规则拒绝，写入 `RestrictionCache`。`source` 省略时按 `worldguard` 处理；`source="observed"` 表示 Gladiator 从实时事件里观测到的拒绝（A3），此时 `regionIds` 恒为空、`box` 由观测点 ± 半径推出 |
 | `CHAT` | username, message | 结构化聊天摘要（与 `bot.on('chat')` 双通道） |
 | `IDLE` | sinceSeconds | 空闲窗口开启，允许 Layer 4 发起外部检索 |
 | `EVENT` | name, detail | 伤害/击杀/方块等对局事件的通知面 |
@@ -115,7 +133,8 @@
 }}
 ```
 
-`source ∈ {flag, global, degraded, unknown}`。`degraded` = WorldGuard 未安装。
+`source ∈ {flag, global, degraded, unknown, observed}`。`degraded` = WorldGuard 未安装；
+`observed` = 命中观测式 deny 缓存（A3），此时 `regionIds` 为空、`box` 为观测点 ± 半径。
 
 ### 2.7 ACTION_RESULT（L1 → L2）
 

@@ -30,10 +30,20 @@ spawn:
     world: ""
     # 生成坐标 x,y,z；留空取该世界的出生点
     location: ""
+    # 死亡后多少 tick 复活（golem 侧 DeathPolicy.RESPAWN 的延迟）；默认 40 = 2 秒
+    respawn-delay-ticks: 40
 
 worldguard:
   # 未安装 WorldGuard 时是否允许降级运行（全部判定为允许）
   allow-degraded: true
+
+guard:
+  # 观测式 deny 反馈（A3）：不查任何外部插件 API，只看「别的插件是否取消了 Bot 的动作」。
+  # 任何插件取消了 Bot 的攻击/交互，就记一次 deny，并在下面两个键的窗口内直接判 deny。
+  # 观测记录有效期（秒）：过期后 queryPvp 恢复走 WorldGuard / 降级判定
+  observed-ttl-seconds: 60
+  # 观测记录的作用半径（格）：观测点周围这个范围内都判 deny
+  observed-radius: 8.0
 
 # 只读观战：玩家可用 /gladiator spectate [bot] 切旁观者模式观看 Bot 训练。
 # 观战者无法攻击/破坏方块；训练环境只把参赛 Bot 当目标，不会追观战者。
