@@ -55,6 +55,7 @@ $include = @(
     'docs/identity-and-action-space.md',
     'docs/production-deployment.md',
     'docs/golem-integration.md',
+    'docs/caller-init-checklist.md',
     'docs/research-server-side-bots.md',
     'docs/acceptance-a5-a9.md',
     'docs/acceptance-a2-a4.md',
