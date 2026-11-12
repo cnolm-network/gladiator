@@ -8,7 +8,7 @@ softdepend: [BetterNameTag]
 commands:
   caller:
     description: 示例调用方控制台
-    usage: /caller <arena|duel|reset|info|tag|reloadtags> ...
+    usage: /caller <arena|duel|reset|info|tag|a6|a8|a9> ...
     permission: callersample.admin
 permissions:
   callersample.admin:

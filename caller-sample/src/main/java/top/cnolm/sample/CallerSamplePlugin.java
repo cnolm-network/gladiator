@@ -119,6 +119,63 @@ public final class CallerSamplePlugin extends JavaPlugin {
             return true;
         }
 
+        if ("a6".equals(sub)) {
+            Location spawn = parseLocation(args, 1);
+            if (spawn == null) {
+                sender.sendMessage("坐标不合法。");
+                return true;
+            }
+            sender.sendMessage("§e[A6] 开始：Ready → 传送 → 套件 → pushGame 顺序探针（约 2–10 秒）");
+            new top.cnolm.sample.probe.A6Probe(this, api, sender, spawn).start();
+            return true;
+        }
+        if ("a8".equals(sub)) {
+            Location spawn = parseLocation(args, 1);
+            if (spawn == null) {
+                sender.sendMessage("坐标不合法。");
+                return true;
+            }
+            sender.sendMessage("§e[A8] 开始：两场独立对局的数据隔离探针（4 只 Bot，约 2–10 秒）");
+            new top.cnolm.sample.probe.A8Probe(this, api, sender, spawn).start();
+            return true;
+        }
+        if ("a9".equals(sub)) {
+            if (args.length < 2) {
+                sender.sendMessage("用法: /" + label + " a9 <normal|cancel-damage|manual-respawn> [botName] [x y z]");
+                sender.sendMessage("§7不传 botName 时由探针自己 spawnBot（golem 后端）；"
+                        + "传 botName 会接管已由 /gladiator spawn 登录的 runtime Bot。");
+                return true;
+            }
+            top.cnolm.sample.probe.A9Probe.Scenario scenario;
+            String mode = args[1].toLowerCase();
+            if ("normal".equals(mode)) {
+                scenario = top.cnolm.sample.probe.A9Probe.Scenario.NORMAL;
+            } else if ("cancel-damage".equals(mode) || "cancel-death".equals(mode)) {
+                // cancel-death 是旧名（golem 时代的「取消致死伤害」），语义相同，保留兼容。
+                scenario = top.cnolm.sample.probe.A9Probe.Scenario.CANCEL_DAMAGE;
+            } else if ("manual-respawn".equals(mode)) {
+                scenario = top.cnolm.sample.probe.A9Probe.Scenario.MANUAL_RESPAWN;
+            } else {
+                sender.sendMessage("未知场景: " + mode + "（normal|cancel-damage|manual-respawn）");
+                return true;
+            }
+            // /caller a9 normal A9_R1  → 接管已登录 Bot；多出来的三项才当坐标。
+            String botName = null;
+            int offset = 2;
+            if (args.length >= 3 && !isNumber(args[2])) {
+                botName = args[2];
+                offset = 3;
+            }
+            Location spawn = parseLocation(args, offset);
+            if (spawn == null) {
+                sender.sendMessage("坐标不合法。");
+                return true;
+            }
+            sender.sendMessage("§e[A9] 开始：" + scenario
+                    + (botName == null ? "" : "，接管 " + botName) + "（约 3–12 秒）");
+            new top.cnolm.sample.probe.A9Probe(this, api, sender, spawn, scenario, botName).start();
+            return true;
+        }
         if ("arena".equals(sub)) {
             if (args.length < 2) {
                 sender.sendMessage("用法: /" + label + " arena <username> [x y z]");
@@ -280,6 +337,19 @@ public final class CallerSamplePlugin extends JavaPlugin {
     }
 
     /** [x y z] 可省略；省略时用执行者（或世界出生点）当前位置。 */
+    /** 用于把 `/caller a9 normal A9_R1` 与 `/caller a9 normal 0 4 0` 区分开。 */
+    private static boolean isNumber(String text) {
+        if (text == null || text.isEmpty()) {
+            return false;
+        }
+        try {
+            Double.parseDouble(text);
+            return true;
+        } catch (NumberFormatException ex) {
+            return false;
+        }
+    }
+
     private Location parseLocation(String[] args, int offset) {
         if (args.length >= offset + 3) {
             try {
