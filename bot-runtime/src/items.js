@@ -26,6 +26,47 @@ export class ItemError extends Error {
   }
 }
 
+/** 错误信息里的中文名：训练日志给人看，写“背包里没有剑”比“没有 sword”更好读。 */
+export const ITEM_LABELS = Object.freeze({
+  sword: '剑',
+  rod: '鱼竿',
+  gapple: '金苹果',
+  blocks: '方块',
+  food: '食物',
+});
+
+const HOTBAR_FIRST = 36;
+const HOTBAR_LAST = 44;
+
+function inventoryItems(bot) {
+  const inventory = bot && bot.inventory;
+  if (!inventory || typeof inventory.items !== 'function') {
+    return null;
+  }
+  const items = inventory.items();
+  return Array.isArray(items) ? items : null;
+}
+
+/**
+ * 选一个快捷栏目标槽：优先空槽（从 36 起），全满时返回 null（调用方改为与手持槽互换）。
+ */
+function pickFreeHotbarSlot(bot) {
+  const items = inventoryItems(bot) || [];
+  const used = new Set(items.filter((it) => it.slot >= HOTBAR_FIRST && it.slot <= HOTBAR_LAST)
+    .map((it) => it.slot));
+  for (let slot = HOTBAR_FIRST; slot <= HOTBAR_LAST; slot += 1) {
+    if (!used.has(slot)) {
+      return slot;
+    }
+  }
+  return null;
+}
+
+function currentHandSlot(bot) {
+  const index = Number.isInteger(bot.quickBarSlot) ? bot.quickBarSlot : 0;
+  return HOTBAR_FIRST + Math.min(Math.max(index, 0), 8);
+}
+
 function matches(item, pattern) {
   if (!item || !item.name) {
     return false;
@@ -70,13 +111,30 @@ export async function selectItem(bot, logicalName) {
   if (typeof bot.heldItem === 'object' && bot.heldItem && matches(bot.heldItem, pattern)) {
     return bot.heldItem.name;
   }
-  const slot = findHotbarSlot(bot, pattern);
-  if (slot === null) {
-    throw new ItemError('ITEM_MISSING', `快捷栏里没有 ${logicalName}`);
+  const items = inventoryItems(bot);
+  const hotbarSlot = findHotbarSlot(bot, pattern);
+  if (hotbarSlot !== null) {
+    await bot.setQuickBarSlot(hotbarSlot - 36);
+    const item = items ? items.find((it) => it.slot === hotbarSlot) : null;
+    return item ? item.name : logicalName;
   }
-  await bot.setQuickBarSlot(slot - 36);
-  const item = bot.inventory.items().find((it) => it.slot === slot);
-  return item ? item.name : logicalName;
+  // 快捷栏没有但背包里有：先挪进快捷栏再选中，否则训练里会出现“有剑却报 ITEM_MISSING”。
+  const anySlot = findAnySlot(bot, pattern);
+  if (anySlot !== null) {
+    const free = pickFreeHotbarSlot(bot);
+    const target = free === null ? currentHandSlot(bot) : free;
+    if (typeof bot.moveSlotItem === 'function') {
+      await bot.moveSlotItem(anySlot, target);
+    } else if (typeof bot.moveSlotItem === 'undefined') {
+      // 没有窗口操作能力（少数只读封装）：只能如实报“不在快捷栏”。
+      throw new ItemError('ITEM_MISSING', `${ITEM_LABELS[logicalName] || logicalName}在背包里但不在快捷栏`);
+    }
+    await bot.setQuickBarSlot(target - HOTBAR_FIRST);
+    const item = items ? items.find((it) => it.slot === target) : null;
+    return item ? item.name : logicalName;
+  }
+  const label = ITEM_LABELS[logicalName] || logicalName;
+  throw new ItemError('ITEM_MISSING', `背包里没有${label}`);
 }
 
 /** 把护甲穿上（调用方通过 RCON 发过套件后调用；缺哪件就跳过哪件）。 */

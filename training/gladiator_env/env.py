@@ -29,6 +29,7 @@ from . import reward_presets
 from .shaping import ShapingReward, ShapingWeights
 from .spaces import (
     ACTION_NAMES,
+    MOVE_MS,
     NUM_ACTIONS,
     OBS_DIM,
     decode_action,
@@ -226,6 +227,8 @@ class GladiatorEnv(gym.Env):
         self._last_events: dict[str, list[dict]] = {}
         self._last_attacked: dict[str, bool] = {}
         self._last_distance: dict[str, float | None] = {}
+        #: 重生后的「观察档」：这段时间内代码驱动的对手只观察不出手（旧坐标会被传送打飞）。
+        self._respawn_grace: dict[str, int] = {}
         self._log = logger or (lambda message: print(f"[env] {message}", flush=True))
 
         self._control_hz = float(control_hz or 0.0)
@@ -311,7 +314,14 @@ class GladiatorEnv(gym.Env):
             if index != 0:  # 0 = idle，只有真正下发动作才算“活跃”
                 self._last_active_at[i] = time.monotonic()
             raw = self._raw[i] if i < len(self._raw) else {}
-            actions = decode_action(index, raw, bot.username, opponents, reach=bot.reach)
+            # 代码驱动的对手比学习方多留 0.75 格余量：它没有「奖励」纠偏，而观测到出手之间
+            # 有 1 个 tick 的延迟（约 5 格/s × 0.2s ≈ 1.1 格），加上击退会让边界攻击吃 OUT_OF_REACH。
+            reach = bot.reach if i == 0 else max(1.5, float(bot.reach) - 0.75)
+            actions = decode_action(index, raw, bot.username, opponents, reach=reach)
+            if i != 0 and self._respawn_grace.get(bot.username, 0) > 0:
+                # 刚重生（可能被传送到出生点）：本 tick 只做观察，避免对旧坐标出手。
+                self._respawn_grace[bot.username] -= 1
+                actions = [{"type": "idle", "params": {"durationMs": MOVE_MS}}]
             dispatch.append(actions)
             for result in self._safe_send(i, actions):
                 if result and result.get("ok") is False:
@@ -325,6 +335,8 @@ class GladiatorEnv(gym.Env):
         observation = self._encode_all()
 
         terminated = any(is_out(obs) for obs in self._raw)
+        if not terminated:
+            self._restock_after_respawn(previous)
         truncated = self._steps >= self.max_steps
         rewards = {}
         self._last_events = {}
@@ -577,6 +589,10 @@ class GladiatorEnv(gym.Env):
                 next_check = now + 1.0
                 for index, bot in enumerate(self.bots):
                     report = loadout_report(self._latest_raw(index))
+                    if report["ok"] and report["armor"] == 4 and not report["holding_sword"]:
+                        # 装备齐了只是没拿剑：让运行时把剑挪进快捷栏并选中（不必重发套件）。
+                        self._ensure_sword_in_hand(index, bot, report=report)
+                        continue
                     if not report["ok"] or report["armor"] < 4 or not report["holding_sword"]:
                         self._log(
                             f"[prep] {bot.username} 装备缺失（护甲 {report['armor']}/4，"
@@ -649,6 +665,53 @@ class GladiatorEnv(gym.Env):
             if report["armor"] < 4:
                 self._send_use(index, {"item": "armor"})
         self._log(f"[kit] {bot.username} 校验未通过，继续训练（该局数据可能有偏差）")
+
+    def _ensure_sword_in_hand(self, index: int, bot: BotConfig,
+                              report: dict | None = None) -> bool:
+        """校验主手是剑；不是就让运行时把剑挪到快捷栏并选中。
+
+        A1：``[kit] ... 手持剑`` 之后仍报 ``ITEM_MISSING 快捷栏里没有 sword`` 的根因在运行时
+        （只看快捷栏、不挪背包），运行时已修；这里再补一层环境侧校验，避免空手开局。
+        返回当前是否已手持剑（观测尚未刷新时可能仍是 False）。
+        """
+        report = report or loadout_report(self._latest_raw(index))
+        if report["holding_sword"]:
+            return True
+        self._log(f"[kit] {bot.username} 主手不是剑（{report['held'] or '空手'}），切回剑")
+        self._select_sword(index)
+        return False
+
+    def _restock_after_respawn(self, previous: list[dict]) -> None:
+        """回合中死亡重生后补发套件（A1）。
+
+        1.8.8 死亡会掉落背包，重生后往往是空手；如果不补，剩下的时间等于白送对手一分。
+        这里只在「上一帧已死、这一帧活」时触发，且只发命令、不阻塞 step。
+        """
+        for index, bot in enumerate(self.bots):
+            before = previous[index] if index < len(previous) else None
+            if not before:
+                continue
+            current = self._raw[index] if index < len(self._raw) else {}
+            was_dead = self_health(before) <= 0.0 or is_out(before)
+            now_alive = self_health(current) > 0.0 and not is_out(current)
+            if not (was_dead and now_alive):
+                continue
+            report = loadout_report(current)
+            self._log(
+                f"[kit] {bot.username} 重生（血量 {self_health(current):g}），"
+                f"补发套件：缺 {report['missing']}，护甲 {report['armor']}/4"
+            )
+            if self.arena.give_kit and self._rcon is not None:
+                for name, need in report["missing"]:
+                    try:
+                        self._command(f"give {bot.username} {name} {need}")
+                    except LinkError:
+                        pass
+                if report["armor"] < 4:
+                    self._send_use(index, {"item": "armor"})
+            # 不管有没有 RCON，都让运行时把主手切回剑（剑可能还在背包/快捷栏里）。
+            self._select_sword(index)
+            self._respawn_grace[bot.username] = 2
 
     def _tag_bot(self, index: int, bot: BotConfig) -> None:
         """给头顶名称打角色标签（BetterNameTag）：训练方红色，代码驱动按策略着色。

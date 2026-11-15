@@ -356,8 +356,9 @@ class TrainingWiringTests(_AppFixture):
         self.assertEqual(self._arg(argv, "--reward-preset"), str(path))
         self.assertEqual(params["rewardPreset"]["id"], "t1")
         self.assertEqual(params["rewardPreset"]["name"], "测试预设")
-        # evalRounds = 每回合对局数；evalEpisodes = 评估总局数
-        self.assertEqual(params["evalRounds"], 3)
+        # B1 口径：evalRounds = 每阶段评估回合数（旧请求字段 evalEpochs=1）；
+        # evalEpisodes = evalRounds × Σ(阶段轮次)（本用例 1 段 3 局）
+        self.assertEqual(params["evalRounds"], 1)
         self.assertEqual(params["evalEpisodes"], 3)
         self.assertEqual(total, 6)
 
@@ -411,8 +412,8 @@ class TrainingWiringTests(_AppFixture):
             "evalEpochs": 0,
         })
         self.assertNotIn("--eval-epochs", argv)
-        self.assertEqual(params["evalEpochs"], 0)
         self.assertEqual(params["evalRounds"], 0)
+        self.assertEqual(params["evalEpisodes"], 0)
         self.assertFalse(params["evalSupported"])
 
     def test_multi_passes_reward_preset_path(self) -> None:

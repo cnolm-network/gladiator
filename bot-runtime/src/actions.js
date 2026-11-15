@@ -251,6 +251,9 @@ export class ActionDispatcher {
       y: Math.floor(entity.position.y),
       z: Math.floor(entity.position.z),
     });
+    // A1：主手必须是剑。策略经常在拿着金苹果/鱼竿（甚至空手）时发 attack，
+    // 结果白白吃一发伤害。这里先自动切剑；只有背包里确实没有剑才报 ITEM_MISSING。
+    await this.ensureSwordInHand();
     // 攻击前 3D 对准目标眼睛：训练里模型只给朝向，这里补一次精确对准。
     if (this.profile.assist.aimLock) {
       try {
@@ -276,6 +279,33 @@ export class ActionDispatcher {
     this.clickGate.recordClick();
     if (this.profile.assist.wtap) {
       await this.sprintReset();
+    }
+  }
+
+  /**
+   * 确保主手是剑：手持不是剑但快捷栏/背包里有剑时先切过去。
+   *
+   * <p>背包读不到（只读封装或测试替身）时不做判定，避免误伤没有 inventory API 的调用方；
+   * 真实运行时 mineflayer 一定有 inventory，所以训练路径上这条判定始终生效。
+   */
+  async ensureSwordInHand() {
+    const bot = this.bot;
+    const items = bot && bot.inventory && typeof bot.inventory.items === 'function'
+      ? bot.inventory.items() : null;
+    if (!Array.isArray(items)) {
+      return;
+    }
+    const held = bot.heldItem;
+    if (held && typeof held.name === 'string' && /_sword$/.test(held.name)) {
+      return;
+    }
+    try {
+      await selectItem(bot, 'sword');
+    } catch (error) {
+      if (error instanceof ItemError) {
+        throw new ActionError(error.code, error.message);
+      }
+      throw error;
     }
   }
 

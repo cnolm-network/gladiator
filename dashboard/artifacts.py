@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from errors import BadRequest, NotFound
+from eval_semantics import normalize_eval
 
 MAX_REVIEW_FILES = 500
 MAX_MARKDOWN_BYTES = 2 * 1024 * 1024
@@ -404,6 +405,13 @@ class ArtifactStore:
         else:
             status = "interrupted"
 
+        # B1：评估回合口径。新 run 直接读 run.json 的 evalRounds；
+        # 旧 run 只有 evalEpisodes（旧含义=总局数）或 evalEpochs，这里按阶段数折回每阶段值。
+        plan_for_eval = (report.get("plan") if isinstance(report, dict) else None) \
+            or (run_meta.get("plan") if isinstance(run_meta, dict) else None) \
+            or []
+        eval_counts = normalize_eval(run_meta if isinstance(run_meta, dict) else {}, plan_for_eval)
+
         return {
             "id": name,
             "legacy": False,
@@ -427,6 +435,10 @@ class ArtifactStore:
             "reviewCount": len(reviews),
             "rewardPreset": reward_preset,
             "model": run_model,
+            # B1：每阶段评估回合数 / 派生总数（旧 run 自动回退）。
+            "evalRounds": eval_counts["evalRounds"],
+            "evalEpisodes": eval_counts["evalEpisodes"],
+            "evalStages": eval_counts["stages"],
             # G-624：run.json 里的持久化写回结果（enabled/ok/modelId/error）。
             "persist": run_meta.get("persist") if isinstance(run_meta, dict) else None,
             "persistWarning": run_meta.get("persistWarning") if isinstance(run_meta, dict) else None,

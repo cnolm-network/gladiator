@@ -22,6 +22,7 @@ from typing import Optional
 from artifacts import ArtifactStore
 from config import DashboardConfig
 from errors import BadRequest, Conflict, Forbidden, NotFound
+from eval_semantics import eval_rounds_from_payload, normalize_eval
 from ports import is_port_open
 from processes import ManagedProcess, ProcessManager
 from rcon_client import run_command
@@ -74,6 +75,21 @@ _RE_TRAIN_DONE = re.compile(
 )
 
 
+def with_eval_counts(params: dict) -> dict:
+    """B1：保证响应里的 ``params`` 同时带 ``evalRounds`` 与 ``evalEpisodes``。
+
+    新任务在 ``_build_train`` 里已经写好两个字段；这里只兜底旧数据结构
+    （只有 ``evalEpochs``/``evalEpisodes`` 的情况），避免前端拿到 undefined。
+    """
+    data = dict(params or {})
+    if "evalRounds" in data and "evalEpisodes" in data:
+        return data
+    counts = normalize_eval(data, data.get("plan"))
+    data["evalRounds"] = counts["evalRounds"]
+    data["evalEpisodes"] = counts["evalEpisodes"]
+    return data
+
+
 @dataclass
 class TrainingJob:
     id: str
@@ -124,7 +140,7 @@ class TrainingJob:
             return {
                 "id": self.id,
                 "kind": self.kind,
-                "params": dict(self.params),
+                "params": with_eval_counts(self.params),
                 "status": self.status,
                 "startedAt": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(self.started_at)),
                 "startedAtEpoch": self.started_at,
@@ -397,8 +413,8 @@ class TrainingRunner:
                 "stages": "",
                 "opponentMode": "scripted",
                 "seed": 7,
+                "evalRounds": 1,
                 "evalEpisodes": 1,
-                "evalEpochs": 1,
                 "autoSpawn": True,
                 "autoCleanup": True,
                 "center": "0.5,4,0.5",
@@ -529,10 +545,15 @@ class TrainingRunner:
             pick(payload, "epochs", default=defaults.get("epochs", 1)),
             "epochs", minimum=1, maximum=200,
         )
-        eval_epochs = parse_int(
-            pick(payload, "evalEpochs", "evalEpisodes", default=defaults.get("evalEpochs", 1)),
-            "evalEpochs", minimum=0, maximum=50,
+        # B1：统一口径。evalRounds = 每阶段评估回合数（0 = 不评估），
+        # evalEpisodes = 实际评估对局数 = evalRounds × Σ(阶段轮次)（派生，只读）。
+        # 旧请求里的 evalEpochs / evalEpisodes 仍兼容。
+        stage_count = max(1, len(plan))
+        eval_rounds = parse_int(
+            eval_rounds_from_payload(payload, plan, default=defaults.get("evalRounds", 1)),
+            "evalRounds", minimum=0, maximum=50,
         )
+        eval_episodes = eval_rounds * total_episodes
         train_total = epochs * total_episodes
         reward_preset = self._reward_preset_from_payload(payload)
         if reward_preset:
@@ -571,7 +592,7 @@ class TrainingRunner:
             "--prep-seconds", str(prep_seconds),
             "--seed", str(seed),
             "--epochs", str(epochs),
-            "--eval-epochs", str(eval_epochs),
+            "--eval-epochs", str(eval_rounds),
             "--run-dir", str(run_dir),
         ]
         # 始终用 --stages 表达计划：单段与多段走同一条路径，避免“回合数是否生效”歧义。
@@ -597,11 +618,10 @@ class TrainingRunner:
             "episodes": plan[0][1],
             "episodesPerEpoch": total_episodes,
             "epochs": epochs,
-            "evalEpochs": eval_epochs,
-            # 口径分离：evalRounds = 每个评估回合的对局数（= Σ计划轮次）；
-            # evalEpisodes = 评估总对局数 = evalEpochs × evalRounds。
-            "evalRounds": total_episodes,
-            "evalEpisodes": eval_epochs * total_episodes,
+            # B1 口径：evalRounds = 每阶段评估回合数（CLI --eval-epochs 同值）；
+            # evalEpisodes = 派生总数 = evalRounds × Σ(阶段轮次)（只读，前端展示用）。
+            "evalRounds": eval_rounds,
+            "evalEpisodes": eval_episodes,
             "evalSupported": True,
             "totalEpisodes": train_total,
             "rewardPreset": reward_preset,
@@ -630,9 +650,8 @@ class TrainingRunner:
             "plan": params["plan"],
             "planText": plan_text,
             "epochs": epochs,
-            "evalEpochs": eval_epochs,
-            "evalRounds": total_episodes,
-            "evalEpisodes": params["evalEpisodes"],
+            "evalRounds": eval_rounds,
+            "evalEpisodes": eval_episodes,
             "totalEpisodes": train_total,
             "rewardPreset": reward_preset,
             "modelId": params["modelId"],
@@ -681,12 +700,12 @@ class TrainingRunner:
         # 多场地训练侧（multi_train）没有 --eval-epochs，评估回合只存在于单场地 train。
         # 明确拒绝而不是静默忽略：否则表单里填了评估回合却毫无效果。
         eval_epochs = parse_int(
-            pick(payload, "evalEpochs", "evalEpisodes", default=0),
-            "evalEpochs", minimum=0, maximum=50,
+            eval_rounds_from_payload(payload, plan, default=0),
+            "evalRounds", minimum=0, maximum=50,
         )
         if eval_epochs:
             raise BadRequest(
-                "多场地训练不支持评估回合：evalEpochs 必须为 0（评估只在单场地 train 中提供）"
+                "多场地训练不支持评估回合：evalRounds 必须为 0（评估只在单场地 train 中提供）"
             )
         reward_preset = self._reward_preset_from_payload(payload)
         if reward_preset:
@@ -770,7 +789,6 @@ class TrainingRunner:
             "plan": [{"opponentMode": item[0], "episodes": item[1]} for item in plan],
             "planText": plan_text,
             # 多场地没有评估阶段：显式写 0，前端/数据页据此不显示评估口径。
-            "evalEpochs": 0,
             "evalRounds": 0,
             "evalEpisodes": 0,
             "evalSupported": False,
@@ -801,7 +819,8 @@ class TrainingRunner:
             "plan": params["plan"],
             "planText": plan_text,
             "epochs": epochs,
-            "evalEpochs": 0,
+            "evalRounds": 0,
+            "evalEpisodes": 0,
             "evalSupported": False,
             "pairs": pairs,
             "totalEpisodes": params["totalEpisodes"],

@@ -589,7 +589,7 @@ function fillTrainingForm(options) {
   set("#tr-epochs", d.epochs ?? 1);
   set("#tr-max-steps", d.maxSteps ?? 200);
   set("#tr-seed", d.seed ?? 7);
-  set("#tr-eval", d.evalEpochs ?? d.evalEpisodes ?? 1);
+  set("#tr-eval", d.evalRounds ?? d.evalEpochs ?? d.evalEpisodes ?? 1);
   set("#tr-center", d.center ?? "0.5,4,0.5");
   set("#tr-spacing", d.spacing ?? 6);
   set("#tr-prep", d.prepSeconds ?? 3);
@@ -1890,10 +1890,17 @@ function renderTraining() {
   const roundText = isMulti
     ? `<span>${job.episodesCompleted || 0} / ${job.totalEpisodes || 0}</span><small class="sub">已完成 / 计划（${pairs} 场地 × ${perPair} 局）</small>`
     : `<span>${job.episodesCompleted || 0} / ${job.totalEpisodes || 0}</span><small class="sub">训练总局数</small>`;
+  const evalParams = job.params || {};
+  const evalRounds = Number(evalParams.evalRounds);
+  const evalEpisodes = Number(evalParams.evalEpisodes);
+  const evalText = evalParams.evalSupported !== false && evalRounds > 0
+    ? `<span>每阶段 ${evalRounds}</span><small class="sub">共 ${evalEpisodes || evalRounds} 回合</small>`
+    : null;
   const items = [
     kvItem("当前计划", stageValue),
     kvItem("回合", roundText),
     kvItem("步数", num(job.steps)),
+    ...(evalText ? [kvItem("评估回合", evalText)] : []),
     kvItem("最近 reward", lastReward == null ? "—" : num(lastReward, 2)),
     kvItem("平均 reward", mean == null ? "—" : num(mean, 2)),
     kvItem("开始时间", fmtTime(job.startedAt)),
@@ -3240,8 +3247,9 @@ function bindTraining() {
         usersPrefix: $("#tr-prefix").value.trim(),
         portsBase: Number($("#tr-base-port").value),
       };
-      // 多场地没有评估阶段：不发送 evalEpochs（后端也会拒绝 >0）。
-      if (kind !== "multi") payload.evalEpochs = Number($("#tr-eval").value);
+      // 多场地没有评估阶段：不发送 evalRounds（后端也会拒绝 >0）。
+      // B1：字段名统一为 evalRounds（每阶段评估回合数），后端派生 evalEpisodes = evalRounds × 阶段数。
+      if (kind !== "multi") payload.evalRounds = Number($("#tr-eval").value);
       const rewardId = currentRewardPresetId();
       if (rewardId) payload.rewardPreset = rewardId;
       const modelId = $("#tr-model") ? $("#tr-model").value : "";

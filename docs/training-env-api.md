@@ -188,13 +188,19 @@ GladiatorEnv(
 |---|---|---|
 | 0 | `idle` | 停机（不发送任何动作） |
 | 1 | `approach` | `look` → `move(forward, 180ms)` |
-| 2 | `attack` | 距离 ≤3 且有实体 id：`look` → `attack`；否则退化为 `move(forward)` |
+| 2 | `attack` | 距离 ≤ `reach - 0.15` 且有实体 id：`look` → `attack`；否则退化为 `move(forward)`（A2） |
 | 3 | `strafe_left` | `look` → `move(left)` |
 | 4 | `strafe_right` | `look` → `move(right)` |
 | 5 | `retreat` | `look` → `move(back)` |
 | 6 | `jump` | `jump` |
 
 每个动作都带单调 `seq`；重发同一 `seq` 由服务端幂等缓存去重（`ACTION_RESULT.deduped=true`）。
+
+**射程口径（A2）**：`attack` 与 `use_rod` 都按 `BotConfig.reach` 判断，且留 0.15 格余量
+（`REACH_TOLERANCE`）：观测里的 `distance` 是"身体到身体"，运行时判 `OUT_OF_REACH` 用的是
+`eyeDistance`（眼高 1.62 / 目标中心 +1.0），同高度下会比观测值大 0.1~0.6 格。
+因此 `distance > reach - 0.15` 时动作退化为 `look` + `move(forward, sprint)`，
+而不是发一次注定失败的 `attack`。`use_rod` 只在 2.0–6.0 格内才真的抛竿。
 
 #### 奖励（可插拔，`G-404`）
 
@@ -248,10 +254,23 @@ GladiatorEnv(
 
 1. 每 0.5 秒给双方发一次 `idle`，清掉上一回合残留的移动/疾跑按键，避免“还没穿甲就冲”；
 2. 每 1 秒复核一次套装（护甲 4/4、手持剑、金苹果 5、鱼竿 1），缺什么补什么；
+   若只是「没拿剑」，直接发 `use {item:"sword", select:true}` 让运行时把剑挪进快捷栏并选中；
 3. 准备期结束再对齐一次站位，然后才返回第一帧观测。
 
 日志形如 `[kit] <user> 套装就绪：手持剑，金苹果 5，护甲 4/4` → `[prep] 准备期 3s 结束，开始对局`。
 准备期不计入 `max_steps`，也不产生 reward。
+
+#### 回合中死亡重生（A1）
+
+1.8.8 死亡会掉落背包，重生后往往是空手。`step()` 在每帧观测后检测「上一帧血量 ≤0、这一帧 >0」，
+命中就在本帧补发一次套件（`give` 缺失项 + `use {item:"armor"}` + `use {item:"sword", select:true}`），
+并打一行日志：
+
+```
+[kit] <user> 重生（血量 20），补发套件：缺 [], 护甲 4/4
+```
+
+补发只发命令、不阻塞 `step()`；`terminated` 的帧不补（对局已结束）。
 
 `ArenaConfig.give_kit=True` 时，每次 reset 用 RCON 发一套装备（顺序固定为
 剑 → 金苹果 → 鱼竿 → 四件护甲，保证剑落在快捷栏第一格）：

@@ -199,6 +199,10 @@ def look_at(target: dict, self_pos: dict) -> dict:
     }
 
 
+# 观测距离与运行时 eyeDistance 的偏差余量（格）。
+REACH_TOLERANCE = 0.15
+
+
 def decode_action(
     index: int,
     observation: dict,
@@ -239,6 +243,10 @@ def decode_action(
         return [{"type": "idle", "params": {"durationMs": MOVE_MS}}]
 
     look = look_at(target, self_pos)
+    # 观测里的 distance 是「身体到身体」，运行时判 OUT_OF_REACH 用的是 eyeDistance
+    # （+1.62 眼高 / +1.0 目标中心），同高度下会比观测值大 0.1~0.6 格。
+    # 因此留 0.15 格余量：宁可多走一步靠近，也不要在边界上白白吃一次 OUT_OF_REACH。
+    effective_reach = max(0.0, float(reach) - REACH_TOLERANCE)
     if name == "approach":
         # 距离超过 2.5 格就疾跑（必须与 forward 同时按才生效）；贴身时步行，避免冲过头。
         sprint = distance > 2.5
@@ -259,8 +267,9 @@ def decode_action(
         return [look, {"type": "use", "params": {"item": "rod"}}]
     if name == "attack":
         entity_id = target.get("id")
-        if entity_id is None or distance > reach:
-            # 够不到时先靠近：攻击距离由 BotProfile.reach 决定（默认原版 3.99），硬打只会空挥。
+        if entity_id is None or distance > effective_reach:
+            # 够不到时先靠近：攻击距离由 BotProfile.reach 决定（默认原版 3.99），硬打只会空挥
+            # （运行时回 OUT_OF_REACH，日志里大量 `目标距离 4.02 > reach 3.99` 就是这么来的）。
             return [look, {"type": "move", "params": {
                 "direction": "forward", "durationMs": MOVE_MS, "sprint": distance > 2.5}}]
         # 近身：先转向目标、挥击、再补一次朝向，减少击退后的背对空挥。

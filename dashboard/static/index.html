@@ -165,7 +165,7 @@
               <label class="field"><span>每回合最大步数</span><input id="tr-max-steps" type="number" min="1" value="200"></label>
               <label class="field"><span>随机种子</span><input id="tr-seed" type="number" min="0" value="7"></label>
               <label class="field"><span>训练回合（每回合跑一遍计划）</span><input id="tr-epochs" type="number" min="1" max="200" value="1" title="每个回合按计划从上到下执行一遍；每个轮次结束更新一次参数"></label>
-              <label class="field" id="tr-eval-field"><span>评估回合（训练后，贪心不学习）</span><input id="tr-eval" type="number" min="0" max="50" value="1"></label>
+              <label class="field" id="tr-eval-field"><span>评估回合（每阶段）</span><input id="tr-eval" type="number" min="0" max="50" value="1" title="每阶段评估回合数；0 = 不评估。派生总数 = 本值 × 计划段数"></label>
               <label class="field"><span>场地中心</span><input id="tr-center" value="0.5,4,0.5"></label>
               <label class="field"><span>间距</span><input id="tr-spacing" type="number" step="0.5" value="6"></label>
               <label class="field"><span>开局准备期（秒）</span><input id="tr-prep" type="number" step="0.5" min="0" max="30" value="3"></label>
@@ -183,6 +183,7 @@
               <button class="btn tiny primary" id="btn-model-import-continue" type="button">导入并继续训练</button>
             </div>
             <p class="muted small hidden" id="tr-eval-note">多场地训练不支持评估回合（multi_train 没有评估阶段），该字段已隐藏。</p>
+            <p class="muted small">评估口径：<b>每阶段</b>跑 N 个评估回合，派生总数 = N × 计划段数；训练侧仍按整遍计划评估（实际对局数 = N × Σ段内轮次）。填 0 表示不评估。</p>
             <p class="muted small">一层：<b>回合</b>（把计划完整跑一遍）→ 二层：<b>计划</b>（按顺序的若干段）→ 三层：<b>轮次</b>（一局对局，直到一方死亡或步数耗尽）。每个训练轮次结束算回报并更新一次参数；评估回合同样跑完整计划，但贪心、不学习。</p>
             <label class="check"><input id="tr-auto-spawn" type="checkbox" checked> 自动 spawn 并放置 Bot</label>
             <label class="check"><input id="tr-auto-cleanup" type="checkbox" checked> 训练结束后自动停止本次拉起的运行时</label>

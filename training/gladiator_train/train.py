@@ -282,6 +282,11 @@ def main(argv: List[str] | None = None) -> int:
             "ports": args.ports,
             "plan": [{"opponentMode": mode, "episodes": count} for mode, count in plan],
             "epochs": epochs,
+            # B1 口径：evalRounds = 每阶段评估回合数（Dashboard 以 --eval-epochs 传这个值），
+            # evalEpisodes = 实际评估对局数 = evalRounds × Σ(阶段轮次)（派生，只读）；
+            # evalEpochs 保留给旧读者。
+            "evalRounds": eval_epochs,
+            "evalEpisodes": eval_epochs * per_epoch,
             "evalEpochs": eval_epochs,
             "initModel": args.init_model or None,
             "initPolicy": init_path or None,

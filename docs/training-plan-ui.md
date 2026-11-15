@@ -1,7 +1,7 @@
 # 训练计划（Dashboard 训练表单）设计与契约
 
 > 版本：v2（2026-11-08）
-> 变更：v2 增加 reward 预设（§6）、明确 evalRounds/evalEpisodes 口径、多场地无评估阶段、
+> 变更：v3 统一评估口径为 `evalRounds`（每阶段）/ `evalEpisodes`（派生总数，B1）；v2 增加 reward 预设（§6）、多场地无评估阶段、
 > 训练预设 fields 校验与覆盖备份、预设卡片文案与实际一致（§4.5）。
 > 适用范围：`dashboard/static/*` 前端与 `dashboard/*.py` 后端。
 > 变更规则：字段只增不改；破坏性变更需同步 `TASKS.md` 与 `HANDOVER.md`。
@@ -24,8 +24,10 @@
 ```
 
 - 训练总对局 = `训练回合 × Σ(轮次)`；每个训练轮次结束更新一次参数。
-- 评估总对局 = `评估回合 × Σ(轮次)`；贪心、不学习、不更新参数。
-- 表单只有一个可编辑的「训练回合」和「评估回合」，**没有**独立的“总回合数”输入。
+- 评估：**每阶段**跑 `evalRounds` 个评估回合；派生总数 `evalEpisodes = evalRounds × Σ(阶段轮次)`。
+  贪心、不学习、不更新参数。训练侧仍按整遍计划评估，实际对局数 = `evalRounds × Σ(轮次)`
+  （各阶段轮次相等时与 `evalEpisodes` 一致）。
+- 表单只有一个可编辑的「训练回合」和「评估回合（每阶段）」，**没有**独立的“总回合数”输入。
 
 ## 2. 数据模型
 
@@ -59,7 +61,8 @@
 ```
 
 - `epochs`：训练回合数（1–200），默认 1；每回合完整按 `plan` 执行一遍。
-- `evalEpochs`：评估回合数（0–50），默认 1；同样按 `plan` 走，但贪心不更新。
+- `evalRounds`：**每阶段**评估回合数（0–50），默认 1，0 = 不评估；同样按 `plan` 走，但贪心不更新。
+  旧请求字段 `evalEpochs` 与旧 `evalEpisodes`（当时含义是总局数）仍被接受，统一折算成 `evalRounds`。
   **仅单场地 `train` 支持**：`kind=multi` 时该字段必须缺省或为 0，否则返回 400
   「多场地训练不支持评估回合」（`multi_train` 没有评估阶段，静默忽略会让用户误以为生效）。
 - `rewardPreset`：reward 预设 id（见 §6），缺省则不传 `--reward-preset`，训练侧用内置默认权重。
@@ -69,15 +72,18 @@
 
 | 字段 | 含义 |
 |---|---|
-| `params.evalEpochs` | 评估回合数（与请求同名） |
-| `params.evalRounds` | 每个评估回合的对局数 = `Σ(plan.episodes)` |
-| `params.evalEpisodes` | 评估总对局数 = `evalEpochs × evalRounds` |
+| `params.evalRounds` | **每阶段评估回合数**（与 `--eval-epochs` 同值） |
+| `params.evalEpisodes` | **派生值（只读）** = `evalRounds × Σ(阶段轮次)`，仅供展示 |
 | `params.evalSupported` | `false` 表示该任务类型没有评估阶段（多场地） |
 | `params.rewardPreset` | `{id, name, path, applied}`；`applied=false` 表示本次任务没有把预设传进命令行 |
 
 **兼容**：仍接受旧的 `stages` 字符串与 `opponentMode` + `episodes`；三者同时存在时优先级为
-`plan` > `stages` > `opponentMode + episodes`。旧字段 `evalEpisodes` 仍被接受，等价于 `evalEpochs`。
-新前端只发送 `plan` + `epochs` + `evalEpochs`。
+`plan` > `stages` > `opponentMode + episodes`。
+评估字段按 `evalRounds` > `evalEpochs` > `evalEpisodes`（按阶段数折回）的顺序取值；
+新前端只发送 `plan` + `epochs` + `evalRounds`。
+
+**旧数据回退**：`run.json` / `report.json` 里若没有 `evalRounds`，数据页按
+`evalEpisodes / max(1, 阶段数)`（向上取整）折回每阶段值，`evalEpisodes` 原样保留。
 
 `GET /api/training/options` 新增：
 
@@ -115,7 +121,7 @@
 | 字段 | 范围 | 说明 |
 |---|---|---|
 | `epochs` | 1–200 | 训练回合数 |
-| `evalEpochs` | 0–50 | **评估回合数**（旧名 `evalEpisodes` 读入时自动映射，写回一律用新名） |
+| `evalEpochs` | 0–50 | **每阶段评估回合数**（预设文件沿用旧键名；请求/响应统一叫 `evalRounds`） |
 | `maxSteps` | 1–5000 | 每回合最大步数 |
 | `seed` | 0–2^31-1 | 随机种子 |
 | `center` | `x,y,z` | 归一化为 `1,4.5,2` 这种紧凑写法 |
@@ -172,8 +178,9 @@
      脚本数恒等于 6 个内置项，写了反而是噪声）。
    - 点击「加载」回填计划与 `fields`，「删除」按钮 → `POST /api/presets/delete`。
 6. **回合**
-   - 「训练回合（每回合跑一遍计划）」可编辑，1–200，默认 1；「评估回合（训练后，贪心不学习）」可编辑，0–50，默认 1。
-   - `kind=multi` 时**隐藏**评估回合字段并显示说明，提交时也不发送 `evalEpochs`
+   - 「训练回合（每回合跑一遍计划）」可编辑，1–200，默认 1；「评估回合（每阶段）」可编辑，0–50，默认 1。
+   - 进度卡的「评估回合」显示 `每阶段 N / 共 M`，`N = evalRounds`、`M = evalEpisodes`。
+   - `kind=multi` 时**隐藏**评估回合字段并显示说明，提交时也不发送 `evalRounds`
      （后端仍会拒绝 >0 的请求，双保险）。
    - 计划卡只读显示 `共 N 段 · 每回合 M 局 · 训练合计 K 局`，其中 `M = Σ(轮次)`、`K = 训练回合 × M`。
    - 进度卡显示 `回合 X/Y · 第 i/n 段 · 本段 a/b 局`；回合切换时阶段计数重置。

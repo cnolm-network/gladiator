@@ -145,6 +145,46 @@ class DecodeActionTest(unittest.TestCase):
         actions = decode_action(2, far, "Glad_Bot_1")
         self.assertEqual(actions[-1]["type"], "move")
 
+    def test_attack_boundary_uses_reach_tolerance(self):
+        """A2：观测距离与运行时 eyeDistance 有偏差，边界上必须提前退化为靠近。"""
+        # 4.3 格：超出 reach 3.99（也超出 3.99-0.15），不发 attack
+        obs = make_observation(
+            "Glad_Bot_1", targets=[make_target(91, "Glad_Bot_2", x=4.3, z=0.0, distance=4.3)])
+        actions = decode_action(2, obs, "Glad_Bot_1")
+        self.assertFalse([a for a in actions if a["type"] == "attack"])
+        self.assertEqual(actions[-1]["type"], "move")
+        self.assertEqual(actions[-1]["params"]["direction"], "forward")
+        self.assertTrue(actions[-1]["params"]["sprint"])
+
+        # 3.8 格：仍在 3.99-0.15 之内，正常攻击
+        obs = make_observation(
+            "Glad_Bot_1", targets=[make_target(91, "Glad_Bot_2", x=3.8, z=0.0, distance=3.8)])
+        actions = decode_action(2, obs, "Glad_Bot_1")
+        self.assertTrue([a for a in actions if a["type"] == "attack"])
+
+    def test_attack_boundary_scales_with_reach_parameter(self):
+        """reach=3.0 时 3.2 格不发 attack（否则运行时必然 OUT_OF_REACH）。"""
+        obs = make_observation(
+            "Glad_Bot_1", targets=[make_target(91, "Glad_Bot_2", x=3.2, z=0.0, distance=3.2)])
+        actions = decode_action(2, obs, "Glad_Bot_1", reach=3.0)
+        self.assertFalse([a for a in actions if a["type"] == "attack"])
+        self.assertEqual(actions[-1]["type"], "move")
+        # 同一距离在默认 reach 下仍在射程内
+        self.assertTrue([a for a in decode_action(2, obs, "Glad_Bot_1") if a["type"] == "attack"])
+
+    def test_use_rod_only_between_two_and_six(self):
+        for distance, expect in ((1.5, False), (3.0, True), (6.5, False)):
+            obs = make_observation(
+                "Glad_Bot_1",
+                targets=[make_target(91, "Glad_Bot_2", x=distance, z=0.0, distance=distance)],
+            )
+            actions = decode_action(ACTION_NAMES.index("use_rod"), obs, "Glad_Bot_1")
+            used = [a for a in actions if a["type"] == "use"
+                    and a["params"].get("item") == "rod"]
+            self.assertEqual(bool(used), expect, f"distance={distance}")
+            if not expect:
+                self.assertEqual(actions[-1]["type"], "move")
+
     def test_spectator_only_is_not_attacked(self):
         # 附近只有观战者时，attack 退化为 idle，而不是对着观战者挥空。
         observation = make_observation(
