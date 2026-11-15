@@ -190,6 +190,15 @@ class WriteBackTests(_Fixture):
         self.assertIn("只读", result["error"])
         self.assertFalse((self.cfg.var_dir / "models" / "file" / "policy.npz").exists())
 
+    def test_gmod_sharing_stem_does_not_block_policy_write_back(self) -> None:
+        """仓库自带 models/default.gmod 时，default 的持久化写回不能被误判为只读。"""
+        write_gmod(self.gdir, "default.gmod", meta=default_meta(id="default"))
+        self.assertIsNotNone(self.store.gmod.get("default"), "前提：gmod 扫描确实能按 stem 命中")
+        result = self.store.write_back("default", self.policy(),
+                                       {"runId": "r", "episodes": 1, "steps": 1})
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertTrue((self.cfg.var_dir / "models" / "default" / "policy.npz").is_file())
+
     def test_disk_error_is_captured_not_raised(self) -> None:
         with mock.patch("models.shutil.copy2", side_effect=OSError("磁盘已满")):
             result = self.store.write_back("default", self.policy(),

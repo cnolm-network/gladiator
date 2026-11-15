@@ -1918,9 +1918,12 @@ function renderTraining() {
   if (persistInfo && persistInfo.enabled) {
     const persistText = persistInfo.ok === true
       ? `已写回模型 <b>${escapeHtml(persistInfo.modelId)}</b>（权重已更新，下次选它继续练）`
-      : persistInfo.skipped
-        ? `未写回模型 ${escapeHtml(persistInfo.modelId)}：${escapeHtml(persistInfo.error || "训练未正常完成")}`
-        : `<span style="color:var(--danger)">写回失败：${escapeHtml(persistInfo.error || "未知原因")}</span>`;
+      : persistInfo.ok == null
+        // 训练还在跑（含评估阶段）时持久化尚未发生，不能显示成失败。
+        ? `训练结束后写回模型 <b>${escapeHtml(persistInfo.modelId)}</b>（当前进行中）`
+        : persistInfo.skipped
+          ? `未写回模型 ${escapeHtml(persistInfo.modelId)}：${escapeHtml(persistInfo.error || "训练未正常完成")}`
+          : `<span style="color:var(--danger)">写回失败：${escapeHtml(persistInfo.error || "未知原因")}</span>`;
     body += `<p class="muted small" style="margin:6px 0 0">持久化训练：${persistText}</p>`;
   }
   if (job.persistWarning) {

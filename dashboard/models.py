@@ -553,7 +553,13 @@ class ModelStore:
         ident = self._check_id(model_id)
         result: dict[str, Any] = {"ok": False, "modelId": ident}
         try:
-            if self.gmod is not None and self.gmod.get(ident) is not None:
+            # 只有「解析到 .gmod」的 id 才是只读包；仓库里随附 models/default.gmod 这类
+            # 与服务端策略模型同名的文件，不能把持久化模型一起判成只读（G-611 后续）。
+            policy_dir = self.root / ident
+            is_policy_model = (policy_dir / "model.json").is_file()
+            if not is_policy_model and (
+                    ident.startswith(GMOD_PREFIX) or (
+                        self.gmod is not None and self.gmod.get(ident) is not None)):
                 raise BadRequest(".gmod 是只读文件包，请先「导入为策略模型」再持久化训练")
             source = Path(policy_file)
             if not source.is_file():
