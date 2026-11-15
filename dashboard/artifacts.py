@@ -127,6 +127,44 @@ def _history_summary(history: list[dict]) -> dict:
     }
 
 
+def _by_opponent(summary: dict | None, history: list[dict], train_user: str | None) -> dict:
+    """分对手胜率（P1-1）。
+
+    优先用训练侧写好的 ``report.summary.byOpponent``；旧 run 没有该字段时，用 history 的
+    ``opponentMode`` + ``winner`` 现算（更老的 run 连 opponentMode 都没有 → 返回空字典，不报错）。
+    """
+    if isinstance(summary, dict):
+        stored = summary.get("byOpponent")
+        if isinstance(stored, dict) and stored:
+            return stored
+    if not train_user or not isinstance(history, list):
+        return {}
+    groups: dict[str, dict] = {}
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        mode = str(item.get("opponentMode") or "")
+        if not mode:
+            continue
+        bucket = groups.setdefault(mode, {"episodes": 0, "wins": 0, "_rewards": []})
+        bucket["episodes"] += 1
+        if item.get("win") is True or (item.get("winner") is not None
+                                       and item.get("winner") == train_user):
+            bucket["wins"] += 1
+        try:
+            bucket["_rewards"].append(float(item.get("totalReward") or 0.0))
+        except (TypeError, ValueError):
+            pass
+    result: dict[str, dict] = {}
+    for mode, bucket in groups.items():
+        episodes = int(bucket["episodes"])
+        rewards = bucket.pop("_rewards")
+        bucket["winRate"] = round(bucket["wins"] / episodes, 4) if episodes else 0.0
+        bucket["meanReward"] = round(sum(rewards) / len(rewards), 4) if rewards else 0.0
+        result[mode] = bucket
+    return result
+
+
 def _plan_from_config(config: dict, kind: str) -> list[dict]:
     if not isinstance(config, dict):
         return []
@@ -182,6 +220,10 @@ class ArtifactStore:
         if not isinstance(payload, dict):
             return {"exists": True, "path": str(path), "error": "train-report.json 不是合法 JSON"}
         history = _slim_history(payload.get("history"))
+        config = payload.get("config") or {}
+        users = config.get("users") if isinstance(config, dict) else None
+        train_user = users[0] if isinstance(users, list) and users else None
+        summary = payload.get("summary")
         return {
             "exists": True,
             "path": str(path),
@@ -190,8 +232,12 @@ class ArtifactStore:
             "finishedAt": _finished_at(payload),
             "durationSeconds": payload.get("durationSeconds"),
             "config": payload.get("config"),
-            "plan": _plan_from_config(payload.get("config") or {}, "train"),
+            "plan": _plan_from_config(config, "train"),
             "summary": _history_summary(history),
+            # P1-1：分对手胜率（旧 run 缺失时从 history 现算，再缺就空表）。
+            "byOpponent": _by_opponent(summary, payload.get("history"), train_user),
+            "evaluationByOpponent": (payload.get("evaluationByOpponent")
+                                     if isinstance(payload.get("evaluationByOpponent"), dict) else {}),
             "history": history,
             "evaluation": _slim_history(payload.get("evaluation")),
             "policyPath": payload.get("policyPath"),
@@ -335,6 +381,8 @@ class ArtifactStore:
             "durationSeconds": report.get("durationSeconds"),
             "status": "finished",
             "summary": summary,
+            # P1-1：分对手胜率（数据页「运行详情」小表用；无数据返回空对象）。
+            "byOpponent": (report.get("byOpponent") if isinstance(report, dict) else None) or {},
             "episodes": summary.get("episodes"),
             "steps": summary.get("totalSteps"),
             "meanReward": summary.get("meanReward"),
@@ -426,6 +474,8 @@ class ArtifactStore:
             "durationSeconds": report.get("durationSeconds"),
             "status": status,
             "summary": summary,
+            # P1-1：分对手胜率（「运行详情」小表用；旧 run 无数据时是空对象）。
+            "byOpponent": (report.get("byOpponent") if isinstance(report, dict) else None) or {},
             "episodes": summary.get("episodes"),
             "steps": summary.get("totalSteps"),
             "meanReward": summary.get("meanReward"),
@@ -753,7 +803,7 @@ class ArtifactStore:
             "id", "legacy", "name", "kind", "tag", "runDir", "createdAt", "modifiedAt",
             "startedAt", "finishedAt", "durationSeconds", "status", "summary", "episodes",
             "steps", "meanReward", "finalReward", "plan", "reviewCount", "logPath",
-            "reportPath", "reportFile", "error",
+            "reportPath", "reportFile", "error", "byOpponent",
         )
         return {key: run.get(key) for key in keys}
 

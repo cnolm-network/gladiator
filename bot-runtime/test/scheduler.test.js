@@ -48,6 +48,20 @@ test('重复 seq 回放缓存结果并标记 deduped', async () => {
   assert.equal(scheduler.stats.deduped, 1);
 });
 
+test('动作自带结果时原样透传（OUT_OF_REACH_CHASED）', async () => {
+  const scheduler = new ActionScheduler({ maxPerSecond: 10, dedupeCapacity: 8 });
+  const result = await scheduler.run(1, async () => ({
+    ok: true, code: 'OUT_OF_REACH_CHASED', distance: 4.4, reach: 3.99,
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 'OUT_OF_REACH_CHASED');
+  assert.equal(result.distance, 4.4);
+  // 缓存回放也要带上
+  const replay = await scheduler.run(1, async () => assert.fail('不应重复执行'));
+  assert.equal(replay.code, 'OUT_OF_REACH_CHASED');
+  assert.equal(replay.deduped, true);
+});
+
 test('执行异常转结构化 code', async () => {
   const scheduler = new ActionScheduler({ now: () => 1000 });
   const error = new Error('区域禁止');

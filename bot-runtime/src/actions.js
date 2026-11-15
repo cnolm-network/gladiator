@@ -20,6 +20,9 @@ const DIRECTIONS = Object.freeze(['forward', 'back', 'left', 'right', 'sprint', 
 // 连续 move 之间允许“按住不放”的宽限期：略大于控制周期（默认 10Hz、2 tick/步 = 200ms），
 // 让运动连续而不是每步松键一次；超过这个时间没有新 move 才真正停下。
 const MOVE_RELEASE_GRACE_MS = 120;
+// 打不到时「追一步」的按键时长：略短于一个控制周期（200ms），既产生实际位移，
+// 又不会让 Bot 冲过头。
+const CHASE_STEP_MS = 180;
 const FACES = Object.freeze({
   up: [0, 1, 0],
   down: [0, -1, 0],
@@ -243,8 +246,20 @@ export class ActionDispatcher {
     }
     const distance = eyeDistance(this.bot, entity);
     if (distance > this.profile.reach) {
-      throw new ActionError('OUT_OF_REACH',
-        `目标距离 ${distance.toFixed(2)} > reach ${this.profile.reach}`);
+      // 打不到就追上去，不报错。
+      //
+      // 训练里对手被判「能打」之后，常被学习方那一击的击退推开 1.0~1.6 格
+      // （击退初速 0.4 格/tick 衰减 + 5.4 格/s × 0.2s 位移），dispatch 时真实 eyeDistance
+      // 已经 > reach。抛 OUT_OF_REACH 只会刷日志，这一 tick 还是白白浪费（下一 tick 仍要靠近）。
+      // 所以改成「先转身 + 疾跑追一步」，返回 ok=true，环境侧不再记失败，
+      // 但仍可用 code=OUT_OF_REACH_CHASED 统计「有多少次是贴上去的」。
+      await this.chaseTarget(entity, distance);
+      return {
+        ok: true,
+        code: 'OUT_OF_REACH_CHASED',
+        distance,
+        reach: this.profile.reach,
+      };
     }
     this.checkAllowed({
       x: Math.floor(entity.position.x),
@@ -280,6 +295,38 @@ export class ActionDispatcher {
     if (this.profile.assist.wtap) {
       await this.sprintReset();
     }
+  }
+
+  /**
+   * 够不到目标时先追一步：转身对准 + 按住前进/疾跑 CHASE_STEP_MS，然后交给既有的延迟释放。
+   *
+   * <p>复用 {@link #move} 的「按住 + 延迟释放」机制（{@code this.hold} + {@link #_scheduleHoldRelease}），
+   * 不会把前进键按死；环境下一 tick 若继续靠近，`move` 会接着保持按住，反之宽限期后自动松开。
+   */
+  async chaseTarget(entity, distance) {
+    const bot = this.bot;
+    if (!entity || !entity.position) {
+      throw new ActionError('ENTITY_NOT_FOUND', '追击时目标已消失');
+    }
+    try {
+      // 未开 aimLock 也至少把视角转过去，否则疾跑是「盲跑」，下一 tick 依然打不到。
+      await aimAt(bot, entity, this.profile.assist.aimLock === true);
+    } catch (error) {
+      // 目标刚消失 / 测试替身没有 lookAt：不阻断追击，下一 tick 的 look 动作会纠正朝向。
+    }
+    if (this.hold && (this.hold.direction !== 'forward' || this.hold.sprint !== true)) {
+      this._releaseHold();
+    }
+    if (this.holdTimer) {
+      clearTimeout(this.holdTimer);
+      this.holdTimer = null;
+    }
+    bot.setControlState('forward', true);
+    bot.setControlState('sprint', true);
+    this.hold = { direction: 'forward', sprint: true };
+    await sleep(CHASE_STEP_MS);
+    this._scheduleHoldRelease(MOVE_RELEASE_GRACE_MS);
+    return { distance, reach: this.profile.reach };
   }
 
   /**

@@ -151,6 +151,38 @@ test('缺少物品时返回 ITEM_MISSING', async () => {
   );
 });
 
+test('超距攻击改为追击：转向 + 前进/疾跑，宽限期后松开', async () => {
+  const bot = fakeBot({ entityPosition: { x: 0, y: 4, z: 5 } });
+  const dispatcher = new ActionDispatcher({
+    bot, profile: profile({ assist: { aimLock: true } }),
+  });
+
+  const result = await dispatcher.dispatch({ type: 'attack', params: { targetEntityId: 7 } });
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 'OUT_OF_REACH_CHASED');
+  assert.ok(result.distance > result.reach, `distance=${result.distance}`);
+  // 不挥空刀
+  assert.equal(bot.calls.filter(([kind]) => kind === 'attack').length, 0);
+  // 先转向目标
+  assert.ok(bot.calls.some(([kind]) => kind === 'lookAt'), 'aimLock 下应先 lookAt');
+  // 再按住前进 + 疾跑
+  assert.equal(bot.controlState.forward, true);
+  assert.equal(bot.controlState.sprint, true);
+  // 宽限期后必须松开（不能把键按死）
+  await sleep(220);
+  assert.equal(bot.controlState.forward, false);
+  assert.equal(bot.controlState.sprint, false);
+});
+
+test('目标实体不存在仍然报错', async () => {
+  const bot = fakeBot();
+  const dispatcher = new ActionDispatcher({ bot, profile: profile() });
+  await assert.rejects(
+    () => dispatcher.dispatch({ type: 'attack', params: { targetEntityId: 404 } }),
+    (error) => /实体不存在/.test(error.message),
+  );
+});
+
 test('eyeDistance 以眼睛高度计算', () => {
   const bot = fakeBot({ position: { x: 0, y: 4, z: 0 }, entityPosition: { x: 0, y: 4, z: 3 } });
   const distance = eyeDistance(bot, bot.entities[7]);

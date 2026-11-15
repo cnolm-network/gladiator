@@ -56,6 +56,8 @@ class TrainerTest(unittest.TestCase):
         self.assertEqual(set(history[0]), {
             "episode", "steps", "totalReward", "terminated", "truncated",
             "winner", "durationSeconds", "startedAt", "startedAtEpoch", "meanHealth",
+            # P1-1：分对手胜率需要这两个字段
+            "opponentMode", "win",
             "policyUpdates", "elapsedSeconds",
             "review",
         })

@@ -384,6 +384,11 @@
           </div>
         </div>
         <div id="data-run-body"></div>
+        <div class="card-head" style="margin-top:14px"><h3>分对手胜率</h3><span class="muted small">按训练计划段统计</span></div>
+        <div class="table-wrap" id="data-run-byopponent-wrap">
+          <table><thead><tr><th>对手</th><th>局数</th><th>胜</th><th>胜率</th><th>均 reward</th></tr></thead><tbody id="data-run-byopponent"></tbody></table>
+        </div>
+        <div class="empty hidden" id="data-run-byopponent-empty">暂无分对手数据（该运行没有记录 opponentMode）。</div>
         <div class="chart" id="data-run-chart"></div>
         <div class="card-head" style="margin-top:14px"><h3>该运行回合</h3><span class="muted small" id="data-run-episodes-meta"></span></div>
         <div class="table-wrap">

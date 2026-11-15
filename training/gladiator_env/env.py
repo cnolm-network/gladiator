@@ -44,6 +44,34 @@ KIT_MUST_HAVE: tuple[tuple[str, int], ...] = (
     ("fishing_rod", 1),
 )
 ARMOR_SLOTS = ("head", "torso", "legs", "feet")
+#: 护甲槽位 → 物品名后缀：死亡掉落后要按**槽位**补发，``give`` 只会按名字给。
+ARMOR_SLOT_SUFFIX = {
+    "head": "_helmet",
+    "torso": "_chestplate",
+    "legs": "_leggings",
+    "feet": "_boots",
+}
+#: 背包里找不到对应套件时的兜底护甲（与 ``ArenaConfig.kit`` 的默认值一致）。
+DEFAULT_ARMOR_ITEMS = {
+    "head": "diamond_helmet",
+    "torso": "diamond_chestplate",
+    "legs": "diamond_leggings",
+    "feet": "diamond_boots",
+}
+#: 重生补装的确认窗口（tick）。``give`` 没有回执，重生后要盯几帧才算数；
+#: 这段时间里该 Bot 不做进攻动作（背包可能还没同步）。
+_RESTOCK_TICKS = 3
+#: 补装确认期间要剥掉的动作类型（``use`` 要按参数细分，见 ``_KEEP_USE_ITEMS``）。
+_COMBAT_ACTIONS = frozenset({"attack", "dig", "place"})
+#: 补装期间**必须放行**的 use：切剑 / 穿甲 —— 它们本身就是补装动作，
+#: 剥掉会造成「补装期间把自己的补装动作也剥了」的死循环（run 20261115-2239 的 FAILED_KIT 就是它）。
+_KEEP_USE_ITEMS = frozenset({"armor", "sword"})
+#: 补装最多重试几轮（每轮 ``_RESTOCK_TICKS`` 帧）；用完才放弃。
+_RESTOCK_MAX_ROUNDS = 3
+#: 主动体检周期（步）：每 N 步查一次套装，缺件就触发补装。
+_RESTOCK_CHECK_EVERY = 10
+#: 这些运行时失败码说明「手上有动作但没东西」，直接当作补装触发源。
+_RESTOCK_TRIGGER_CODES = frozenset({"ITEM_MISSING", "ITEM_NOT_FOUND", "NO_ITEM"})
 
 
 def loadout_report(observation: dict | None) -> dict:
@@ -61,6 +89,9 @@ def loadout_report(observation: dict | None) -> dict:
         counts[name] = counts.get(name, 0) + int(item.get("count") or 0)
     armor = self_view.get("armor") or {}
     worn = sum(1 for slot in ARMOR_SLOTS if armor.get(slot))
+    # 护甲不进 ``missing``（那里只表示物品数量），单独给槽位列表：
+    # 死亡后四件护甲是**掉落消失**的，只发 ``use{item:"armor"}`` 永远穿不上（背包里没有）。
+    missing_armor = [slot for slot in ARMOR_SLOTS if not armor.get(slot)]
     held = str(((self_view.get("heldItem") or {}).get("name") or ""))
     missing = [
         (name, need - counts.get(name, 0))
@@ -70,6 +101,7 @@ def loadout_report(observation: dict | None) -> dict:
     return {
         "counts": counts,
         "armor": worn,
+        "missingArmor": missing_armor,
         "held": held,
         "missing": missing,
         "ok": not missing and worn == 4,
@@ -229,6 +261,18 @@ class GladiatorEnv(gym.Env):
         self._last_distance: dict[str, float | None] = {}
         #: 重生后的「观察档」：这段时间内代码驱动的对手只观察不出手（旧坐标会被传送打飞）。
         self._respawn_grace: dict[str, int] = {}
+        #: 对手「出手前先确认」：本 tick 判到 attack 但还没确认时记 1，下一 tick 复核后才真出手。
+        self._opponent_hold: dict[str, int] = {}
+        #: 待确认的攻击目标实体 id；换了目标要重新确认，避免对着旧目标补刀。
+        self._opponent_target: dict[str, int] = {}
+        #: 重生补装待确认次数（A2）：give 没有回执，重生后紧跟着的几步要复核是否真的到位。
+        self._restock_pending: dict[str, int] = {}
+        #: 每个重生周期只打一次「仍缺件」日志，避免刷屏。
+        self._restock_logged: set[str] = set()
+        #: 补装确认进行到第几 tick（日志用「第 N tick 已补齐」）。
+        self._restock_tick: dict[str, int] = {}
+        #: 已用完的补装轮数（到期仍缺件就再来一轮，最多 ``_RESTOCK_MAX_ROUNDS`` 轮）。
+        self._restock_rounds: dict[str, int] = {}
         self._log = logger or (lambda message: print(f"[env] {message}", flush=True))
 
         self._control_hz = float(control_hz or 0.0)
@@ -276,6 +320,13 @@ class GladiatorEnv(gym.Env):
         self.shaping.reset()
         options = options or {}
         self._steps = 0
+        # 新回合：动作确认状态与补装确认都不该跨回合残留。
+        self._opponent_hold.clear()
+        self._opponent_target.clear()
+        self._restock_pending.clear()
+        self._restock_logged.clear()
+        self._restock_tick.clear()
+        self._restock_rounds.clear()
         self._ensure_connected()
 
         if self._rcon_owned and self._rcon is not None:
@@ -321,17 +372,30 @@ class GladiatorEnv(gym.Env):
             if i != 0 and self._respawn_grace.get(bot.username, 0) > 0:
                 # 刚重生（可能被传送到出生点）：本 tick 只做观察，避免对旧坐标出手。
                 self._respawn_grace[bot.username] -= 1
+                self._clear_opponent_hold(bot.username)
                 actions = [{"type": "idle", "params": {"durationMs": MOVE_MS}}]
+            elif i != 0:
+                # 对手「出手前先确认」：观测与出手之间隔着一个 tick（≈1.1 格位移）+ 击退，
+                # 直接出拳会在边界吃 OUT_OF_REACH。这里把第一次判到的 attack 换成贴近，
+                # 下一 tick 用新观测复核距离，仍在射程内才真的挥。
+                actions = self._confirm_opponent_attack(bot, actions)
+            if self._restock_pending.get(bot.username, 0) > 0:
+                # 重生补装确认中：背包可能还没同步，进攻动作直接不发
+                # （否则运行时回 ITEM_MISSING，日志刷屏且这一 tick 白费）。
+                actions = self._strip_combat_actions(actions)
             dispatch.append(actions)
-            for result in self._safe_send(i, actions):
-                if result and result.get("ok") is False:
-                    self._log(f"{bot.username}: 动作失败 code={result.get('code')} {result.get('reason', '')}")
+            self._handle_action_results(i, self._safe_send(i, actions))
 
         time.sleep(self.action_ticks / self._control_hz)
         if not self.wait_action_results:
             self._drain_results()
         previous = self._raw
         self._raw = self._refresh_raw(previous)
+        # A2：重生补装确认（必须在观测刷新之后、算奖励之前，让策略看到补齐后的状态）。
+        self._confirm_restock()
+        # 兜底体检：局内「死→活」可能整个被刷新跳过（is_out 看不到），这里只看现状。
+        if _RESTOCK_CHECK_EVERY > 0 and self._steps % _RESTOCK_CHECK_EVERY == 0:
+            self._periodic_loadout_check()
         observation = self._encode_all()
 
         terminated = any(is_out(obs) for obs in self._raw)
@@ -450,6 +514,45 @@ class GladiatorEnv(gym.Env):
             return ((a["x"] - b["x"]) ** 2 + (a["y"] - b["y"]) ** 2 + (a["z"] - b["z"]) ** 2) ** 0.5
         except (KeyError, TypeError):
             return None
+
+    # --- 对手出手确认（A1） ---------------------------------------------
+
+    def _clear_opponent_hold(self, username: str) -> None:
+        self._opponent_hold.pop(username, None)
+        self._opponent_target.pop(username, None)
+
+    def _confirm_opponent_attack(self, bot: BotConfig, actions: list[dict]) -> list[dict]:
+        """把「本 tick 第一次判到的 attack」降级成贴近，下一 tick 复核后再出手。
+
+        - 只对代码驱动的对手生效（学习方的动作完全不经过这里）；
+        - 不引入随机性：连续两个 tick 都判到同一目标 attack 才真正出手；
+        - 中间换目标或不再判 attack → 状态清空，重新开始确认。
+        """
+        username = bot.username
+        attack = next((item for item in actions if item.get("type") == "attack"), None)
+        if attack is None:
+            # 本 tick 不打算出手（例如上一 tick 确认后距离变大、已退化为 move）：清掉待确认。
+            self._clear_opponent_hold(username)
+            return actions
+
+        target_id = (attack.get("params") or {}).get("targetEntityId")
+        held = int(self._opponent_hold.get(username) or 0)
+        same_target = self._opponent_target.get(username) == target_id
+        if held <= 0 or not same_target:
+            self._opponent_hold[username] = 1
+            self._opponent_target[username] = target_id
+            return self._approach_only(actions)
+        # 连续两次判到同一目标且仍在射程内：真正出手，并清掉确认状态。
+        self._clear_opponent_hold(username)
+        return actions
+
+    @staticmethod
+    def _approach_only(actions: list[dict]) -> list[dict]:
+        """保留朝向、把 attack 换成疾跑靠近（贴近/保持距离）。"""
+        look = next((item for item in actions if item.get("type") == "look"), None)
+        move = {"type": "move", "params": {
+            "direction": "forward", "durationMs": MOVE_MS, "sprint": True}}
+        return ([look] if look is not None else []) + [move]
 
     def _opponent_action(self, index: int) -> int:
         """非受控 Bot 的动作：课程学习的不同难度。"""
@@ -662,8 +765,7 @@ class GladiatorEnv(gym.Env):
             )
             for name, need in report["missing"]:
                 self._command(f"give {bot.username} {name} {need}")
-            if report["armor"] < 4:
-                self._send_use(index, {"item": "armor"})
+            self._give_armor(index, bot, report)
         self._log(f"[kit] {bot.username} 校验未通过，继续训练（该局数据可能有偏差）")
 
     def _ensure_sword_in_hand(self, index: int, bot: BotConfig,
@@ -685,7 +787,11 @@ class GladiatorEnv(gym.Env):
         """回合中死亡重生后补发套件（A1）。
 
         1.8.8 死亡会掉落背包，重生后往往是空手；如果不补，剩下的时间等于白送对手一分。
-        这里只在「上一帧已死、这一帧活」时触发，且只发命令、不阻塞 step。
+        这里只在「上一帧已死、这一帧活」时触发。
+
+        注意：观测 200ms 刷一次，**局内「死→活」很可能被跳过一个刷新点**，
+        这条路径会静默失效——所以它只是一条「能看见就用」的快路径，
+        真正兜底的是 :meth:`_request_restock` 的另外两个触发源（运行时失败码 / 周期体检）。
         """
         for index, bot in enumerate(self.bots):
             before = previous[index] if index < len(previous) else None
@@ -696,22 +802,218 @@ class GladiatorEnv(gym.Env):
             now_alive = self_health(current) > 0.0 and not is_out(current)
             if not (was_dead and now_alive):
                 continue
+            self._log(f"[kit] {bot.username} 重生（血量 {self_health(current):g}）")
+            self._request_restock(index, reason="respawn")
+
+    def _request_restock(self, index: int, reason: str = "") -> bool:
+        """给某个 Bot 开一轮补装（三个触发源共用这一条路径）。
+
+        触发源：① 观测到「死→活」（``respawn``）；② 运行时回 ``ITEM_MISSING`` 之类的失败码
+        （``code=...``）；③ 每 ``_RESTOCK_CHECK_EVERY`` 步的主动体检（``periodic``）。
+
+        返回 True 表示新开了一轮（打了「触发补装」日志），False 表示只是把已有窗口补足。
+        """
+        if not 0 <= index < len(self.bots):
+            return False
+        bot = self.bots[index]
+        user = bot.username
+        current = int(self._restock_pending.get(user, 0))
+        if current > 0:
+            # 已在补装窗口里：只把计数补足，不重复打日志（否则每 tick 一条）。
+            self._restock_pending[user] = max(current, _RESTOCK_TICKS)
+            self._respawn_grace[user] = max(
+                self._respawn_grace.get(user, 0), _RESTOCK_TICKS)
+            self._restock_rounds.setdefault(user, 0)
+            return False
+
+        self._restock_pending[user] = _RESTOCK_TICKS
+        self._restock_tick[user] = 0
+        self._restock_rounds[user] = 0
+        self._restock_logged.discard(user)
+        # 观察档与补装窗口同步：补装没确认完之前，代码驱动对手只观察不出手。
+        self._respawn_grace[user] = max(
+            self._respawn_grace.get(user, 0), _RESTOCK_TICKS)
+
+        raw = self._raw[index] if index < len(self._raw) else None
+        report = loadout_report(raw)
+        self._log(f"[restock] {user} 触发补装（原因：{reason or 'unknown'}）")
+        self._give_missing(index, bot, report)
+        return True
+
+    def _give_missing(self, index: int, bot: BotConfig, report: dict) -> None:
+        """按 ``loadout_report`` 的结果补件：缺什么 ``give`` 什么 + 重穿护甲 + 切剑。
+
+        ``give`` 依赖 RCON 与 ``give_kit``；两者都不具备时至少把剑切到手上
+        （可能是「有剑但没选中」，运行时能自己挪进快捷栏）。
+        """
+        if self.arena.give_kit and self._rcon is not None:
+            for name, need in report["missing"]:
+                try:
+                    self._command(f"give {bot.username} {name} {max(1, int(need))}")
+                except LinkError:
+                    pass
+            self._give_armor(index, bot, report)
+        self._select_sword(index)
+
+    def _give_armor(self, index: int, bot: BotConfig, report: dict) -> None:
+        """按缺失**槽位**补发护甲，再请运行时穿上。
+
+        护甲掉落是「整件消失」，只发 ``use{item:"armor"}`` 是穿不上的（背包里没有这件）。
+        必须先把头盔/胸甲/护腿/靴子 ``give`` 回来，``use{armor}`` 才有东西可穿。
+        """
+        missing_armor = report.get("missingArmor") or []
+        if not missing_armor or not (self.arena.give_kit and self._rcon is not None):
+            return
+        for slot in missing_armor:
+            try:
+                self._command(f"give {bot.username} {self._armor_item_for(slot)} 1")
+            except LinkError:
+                pass
+        self._send_use(index, {"item": "armor"})
+
+    def _armor_item_for(self, slot: str) -> str:
+        """某个护甲槽位应该发什么物品：优先用 ``ArenaConfig.kit`` 里的同后缀件。"""
+        suffix = ARMOR_SLOT_SUFFIX.get(slot)
+        if suffix:
+            for name, _count in self.arena.kit:
+                if str(name).endswith(suffix):
+                    return str(name)
+        return DEFAULT_ARMOR_ITEMS[slot]
+
+    def _confirm_restock(self) -> None:
+        """复核补发的套件是否真的到位（A2）。
+
+        1.8.8 的 ``give`` 没有回执，重生后 1–2 tick 内容易出现「有甲无剑」，运行时于是回
+        ``ITEM_MISSING 背包里没有剑``。这里在窗口内持续复核：缺件按数量补发、护甲不足重新穿、
+        顺手把主手切回剑。
+
+        窗口（``_RESTOCK_TICKS`` 帧）用完仍缺件时**不再直接放弃**：重置窗口再来一轮，
+        最多 ``_RESTOCK_MAX_ROUNDS`` 轮；期间进攻动作一直被剥掉（:meth:`_strip_combat_actions`）。
+        全部失败才打一行 ``[kit] <user> 补装失败（已重试 N 轮，缺 ...）``。
+
+        完成判据只看**数量 + 护甲**（``missing == []`` 且护甲 4/4），**不把 ``holding_sword``
+        当硬条件**：切剑是策略自己的事，卡在这里只会让窗口 3 轮白跑（日志表现为
+        ``补装失败（已重试 3 轮，缺 []）``）。数量齐但没持剑时打一行提示并立即结束窗口。
+        """
+        for index, bot in enumerate(self.bots):
+            left = int(self._restock_pending.get(bot.username, 0))
+            if left <= 0:
+                continue
+            tick = int(self._restock_tick.get(bot.username, 0)) + 1
+            self._restock_tick[bot.username] = tick
+            current = self._raw[index] if index < len(self._raw) else {}
             report = loadout_report(current)
-            self._log(
-                f"[kit] {bot.username} 重生（血量 {self_health(current):g}），"
-                f"补发套件：缺 {report['missing']}，护甲 {report['armor']}/4"
-            )
-            if self.arena.give_kit and self._rcon is not None:
-                for name, need in report["missing"]:
-                    try:
-                        self._command(f"give {bot.username} {name} {need}")
-                    except LinkError:
-                        pass
-                if report["armor"] < 4:
-                    self._send_use(index, {"item": "armor"})
-            # 不管有没有 RCON，都让运行时把主手切回剑（剑可能还在背包/快捷栏里）。
-            self._select_sword(index)
-            self._respawn_grace[bot.username] = 2
+            # 数量齐 + 护甲满即算补齐；持不持剑交给策略（见方法注释）。
+            if report["ok"] and report["armor"] == 4:
+                rounds = int(self._restock_rounds.get(bot.username, 0))
+                if not report["holding_sword"]:
+                    # 每轮最多一次（窗口在马上升级结束，天然只有一条）。
+                    self._log(
+                        f"[restock] {bot.username} 数量齐但不持剑，等策略自行切换"
+                    )
+                self._restock_pending.pop(bot.username, None)
+                self._restock_logged.discard(bot.username)
+                self._restock_tick.pop(bot.username, None)
+                self._restock_rounds.pop(bot.username, None)
+                self._respawn_grace.pop(bot.username, None)
+                suffix = f"，第 {rounds + 1} 轮" if rounds else ""
+                self._log(f"[restock] {bot.username} 已补齐（第 {tick} tick{suffix}）")
+                continue
+            self._give_missing(index, bot, report)
+            if bot.username not in self._restock_logged:
+                self._restock_logged.add(bot.username)
+                self._log(
+                    f"[kit] {bot.username} 补装中（缺 {report['missing']}，"
+                    f"护甲 {report['armor']}/4，手持 {report['held'] or '空手'}）"
+                )
+            left -= 1
+            if left > 0:
+                self._restock_pending[bot.username] = left
+                # 观察档跟随 pending：确认期间对手不出手。
+                self._respawn_grace[bot.username] = max(
+                    self._respawn_grace.get(bot.username, 0), left)
+                continue
+
+            # 本轮窗口用完仍缺件：还有余量就再来一轮（strip 继续生效），否则放弃。
+            rounds = int(self._restock_rounds.get(bot.username, 0)) + 1
+            self._restock_rounds[bot.username] = rounds
+            if rounds < _RESTOCK_MAX_ROUNDS:
+                self._restock_pending[bot.username] = _RESTOCK_TICKS
+                self._restock_tick[bot.username] = 0
+                # 新一轮重新允许打一次「补装中」日志（每轮最多一条）。
+                self._restock_logged.discard(bot.username)
+                self._respawn_grace[bot.username] = max(
+                    self._respawn_grace.get(bot.username, 0), _RESTOCK_TICKS)
+                self._log(
+                    f"[kit] {bot.username} 补装第 {rounds} 轮未齐（缺 {report['missing']}），重试"
+                )
+            else:
+                self._restock_pending.pop(bot.username, None)
+                self._restock_tick.pop(bot.username, None)
+                self._restock_rounds.pop(bot.username, None)
+                self._restock_logged.discard(bot.username)
+                self._respawn_grace.pop(bot.username, None)
+                self._log(
+                    f"[kit] {bot.username} 补装失败（已重试 {rounds} 轮，"
+                    f"缺 {report['missing']}，护甲 {report['armor']}/4）"
+                )
+
+    def _periodic_loadout_check(self) -> None:
+        """每 ``_RESTOCK_CHECK_EVERY`` 步主动体检一次套装（兜底）。
+
+        局内死亡→复活可能整个被观测跳过（200ms 一次刷新），``is_out`` 根本没看到，
+        ``_restock_after_respawn`` 就不会触发。这里不问「死没死」，只看「现在缺不缺」。
+        """
+        if not self.arena.give_kit:
+            # 场地自己不供装（例如自定义补给），主动补装会把规则改乱。
+            return
+        for index, bot in enumerate(self.bots):
+            if self._restock_pending.get(bot.username, 0) > 0:
+                continue
+            report = loadout_report(self._raw[index] if index < len(self._raw) else None)
+            if report["ok"] and report["armor"] == 4 and report["holding_sword"]:
+                continue
+            if report["ok"] and report["armor"] == 4:
+                # 只是没拿剑（例如刚吃完金苹果）：切剑即可，不必开补装窗口把战斗动作剥掉。
+                self._ensure_sword_in_hand(index, bot, report=report)
+                continue
+            self._request_restock(index, reason="periodic")
+
+    @staticmethod
+    def _is_equip_use(action: dict) -> bool:
+        """这条 ``use`` 是不是「装备性」的（切剑 / 穿甲）——补装期间必须放行。"""
+        params = action.get("params") or {}
+        if params.get("select") is True:
+            return True
+        return str(params.get("item") or "") in _KEEP_USE_ITEMS
+
+    @classmethod
+    def _strip_combat_actions(cls, actions: list[dict]) -> list[dict]:
+        """补装确认期间只剥「进攻性」动作，保留装备动作与移动/观察。
+
+        - 剥掉：``attack`` / ``dig`` / ``place``，以及进攻/消耗性的 ``use``
+          （``gapple`` / ``rod`` / ``blocks`` / ``food`` 等）；
+        - 保留：``look`` / ``move`` / ``jump`` / ``idle``，以及**装备性** ``use``
+          （``select=true`` 或 ``item in {armor, sword}``）。
+
+        保留装备性 use 是关键：``_give_missing`` / ``_select_sword`` 走的正是
+        ``use{item:"sword",select:true}`` 与 ``use{item:"armor"}``。
+        若把它们一起剥掉，补装期间就再也无法切剑 → ``holding_sword`` 永远为假 →
+        窗口 3 轮必然失败（``缺 []`` 却 FAILED_KIT）。
+        """
+        kept = []
+        for item in actions:
+            action = item or {}
+            kind = str(action.get("type") or "")
+            if kind in _COMBAT_ACTIONS:
+                continue
+            if kind == "use" and not cls._is_equip_use(action):
+                continue
+            kept.append(action)
+        if not kept:
+            # 全被剥光时给个 idle，保持「每 tick 都有动作」的既有约定。
+            return [{"type": "idle", "params": {"durationMs": MOVE_MS}}]
+        return kept
 
     def _tag_bot(self, index: int, bot: BotConfig) -> None:
         """给头顶名称打角色标签（BetterNameTag）：训练方红色，代码驱动按策略着色。
@@ -874,7 +1176,7 @@ class GladiatorEnv(gym.Env):
             return []
 
     def _drain_results(self) -> None:
-        """非阻塞模式下把上一 tick 的 ACTION_RESULT 取回来，只用于错误日志。"""
+        """非阻塞模式下把上一 tick 的 ACTION_RESULT 取回来（日志 + 补装触发）。"""
         for index, link in enumerate(self.links):
             poll = getattr(link, "poll_results", None)
             if poll is None:
@@ -884,7 +1186,23 @@ class GladiatorEnv(gym.Env):
             except Exception as exc:  # noqa: BLE001
                 self._log(f"{self.bots[index].username}: 读取动作结果失败: {exc}")
                 continue
-            for result in results:
-                if result and result.get("ok") is False:
-                    self._log(f"{self.bots[index].username}: 动作失败 "
-                              f"code={result.get('code')} {result.get('reason', '')}")
+            self._handle_action_results(index, results)
+
+    def _handle_action_results(self, index: int, results: list[dict]) -> None:
+        """统一处理 ACTION_RESULT：打日志 + 把「没东西可打」变成补装触发源。
+
+        关键：局内死亡→复活可能整个被 200ms 的观测刷新跳过，
+        ``_restock_after_respawn`` 看不到 ``is_out`` 就不会触发。运行时的
+        ``ITEM_MISSING``（背包里没有剑/鱼竿/金苹果）是**必然会被发出来**的可见信号，
+        用它当触发源，补装就不会再静默失效。
+        """
+        if not results:
+            return
+        user = self.bots[index].username if 0 <= index < len(self.bots) else "?"
+        for result in results:
+            if not result or result.get("ok") is not False:
+                continue
+            code = str(result.get("code") or "")
+            self._log(f"{user}: 动作失败 code={code} {result.get('reason', '')}")
+            if code in _RESTOCK_TRIGGER_CODES:
+                self._request_restock(index, reason=f"code={code}")

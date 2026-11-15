@@ -260,6 +260,19 @@ GladiatorEnv(
 日志形如 `[kit] <user> 套装就绪：手持剑，金苹果 5，护甲 4/4` → `[prep] 准备期 3s 结束，开始对局`。
 准备期不计入 `max_steps`，也不产生 reward。
 
+#### 对手「出手前先确认」（A1）
+
+代码驱动的对手（index != 0）在判到 `attack` 时不会立刻挥：第一次只下发
+`look` + `move(forward, sprint)`（贴近/保持），把真正的 `attack` 推到下一 tick，
+用新观测复核距离；**连续两 tick 判到同一目标且仍在射程内**才真正出手。
+
+原因：观测与出手之间隔着一个 tick（≈1.1 格位移），加上击退，边界攻击会被运行时判
+`OUT_OF_REACH`（日志里 `目标距离 4.3~4.8 > reach 3.99`）。
+
+- 只影响对手；学习方的动作序列完全不变（`_confirm_opponent_attack` 只在 `i != 0` 的分支调用）；
+- 不引入随机性；换目标要重新确认（`_opponent_target` 记当前确认对象）；
+- 重生后的「观察档」（`_respawn_grace`）优先：那几 tick 仍然只 idle，并清空确认状态。
+
 #### 回合中死亡重生（A1）
 
 1.8.8 死亡会掉落背包，重生后往往是空手。`step()` 在每帧观测后检测「上一帧血量 ≤0、这一帧 >0」，
@@ -271,6 +284,12 @@ GladiatorEnv(
 ```
 
 补发只发命令、不阻塞 `step()`；`terminated` 的帧不补（对局已结束）。
+
+补发之后还有**确认期**（A2）：`give` 没有回执，重生后 1–2 tick 内仍可能「有甲无剑」，
+运行时于是回 `ITEM_MISSING 背包里没有剑`。因此 `_restock_after_respawn` 会登记
+`_restock_pending[username] = 3`，随后每帧用 `loadout_report` 复核：缺件按数量再 `give`、
+护甲不足重发 `use {item:"armor"}`、并 `use {item:"sword", select:true}`；齐了立即清零。
+同一条「仍缺件」日志每个重生周期最多打一次。
 
 `ArenaConfig.give_kit=True` 时，每次 reset 用 RCON 发一套装备（顺序固定为
 剑 → 金苹果 → 鱼竿 → 四件护甲，保证剑落在快捷栏第一格）：

@@ -73,8 +73,12 @@ export class ActionScheduler {
   async execute(seq, execute) {
     let result;
     try {
-      await execute();
-      result = { ok: true };
+      // 动作可以自己带结果（例如 attack 够不到时回 {ok:true, code:'OUT_OF_REACH_CHASED'}）：
+      // 这类 code 只是统计口径，不是失败，原样透传；普通动作仍统一回 {ok:true}。
+      const returned = await execute();
+      result = returned && typeof returned === 'object' && typeof returned.ok === 'boolean'
+        ? returned
+        : { ok: true };
     } catch (error) {
       result = {
         ok: false,

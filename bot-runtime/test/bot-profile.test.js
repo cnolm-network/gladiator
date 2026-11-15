@@ -103,17 +103,27 @@ test('talk/idle 不计反应延时，战斗动作计入', () => {
   assert.equal(usesReactionDelay('look'), false);
 });
 
-test('attack 超出 reach 直接回 OUT_OF_REACH 且不调用 bot.attack', async () => {
+test('attack 超出 reach 不抛错，改为追击并返回 OUT_OF_REACH_CHASED', async () => {
   const bot = fakeBot({ entityPosition: { x: 5, y: 64, z: 0 } });
   const dispatcher = new ActionDispatcher({
     bot,
     profile: { reach: 3.99, reactionMs: 0, reactionJitterMs: 0 },
   });
-  await assert.rejects(
-    () => dispatcher.dispatch({ type: 'attack', params: { targetEntityId: 7 } }),
-    (error) => error.code === 'OUT_OF_REACH',
-  );
+  // 硬打只会吃 OUT_OF_REACH，所以仍然不许真的挥；但也不再抛错（环境侧不再刷失败日志）。
+  const result = await dispatcher.dispatch({ type: 'attack', params: { targetEntityId: 7 } });
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 'OUT_OF_REACH_CHASED');
+  assert.ok(result.distance > result.reach, `distance=${result.distance}`);
   assert.equal(bot.attacks.length, 0);
+  // 追一步 = 按下前进 + 疾跑
+  assert.deepEqual(bot.controls.filter(([name]) => name === 'forward' || name === 'sprint'),
+    [['forward', true], ['sprint', true]]);
+  assert.equal(dispatcher.hold.direction, 'forward');
+  assert.equal(dispatcher.hold.sprint, true);
+  // 延迟释放：宽限期过后必须松开，不能把键按死
+  await new Promise((resolve) => setTimeout(resolve, 220));
+  assert.deepEqual(bot.controls.slice(2), [['forward', false], ['sprint', false]]);
+  assert.equal(dispatcher.hold, null);
 });
 
 test('attack 在 reach 内会受 CPS 节流，第二次点击等待', async () => {

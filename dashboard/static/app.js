@@ -2242,6 +2242,29 @@ function renderRunDetail() {
     ${kvItem("日志", run.logState === "no-log" ? "本次运行没有日志（历史数据）" : (run.logPath || "—"))}
     ${kvItem("报告", run.reportPath || "—")}
   </div>`;
+  // P1-1：分对手胜率小表（对手 / 局数 / 胜 / 胜率 / 均 reward）；无数据显示「暂无」。
+  const byOpponent = run.byOpponent || {};
+  const opponentRows = Object.entries(byOpponent)
+    .filter(([, item]) => item && typeof item === "object")
+    .sort((a, b) => Number(b[1].episodes || 0) - Number(a[1].episodes || 0));
+  const byOpponentBody = $("#data-run-byopponent");
+  if (byOpponentBody) {
+    byOpponentBody.innerHTML = opponentRows.map(([mode, item]) => {
+      const rate = item.winRate == null ? null : Number(item.winRate);
+      return `<tr>
+        <td>${escapeHtml(mode)}</td>
+        <td>${num(item.episodes)}</td>
+        <td>${num(item.wins)}</td>
+        <td>${rate == null ? "—" : `${(rate * 100).toFixed(1)}%`}</td>
+        <td>${num(item.meanReward, 2)}</td>
+      </tr>`;
+    }).join("");
+  }
+  const byOpponentWrap = $("#data-run-byopponent-wrap");
+  if (byOpponentWrap) byOpponentWrap.classList.toggle("hidden", opponentRows.length === 0);
+  const byOpponentEmpty = $("#data-run-byopponent-empty");
+  if (byOpponentEmpty) byOpponentEmpty.classList.toggle("hidden", opponentRows.length > 0);
+
   const history = run.history || [];
   $("#data-run-chart").innerHTML = history.length
     ? lineChart(history.map((item) => Number(item.totalReward) || 0), { labels: history.map((item) => `#${item.episode ?? ""}`) })

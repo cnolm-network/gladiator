@@ -121,6 +121,33 @@ def parse_stages(raw: str, fallback_episodes: int) -> list[tuple[str, int]]:
     return stages
 
 
+def _bucket(records: list[dict], username: str) -> dict:
+    """一组的胜率/均 reward（P1-1）。"""
+    episodes = len(records)
+    wins = sum(1 for item in records
+               if bool(item.get("win")) or (item.get("winner") is not None
+                                            and item.get("winner") == username))
+    rewards = [float(item.get("totalReward") or 0.0) for item in records]
+    return {
+        "episodes": episodes,
+        "wins": wins,
+        "winRate": round(wins / episodes, 4) if episodes else 0.0,
+        "meanReward": round(sum(rewards) / episodes, 4) if episodes else 0.0,
+    }
+
+
+def summarize_records(records: list[dict], username: str) -> dict:
+    """``{"overall": {...}, "byOpponent": {mode: {...}}}``。"""
+    groups: dict[str, list[dict]] = {}
+    for item in records:
+        key = str(item.get("opponentMode") or "unknown")
+        groups.setdefault(key, []).append(item)
+    return {
+        "overall": _bucket(records, username),
+        "byOpponent": {key: _bucket(items, username) for key, items in groups.items()},
+    }
+
+
 def main(argv: List[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     run_dir = args.run_dir or new_run_dir("train", "-".join(args.users[:2]))
@@ -271,6 +298,8 @@ def main(argv: List[str] | None = None) -> int:
 
     os.makedirs(os.path.dirname(os.path.abspath(args.save)), exist_ok=True)
     policy.save(args.save, extra={"episodes": len(history), "seed": args.seed})
+    train_summary = summarize_records(history, bots[0].username)
+    eval_summary = summarize_records(eval_results, bots[0].username)
     report = {
         "runDir": run_dir,
         "kind": "train",
@@ -316,7 +345,12 @@ def main(argv: List[str] | None = None) -> int:
             "reviews": args.review_dir,
         },
         "history": history,
+        # P1-1：分对手胜率。overall = 全部训练局；byOpponent 按 env.opponent_mode 分桶。
+        "summary": train_summary,
         "evaluation": eval_results,
+        # 评估局的分桶（evaluation 本身是数组，分桶放在同级字段，避免破坏既有读取方）。
+        "evaluationByOpponent": eval_summary["byOpponent"],
+        "evaluationOverall": eval_summary["overall"],
         "policyPath": args.save,
     }
     save_report(args.report, report)
@@ -329,6 +363,13 @@ def main(argv: List[str] | None = None) -> int:
         f"[train] 完成：{len(history)} episodes / {total_steps} steps / "
         f"mean reward {mean_reward:.3f} / 命中 {hits} 空挥 {whiffs} / 用时 {report['durationSeconds']}s"
     )
+    by_opponent = report["summary"]["byOpponent"]
+    if by_opponent:
+        detail = "；".join(
+            f"{mode} {bucket['wins']}/{bucket['episodes']}（{bucket['winRate']:.0%}）"
+            for mode, bucket in by_opponent.items()
+        )
+        print(f"[train] 分对手胜率：{detail}")
     print(f"[train] 策略 {args.save}；报告 {args.report}；复盘 {args.review_dir}")
     return 0
 

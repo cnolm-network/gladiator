@@ -32,6 +32,10 @@ class EpisodeResult:
     observations: List[np.ndarray] = field(default_factory=list)
     actions: List[int] = field(default_factory=list)
     rewards: List[float] = field(default_factory=list)
+    #: 本局对手策略（取自 env.opponent_mode）；用于「固定对手池胜率」分桶。
+    opponent_mode: str = ""
+    #: 学习方是否赢下本局（winner == 学习方用户名）；未分胜负（超时截断）为 False。
+    win: bool = False
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -40,6 +44,8 @@ class EpisodeResult:
             "terminated": self.terminated,
             "truncated": self.truncated,
             "winner": self.winner,
+            "opponentMode": self.opponent_mode,
+            "win": self.win,
             "durationSeconds": round(self.duration_s, 2),
             "startedAt": self.started_at,
             "startedAtEpoch": round(self.started_epoch, 3),
@@ -116,6 +122,9 @@ class Trainer:
         result.started_epoch = started_wall
         result.started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(started_wall))
         result.mean_health = float(np.mean(healths)) if healths else 0.0
+        # P1-1：分对手胜率需要「这局打的是谁 + 是否赢」，两者都从环境/结果里取，不依赖调用方补。
+        result.opponent_mode = str(getattr(self.env, "opponent_mode", "") or "")
+        result.win = bool(result.winner is not None and result.winner == username)
         breakdown = {}
         summary_fn = getattr(self.env, "shaping", None)
         if summary_fn is not None:

@@ -73,9 +73,39 @@ cd training
 - `artifacts/policy.npz`：`W1/b1/W2/b2` + `_meta`（obs_dim/n_actions/hidden/updates）。
   用 `Policy.load(path)` 读回，`policy.act(obs, rng, greedy=True)` 即可推理。
 - `artifacts/train-report.json`：`config` / `history`（每回合 steps、totalReward、winner、
-  durationSeconds、policyUpdates）/ `evaluation` / `policyPath`。
+  opponentMode、win、durationSeconds、policyUpdates）/ `summary` / `evaluation` /
+  `evaluationByOpponent` / `evaluationOverall` / `policyPath`。
 
 `training/artifacts/` 已加入 `.gitignore`，训练产物不入库。
+
+### 4.1 分对手胜率（P1-1）
+
+`history` 的每条记录新增两个字段：
+
+| 字段 | 含义 |
+|---|---|
+| `opponentMode` | 本局对手策略（取自 `env.opponent_mode`，即训练计划当前段） |
+| `win` | 学习方是否赢下本局（`winner == bots[0].username`）；超时截断为 `false` |
+
+`report.summary` 是训练局的分桶聚合：
+
+```json
+{
+  "overall":    {"episodes": 16, "wins": 3, "winRate": 0.1875, "meanReward": -39.68},
+  "byOpponent": {
+    "scripted": {"episodes": 6, "wins": 2, "winRate": 0.3333, "meanReward": -20.1},
+    "rusher":   {"episodes": 6, "wins": 1, "winRate": 0.1667, "meanReward": -41.2},
+    "aimbot":   {"episodes": 4, "wins": 0, "winRate": 0.0,    "meanReward": -68.3}
+  }
+}
+```
+
+评估局单独给 `report.evaluationByOpponent` / `report.evaluationOverall`
+（`evaluation` 本身仍是数组——Dashboard 与旧脚本按数组消费，分桶放在同级字段，不破坏既有读取方）。
+
+Dashboard「运行详情」据此渲染「分对手胜率」小表：对手 / 局数 / 胜 / 胜率 / 均 reward。
+旧 run 没有 `summary.byOpponent` 时，Dashboard 会用 `history` 里的 `opponentMode` + `winner`
+现算；连 `opponentMode` 都没有的更老 run 返回空表并显示「暂无」。
 
 ## 3.5 手感配置（G-507）
 
