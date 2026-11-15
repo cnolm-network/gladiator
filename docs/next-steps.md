@@ -3,6 +3,56 @@
 > 写于 2026-11-09，2026-11-10 追加「身份 / 动作空间」两项结构性议题。按「先证明正确、再提升强度、最后扩边界」排序；
 > 每条都标了为什么现在做、验收怎么算过。可选做（P2）的部分不影响主线。
 
+## 2026-11-15 更新 · 训练重启后的下一阶段主线
+
+**当前状态（本轮实测）**
+- 训练链路已重启并跑通：`spawn.mode: runtime`、Dashboard 8080 托管 Paper 25566 + 2 个运行时 8770/8771，
+  运行 `20261115-2025-train-Bot_T1`：`scripted×6 → rusher×6 → aimbot×4`（16 局）、`maxSteps=200`、
+  Battle reward 预设、持久化到 `default`、autoSpawn + autoCleanup。
+- 双后端可用：`runtime`（mineflayer 真登录，训练用）与 `golem`（进程内身体，`/gladiator spawn` 直接可用）。
+- 验收全绿：A1–A9（A3 走观测式 deny、A7 走调用方清单）；Java 65 / golem 73 / node 68 测试通过。
+
+**本轮暴露的问题（P0 优先，直接决定训练是否可信）**
+1. `ITEM_MISSING`：`[kit] 套装就绪` 之后仍出现「快捷栏里没有 sword / rod」。疑似 `equipArmor`/`use item` 改选中槽、
+   死亡清背包、或 `give` 落到背包而非快捷栏；需要把「每步前置条件」收进环境（出手前确认手持剑）。
+2. 评估口径：`POST /api/training/start` 返回的 `evalEpisodes` 被算成 16（等于总回合数），需确认是「评估回合数」还是「评估总对局数」，
+   并让 UI/报告只出现一个含义。
+3. `OUT_OF_REACH`（距离 14.42 > 3.99）出现在脚本对手身上：说明「超出射程仍发 attack」的路径没被动作层拦住，
+   策略会把这类空动作当噪声学进去。
+
+---
+
+### P0 · 让训练「可信」（1–2 天）
+
+| # | 事项 | 验收 |
+|---|---|---|
+| P0-1 | 训练前置条件硬化：每步 `attack` 前确认手持剑（缺则自动 `slot` 切剑并回 `ACTION_RESULT` 说明）；`_ensure_loadout` 覆盖「回合中途死亡重生」 | 连续 50 局 `ITEM_MISSING` 计数 = 0；复盘里 `attack` 命中率不再是 0 |
+| P0-2 | 评估口径统一：一个 `evalRounds`（每阶段）概念，报告/Dashboard/CLI 同名字段 | 启动响应与报告里 `evalEpisodes == evalRounds × 阶段数`，且 UI 只显示「评估回合 × 阶段数」 |
+| P0-3 | 超射程动作拦截：`decode_action` 用 `reach` 判定，超出时改为 `approach`（而不是发一个必失败的 attack） | `OUT_OF_REACH` 计数在 10 局内降为 0 |
+
+### P1 · 让策略「变强」（1–2 周）
+
+| # | 事项 | 说明 / 验收 |
+|---|---|---|
+| P1-1 | 指标先行：固定对手池（`scripted/rusher/aimbot` 各 N 局）的**胜率**作为唯一主指标 | 每轮训练产出「分对手胜率表」，替代 mean reward 作决策依据 |
+| P1-2 | 算法升级：REINFORCE → PPO + GAE（rollout 覆盖 2–3 回合），8–32 并行 | 同预算下对 `rusher` 胜率 ≥ 50%（当前 `default` 约 0%） |
+| P1-3 | 课程与自博弈：阶段 0（静止假人）→ 3（多风格池）→ 4（历史快照） | 每阶段有进入/退出阈值（命中率 >70% / 击退命中 >40% / 胜率 >55%） |
+| P1-4 | 动作空间 v2：正交意图 + `items.json` 能力表 + action mask（见 `docs/identity-and-action-space.md` 第二部分） | 一票判据：加一条 `minecraft:potion` 能力项，不改 Python/JS 即可学会使用 |
+
+### P2 · 让系统「可交付」（1–2 周）
+
+| # | 事项 | 说明 |
+|---|---|---|
+| P2-1 | 训练-部署一致：给 `bot-runtime` 加 **attached 模式**（只开通道 B、不登录 MC），让训练环境能驱动 golem 身体 | 目前训练必须 runtime 登录，golem 只能手动 `/golem` 验证；打通后「训练用什么身体，部署就用什么身体」 |
+| P2-2 | 身份命名空间：`AI_` 前缀 + 占用预检 + `NAME_TAKEN`（`docs/identity-and-action-space.md` 路线 A） | 离线 Bot 不与真人重名；上线前必做 |
+| P2-3 | 模型分发：模型颜色/名称由 Gladiator 广播给 `caller-sample` 之类调用方，`.gmod` 热更新 | 换模型不用重启服 |
+| P2-4 | CI：GitHub Actions 跑 Java/golem/node/training/dashboard 五套测试 + `verifyStandalone` | 每次 push 自动跑，PR 必过 |
+
+### 本周不做（避免分心）
+- 不追 1.12+；不做正版账号池（C1）；不做 GUI 编辑器；不引入第三方 RL 框架（保持零依赖基线）。
+
+---
+
 ## 0. 当前基线（先读这个）
 
 | 维度 | 现状 |
