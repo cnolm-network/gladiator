@@ -21,6 +21,7 @@ import top.cnolm.gladiator.bridge.LinkServer;
 import top.cnolm.gladiator.core.BotHandle;
 import top.cnolm.gladiator.core.BotRegistry;
 import top.cnolm.gladiator.core.GladiatorServiceImpl;
+import top.cnolm.gladiator.core.PlayerRespawn;
 import top.cnolm.gladiator.core.PlayerTelemetry;
 import top.cnolm.gladiator.core.SpectatorService;
 
@@ -86,6 +87,9 @@ public final class GladiatorCommand implements CommandExecutor {
             case "stats":
                 handleStats(sender, label, args);
                 return true;
+            case "respawn":
+                handleRespawn(sender, label, args);
+                return true;
             case "spectate":
                 handleSpectate(sender, label, args);
                 return true;
@@ -95,9 +99,17 @@ public final class GladiatorCommand implements CommandExecutor {
             default:
                 sender.sendMessage("[Gladiator] 用法: /" + label
                         + " <status|spawn <username>|train <username>|list|game|analyze [session] [windowSec]"
-                        + "|pvp <x> <y> <z>|stats <player>|spectate [bot]|unspectate|reload>");
+                        + "|pvp <x> <y> <z>|stats <player>|respawn <player>|spectate [bot]|unspectate|reload>");
                 return true;
         }
+    }
+
+    /**
+     * `/gladiator respawn <player>` 的路由（块 B）：{@code target == null} → 失败文案，
+     * 否则按是否死亡返回「已请求 / 跳过」。抽成静态方法便于单测，不需要真实服务端。
+     */
+    static String respawnResponse(Player target) {
+        return PlayerRespawn.request(target);
     }
 
     /**
@@ -129,6 +141,21 @@ public final class GladiatorCommand implements CommandExecutor {
             return;
         }
         sender.sendMessage(statsResponse(findOnlinePlayer(args[1])));
+    }
+
+    /**
+     * 强制重生：把人机对战里停在死亡界面的玩家（或 Bot）拉回战场。
+     *
+     * <p>1.8 没有原版命令能代替客户端点「重生」，这里调 {@code Player#spigot().respawn()}。
+     * 未死亡时返回「跳过」而不是报错——编排层每局都会对双方各发一次，活着的那个必然走到这个分支。
+     * 输出同样保持纯净单行，方便 RCON 解析。
+     */
+    private void handleRespawn(CommandSender sender, String label, String[] args) {
+        if (args.length < 2) {
+            sender.sendMessage("[Gladiator] 用法: /" + label + " respawn <player>");
+            return;
+        }
+        sender.sendMessage(respawnResponse(findOnlinePlayer(args[1])));
     }
 
     private static boolean flag(String value) {

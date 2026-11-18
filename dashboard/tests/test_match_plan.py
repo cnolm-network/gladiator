@@ -31,13 +31,17 @@ from match_runner import (  # noqa: E402
     SHIELD_AMPLIFIER,
     SHIELD_EFFECT_ID,
     SHIELD_SECONDS,
+    SPAWN_TOLERANCE,
     MatchPlan,
     MatchRunner,
+    _at_spawn,
     argv_brain_spec,
     build_import_command,
     choose_runtime,
+    derive_default_spawns,
     judge_round,
     parse_stats_line,
+    rekit_commands,
     round_place_commands,
     round_setup_commands,
 )
@@ -59,41 +63,69 @@ class FakeClock:
 
 
 class FakeConn:
-    """脚本化的 RCON 连接。
+    """脚本化的 RCON 连接（带最小状态：血量/坐标/重生）。
 
     ``script`` 是逐次"决策采样"的血量序列：``[{"player": 20, "bot": 20}, ...]``，
-    取完后一直重复最后一项。``None`` 表示该方读不到 stats（离线）。
+    每对 stats 消费一项，取完后一直重复最后一项。``None`` 表示该方读不到 stats（离线）。
+
+    ``respawn_works=False``（默认）时 `gladiator respawn` 只返回「跳过」、不复活——
+    这样"死亡 → 5 秒内没回到站位 → 按死亡判负"的老行为可以被稳定复现；
+    置 True 则模拟插件真的重生成功，用来验证「继续本局」分支。
     """
 
-    def __init__(self, script: list[dict], player: str, bot: str) -> None:
+    def __init__(self, script: list[dict], player: str, bot: str,
+                 *, respawn_works: bool = False) -> None:
         self.script = list(script) or [{"player": 20.0, "bot": 20.0}]
         self.player = player.lower()
         self.bot = bot.lower()
         self.bot_name = bot
+        self.player_name = player
         self.commands: list[str] = []
         self.index = 0
         self.current = self.script[0]
-        self.pending_player = False
         self.closed = False
+        self.respawn_works = respawn_works
+        self.health = {"player": 20.0, "bot": 20.0}
+        self.pos = {"player": [0.0, 4.0, 0.0], "bot": [0.0, 4.0, 0.0]}
+
+    def _key(self, name: str) -> str:
+        return "player" if str(name).lower() == self.player else "bot"
 
     def command(self, text: str) -> str:
         self.commands.append(text)
         if text.startswith("gladiator stats "):
-            name = text.split()[-1].lower()
-            if name == self.player:
+            name = text.split()[-1]
+            key = self._key(name)
+            if key == "player":
                 self.current = self.script[min(self.index, len(self.script) - 1)]
-                self.pending_player = True
-                health = self.current.get("player")
-            else:
-                health = self.current.get("bot")
-                if self.pending_player:
-                    self.index += 1
-                    self.pending_player = False
+                self.index += 1
+                for side in ("player", "bot"):
+                    value = self.current.get(side)
+                    self.health[side] = None if value is None else float(value)
+            health = self.health[key]
             if health is None:
                 return "stats 失败：玩家不在线"
+            x, y, z = self.pos[key]
             return (f"name={name} health={float(health):.1f} food=20 saturation=5.0 armor=0.0"
-                    " x=0.0 y=4.0 z=0.0 yaw=0.0 pitch=0.0 sprinting=false blocking=false"
-                    " onGround=true hurt=0.0")
+                    f" x={x:.2f} y={y:.2f} z={z:.2f} yaw=0.0 pitch=0.0"
+                    " sprinting=false blocking=false onGround=true hurt=0.0")
+        if text.startswith("gladiator respawn "):
+            name = text.split()[-1]
+            key = self._key(name)
+            health = self.health.get(key)
+            if self.respawn_works and health is not None and health <= 0:
+                self.health[key] = 20.0
+                return f"respawn 已请求：{name}"
+            return f"respawn 跳过：{name} 未死亡"
+        if text.startswith("tp "):
+            parts = text.split()
+            if len(parts) >= 5:
+                key = self._key(parts[1])
+                self.pos[key] = [float(parts[2]), float(parts[3]), float(parts[4])]
+                return f"Teleported {parts[1]}"
+            return ""
+        if text.startswith("spawnpoint "):
+            return "Set spawn point"
         if text == "gladiator list":
             return f"  - glad-{self.bot} name={self.bot_name} uuid=x ready=true state=Alive"
         if text == "gladiator status":
@@ -192,9 +224,21 @@ class MatchPlanTests(unittest.TestCase):
         self.assertTrue(plan.record)
         self.assertFalse(plan.train_after)
         self.assertIsNone(plan.brain)
+        self.assertEqual(plan.respawn_delay_ms, 800)
         data = plan.to_dict()
         self.assertEqual(data["player"], "Steve")
         self.assertEqual(data["rounds"], 3)
+        self.assertEqual(data["respawnDelayMs"], 800)
+
+    def test_respawn_delay_is_configurable_and_bounded(self) -> None:
+        plan = MatchPlan.from_payload({"player": "Steve", "respawnDelayMs": 0}, self.cfg)
+        self.assertEqual(plan.respawn_delay_ms, 0)
+        plan = MatchPlan.from_payload({"player": "Steve", "respawnDelayMs": 1500}, self.cfg)
+        self.assertEqual(plan.respawn_delay_ms, 1500)
+        with self.assertRaises(BadRequest):
+            MatchPlan.from_payload({"player": "Steve", "respawnDelayMs": 6000}, self.cfg)
+        with self.assertRaises(BadRequest):
+            MatchPlan.from_payload({"player": "Steve", "respawnDelayMs": -1}, self.cfg)
 
     def test_player_is_required(self) -> None:
         with self.assertRaises(BadRequest):
@@ -368,6 +412,55 @@ class JudgeRoundTests(unittest.TestCase):
         self.assertEqual(verdict["reason"], "player-respawn")
 
 
+class SpawnTests(unittest.TestCase):
+    """bug1-2：未填 spawns 时的默认出生点推导与摆位命令。"""
+
+    def test_derive_uses_midpoint_and_player_y(self) -> None:
+        spawns = derive_default_spawns(
+            "Steve", {"x": 10.0, "y": 5.0, "z": 20.0, "health": 20.0},
+            "Glad_Bot_1", {"x": 30.0, "y": 9.0, "z": 40.0, "health": 20.0},
+        )
+        self.assertEqual(spawns, {"Steve": (16.0, 5.0, 30.0),
+                                  "Glad_Bot_1": (24.0, 5.0, 30.0)})
+
+    def test_derive_returns_none_when_stats_missing(self) -> None:
+        self.assertIsNone(derive_default_spawns("Steve", None, "Bot", {"x": 1, "z": 2}))
+        self.assertIsNone(derive_default_spawns("Steve", {"y": 4}, "Bot", {"x": 1, "z": 2}))
+        self.assertIsNone(derive_default_spawns("Steve", {"x": "x", "z": 0}, "Bot",
+                                                {"x": 1, "z": 2}))
+
+    def test_place_commands_set_spawnpoint_for_both(self) -> None:
+        spawns = {"Steve": (0.0, 4.0, 0.0), "Glad_Bot_1": (6.0, 4.0, 0.0)}
+        commands = round_place_commands("Steve", "Glad_Bot_1", spawns)
+        self.assertIn("spawnpoint Steve 0.00 4.00 0.00", commands)
+        self.assertIn("spawnpoint Glad_Bot_1 6.00 4.00 0.00", commands)
+        # 传送必须在设置重生点之前，否则重生点会落在旧位置。
+        self.assertLess(commands.index("tp Steve 0.00 4.00 0.00"),
+                        commands.index("spawnpoint Steve 0.00 4.00 0.00"))
+        # 倒计时免伤必须解除，否则整局无敌。
+        self.assertIn("effect Steve clear", commands)
+        self.assertIn("effect Glad_Bot_1 clear", commands)
+
+    def test_place_commands_skip_when_no_spawns(self) -> None:
+        self.assertEqual(round_place_commands("Steve", "Glad_Bot_1", None),
+                         ["effect Steve clear", "effect Glad_Bot_1 clear"])
+
+    def test_rekit_has_kit_and_heal_but_no_shield(self) -> None:
+        commands = rekit_commands(["Steve", "Glad_Bot_1"], "diamond")
+        self.assertIn("give Steve diamond_sword", commands)
+        self.assertIn("give Glad_Bot_1 diamond_chestplate", commands)
+        self.assertIn("effect Steve 6 1 20 true", commands)
+        # 重生后不能给抗性 V：会给 5 秒无敌，破坏对局。
+        self.assertFalse(any(f" {SHIELD_EFFECT_ID} " in item for item in commands))
+
+    def test_spawn_tolerance_helper(self) -> None:
+        self.assertTrue(_at_spawn({"health": 20, "x": 0.4, "z": -1.9}, (0, 4, 0)))
+        self.assertFalse(_at_spawn({"health": 20, "x": SPAWN_TOLERANCE + 0.1, "z": 0}, (0, 4, 0)))
+        self.assertFalse(_at_spawn({"health": 0, "x": 0, "z": 0}, (0, 4, 0)))
+        self.assertFalse(_at_spawn(None, (0, 4, 0)))
+        self.assertFalse(_at_spawn({"health": 20, "x": 0, "z": 0}, None))
+
+
 class ImportCommandTests(unittest.TestCase):
     def test_command_with_bc(self) -> None:
         command = build_import_command(
@@ -404,9 +497,10 @@ class MatchFlowTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _runner(self, script: list[dict], runtimes: FakeRuntimes | None = None,
-                models: FakeModels | None = None) -> tuple[MatchRunner, FakeConn, FakeClock]:
+                models: FakeModels | None = None, *,
+                respawn_works: bool = False) -> tuple[MatchRunner, FakeConn, FakeClock]:
         clock = FakeClock()
-        conn = FakeConn(script, "Steve", "Glad_Bot_1")
+        conn = FakeConn(script, "Steve", "Glad_Bot_1", respawn_works=respawn_works)
         runner = MatchRunner(
             self.cfg, server=mock.Mock(), runtimes=runtimes or FakeRuntimes(), models=models,
             rcon_factory=lambda: conn, clock=clock.now, sleeper=clock.sleep,
@@ -414,40 +508,180 @@ class MatchFlowTests(unittest.TestCase):
         return runner, conn, clock
 
     def _start_and_wait(self, runner: MatchRunner, payload: dict) -> dict:
+        # 补丁必须覆盖整个对局线程：线程里会调 is_port_open/_wait_listening，
+        # 提前退出 with 会让它去打真实端口、白等 15~20 秒。
         with mock.patch("match_runner.is_port_open", return_value=True), \
                 mock.patch("match_runner.is_port_free", return_value=True):
             runner.start(payload)
-        thread = runner._thread
-        self.assertIsNotNone(thread)
-        thread.join(timeout=20)
-        self.assertFalse(thread.is_alive(), "对局线程未在 20s 内结束")
+            thread = runner._thread
+            self.assertIsNotNone(thread)
+            thread.join(timeout=20)
+            self.assertFalse(thread.is_alive(), "对局线程未在 20s 内结束")
         return runner.current()
 
     def test_rounds_progress_and_score(self) -> None:
-        # 第 1 局：Bot 把玩家打死（玩家血量掉到 0）；第 2 局：双方僵持到超时，Bot 血更少。
-        script = [
-            {"player": 20.0, "bot": 20.0},
-            {"player": 12.0, "bot": 18.0},
-            {"player": 0.0, "bot": 18.0},
-            {"player": 20.0, "bot": 20.0},
-            {"player": 20.0, "bot": 12.0},
-        ]
-        runner, conn, _ = self._runner(script)
+        # 双方都不死：两局都打满时间、血量相同 → 两个平局，验证局数推进与计分。
+        runner, _, _ = self._runner([{"player": 20.0, "bot": 20.0}])
         snapshot = self._start_and_wait(runner, {
             "mode": "spawn", "player": "Steve", "bot": "Glad_Bot_1", "envPort": 8775,
             "rounds": 2, "roundSeconds": 10, "record": False,
         })
         self.assertEqual(snapshot["phase"], "finished")
         self.assertEqual(len(snapshot["roundsDetail"]), 2)
-        first, second = snapshot["roundsDetail"]
-        self.assertEqual(first["winner"], "bot")
-        self.assertEqual(first["reason"], "kill")
-        self.assertEqual(second["winner"], "player")
-        self.assertEqual(second["reason"], "timeout")
-        self.assertEqual(snapshot["score"], {"player": 1, "bot": 1, "draws": 0})
+        self.assertEqual([item["reason"] for item in snapshot["roundsDetail"]],
+                         ["timeout", "timeout"])
+        self.assertEqual(snapshot["score"], {"player": 0, "bot": 0, "draws": 2})
         self.assertEqual(snapshot["round"], 2)
         # spawn 模式：自己拉起的运行时在对局结束后必须停掉。
         self.assertEqual(runner.runtimes.stopped, ["runtime-8775"])
+
+    def test_default_spawns_derived_and_logged(self) -> None:
+        runner, conn, _ = self._runner([{"player": 20.0, "bot": 20.0}])
+        snapshot = self._start_and_wait(runner, {
+            "mode": "spawn", "player": "Steve", "rounds": 1, "roundSeconds": 10,
+            "record": False,
+        })
+        # 双方初始都在 (0, 4, 0)：中点 (0, 0) → 玩家 -4、Bot +4。
+        self.assertEqual(snapshot["defaultSpawns"],
+                         {"Steve": [-4.0, 4.0, 0.0], "Glad_Bot_1": [4.0, 4.0, 0.0]})
+        self.assertEqual(snapshot["spawns"],
+                         {"Steve": [-4.0, 4.0, 0.0], "Glad_Bot_1": [4.0, 4.0, 0.0]})
+        log_text = " ".join(entry["text"] for entry in snapshot["log"])
+        self.assertIn("未指定出生点，使用自动出生点", log_text)
+        self.assertIn("tp Steve -4.00 4.00 0.00", conn.commands)
+        self.assertIn("tp Glad_Bot_1 4.00 4.00 0.00", conn.commands)
+
+    def test_explicit_spawns_are_not_overridden(self) -> None:
+        runner, _, _ = self._runner([{"player": 20.0, "bot": 20.0}])
+        snapshot = self._start_and_wait(runner, {
+            "mode": "spawn", "player": "Steve", "rounds": 1, "roundSeconds": 10,
+            "record": False,
+            "spawns": {"player": [10, 5, 10], "bot": [30, 5, 10]},
+        })
+        self.assertIsNone(snapshot["defaultSpawns"])
+        self.assertEqual(snapshot["spawns"],
+                         {"Steve": [10.0, 5.0, 10.0], "Glad_Bot_1": [30.0, 5.0, 10.0]})
+
+    def test_spawnpoint_is_sent_every_round(self) -> None:
+        runner, conn, _ = self._runner([{"player": 20.0, "bot": 20.0}])
+        self._start_and_wait(runner, {
+            "mode": "spawn", "player": "Steve", "rounds": 2, "roundSeconds": 10,
+            "record": False,
+            "spawns": {"player": [0, 4, 0], "bot": [6, 4, 0]},
+        })
+        player_points = [item for item in conn.commands if item.startswith("spawnpoint Steve ")]
+        bot_points = [item for item in conn.commands if item.startswith("spawnpoint Glad_Bot_1 ")]
+        self.assertEqual(len(player_points), 2, conn.commands)
+        self.assertEqual(len(bot_points), 2, conn.commands)
+        self.assertEqual(player_points[0], "spawnpoint Steve 0.00 4.00 0.00")
+        self.assertEqual(bot_points[0], "spawnpoint Glad_Bot_1 6.00 4.00 0.00")
+
+    def test_death_without_respawn_loses_round_after_timeout(self) -> None:
+        # 玩家死掉且 respawn 不起作用（客户端没点重生）：5 秒内回不到站位 → 按死亡判负。
+        script = [
+            {"player": 20.0, "bot": 20.0},
+            {"player": 0.0, "bot": 20.0},
+        ]
+        runner, conn, _ = self._runner(script)
+        snapshot = self._start_and_wait(runner, {
+            "mode": "spawn", "player": "Steve", "rounds": 1, "roundSeconds": 10,
+            "record": False,
+            "spawns": {"player": [0, 4, 0], "bot": [6, 4, 0]},
+        })
+        entry = snapshot["roundsDetail"][0]
+        self.assertEqual(entry["winner"], "bot")
+        self.assertEqual(entry["reason"], "kill")
+        self.assertIn("5 秒内未回到站位", " ".join(item["text"] for item in snapshot["log"]))
+        # respawn 必须对双方都发，Bot 未死亡时得到「跳过」。
+        respawns = [item for item in conn.commands if item.startswith("gladiator respawn ")]
+        self.assertEqual(respawns[:2], ["gladiator respawn Steve", "gladiator respawn Glad_Bot_1"])
+        # 顺序：先 respawn，再补装，再 tp 回出生点（都从 respawn 之后开始找）。
+        first_respawn = conn.commands.index("gladiator respawn Steve")
+        first_give = conn.commands.index("give Steve diamond_sword", first_respawn)
+        first_tp = conn.commands.index("tp Steve 0.00 4.00 0.00", first_respawn)
+        self.assertLess(first_respawn, first_give)
+        self.assertLess(first_give, first_tp)
+        log_text = " ".join(item["text"] for item in snapshot["log"])
+        self.assertIn("respawn Glad_Bot_1: respawn 跳过：Glad_Bot_1 未死亡", log_text)
+        self.assertIn("已强制重生 + 重新摆位", log_text)
+
+    def test_death_recovers_and_round_continues(self) -> None:
+        # 插件真的把玩家拉起来了：补装 + 传送 → 本局继续到时间上限。
+        script = [
+            {"player": 20.0, "bot": 20.0},
+            {"player": 0.0, "bot": 18.0},
+            {"player": 20.0, "bot": 18.0},
+        ]
+        runner, conn, clock = self._runner(script, respawn_works=True)
+        snapshot = self._start_and_wait(runner, {
+            "mode": "spawn", "player": "Steve", "rounds": 1, "roundSeconds": 10,
+            "record": False, "respawnDelayMs": 400,
+            "spawns": {"player": [0, 4, 0], "bot": [6, 4, 0]},
+        })
+        entry = snapshot["roundsDetail"][0]
+        self.assertEqual(entry["reason"], "timeout")
+        self.assertEqual(entry["winner"], "player")  # 20 > 18
+        log_text = " ".join(item["text"] for item in snapshot["log"])
+        self.assertIn("双方已回到站位，本局继续", log_text)
+        self.assertIn("respawn Steve: respawn 已请求：Steve", log_text)
+        self.assertIn("gladiator respawn Glad_Bot_1", conn.commands)
+        # 重生后必须有补装与 tp（顺序 respawn < give < tp，都从 respawn 之后算）。
+        first_respawn = conn.commands.index("gladiator respawn Steve")
+        self.assertLess(first_respawn,
+                        conn.commands.index("give Steve diamond_sword", first_respawn))
+        self.assertLess(conn.commands.index("give Steve diamond_sword", first_respawn),
+                        conn.commands.index("tp Steve 0.00 4.00 0.00", first_respawn))
+        self.assertGreater(clock.now(), 0.4)
+
+    def test_sides_recovered_ignores_living_side_position(self) -> None:
+        # 存活方在追击，不可能站在出生点：只要求它活着；死者必须真的回到出生点。
+        plan = MatchPlan.from_payload({
+            "player": "Steve", "bot": "Glad_Bot_1",
+            "spawns": {"player": [0, 4, 0], "bot": [6, 4, 0]},
+        }, self.cfg)
+        spawns = plan.spawns
+        far_bot = {"health": 20, "x": 40, "z": 40}
+        home_player = {"health": 20, "x": 0.3, "z": 0.2}
+        self.assertTrue(MatchRunner._sides_recovered(
+            plan, ["Steve"], spawns, home_player, far_bot))
+        # 死者没回到出生点（被拉回世界出生点）→ 失败。
+        self.assertFalse(MatchRunner._sides_recovered(
+            plan, ["Steve"], spawns, {"health": 20, "x": -2000, "z": 80}, far_bot))
+        # 存活方血量归零（三次击杀死在同一帧）→ 失败。
+        self.assertFalse(MatchRunner._sides_recovered(
+            plan, ["Steve"], spawns, home_player, {"health": 0, "x": 6, "z": 0}))
+
+    def test_recovery_retries_tp_until_player_lands(self) -> None:
+        # 客户端重生后的本地位置预测会覆盖第一次 tp：窗口内必须重发，直到真的站回去。
+        class FlakyTpConn(FakeConn):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                self.player_tp_ignored = 2
+
+            def command(self, text: str) -> str:
+                if text.startswith("tp Steve ") and self.player_tp_ignored > 0:
+                    self.player_tp_ignored -= 1
+                    self.commands.append(text)
+                    self.pos["player"] = [-2000.0, 4.0, 80.0]  # 被拉回世界出生点
+                    return "Teleported Steve"
+                return super().command(text)
+
+        clock = FakeClock()
+        conn = FlakyTpConn([{"player": 20.0, "bot": 20.0}], "Steve", "Glad_Bot_1",
+                           respawn_works=True)
+        runner = MatchRunner(self.cfg, server=mock.Mock(), runtimes=FakeRuntimes(),
+                             rcon_factory=lambda: conn, clock=clock.now,
+                             sleeper=clock.sleep)
+        plan = MatchPlan.from_payload({
+            "player": "Steve", "bot": "Glad_Bot_1", "roundSeconds": 10,
+            "respawnDelayMs": 0,
+            "spawns": {"player": [0, 4, 0], "bot": [6, 4, 0]},
+        }, self.cfg)
+        match: dict = {"log": []}
+        self.assertTrue(runner._recover_after_death(match, plan, conn, ["Steve"]))
+        player_tps = [item for item in conn.commands if item.startswith("tp Steve ")]
+        self.assertGreaterEqual(len(player_tps), 3, conn.commands)
+        self.assertIn("双方已回到站位，本局继续", " ".join(e["text"] for e in match["log"]))
 
     def test_timeout_with_equal_health_is_draw(self) -> None:
         runner, _, _ = self._runner([{"player": 20.0, "bot": 20.0}])
@@ -497,6 +731,8 @@ class MatchFlowTests(unittest.TestCase):
         self.assertIn("--target-player", extra)
         self.assertIn("Steve", extra)
         self.assertIn("--rcon", extra)
+        # 20Hz：5Hz 时同一策略的出手频率只有训练时的 1/4（真机 2026-11-18 实测近身几乎不攻击）。
+        self.assertEqual(extra[extra.index("--brain-hz") + 1], "20")
 
     def test_attach_with_brain_on_external_runtime_is_rejected(self) -> None:
         model = self.root / "policy.npz"
@@ -578,7 +814,7 @@ class MatchFlowTests(unittest.TestCase):
         with mock.patch("match_runner.is_port_open", return_value=True), \
                 mock.patch("match_runner.is_port_free", return_value=True):
             runner.start({"mode": "spawn", "player": "Steve", "rounds": 5,
-                          "roundSeconds": 600, "record": False, "envPort": 8775})
+                          "roundSeconds": 1000, "record": False, "envPort": 8775})
             snapshot = runner.stop()
         self.assertEqual(snapshot["phase"], "stopped")
         self.assertFalse(snapshot["running"])
@@ -589,7 +825,7 @@ class MatchFlowTests(unittest.TestCase):
         with mock.patch("match_runner.is_port_open", return_value=True), \
                 mock.patch("match_runner.is_port_free", return_value=True):
             runner.start({"mode": "spawn", "player": "Steve", "rounds": 5,
-                          "roundSeconds": 600, "record": False})
+                          "roundSeconds": 1000, "record": False})
             with self.assertRaises(Conflict):
                 runner.start({"mode": "spawn", "player": "Steve", "rounds": 1})
             runner.stop()

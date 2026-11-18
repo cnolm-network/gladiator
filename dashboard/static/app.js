@@ -2102,7 +2102,7 @@ function renderMatchHint(match) {
   }
   const record = $("#match-record") && $("#match-record").checked;
   const train = $("#match-train-after") && $("#match-train-after").checked;
-  const parts = [`模型 ${brain} 会在运行时里以 5Hz 自主决策`];
+  const parts = [`模型 ${brain} 会在运行时里以 20Hz 自主决策`];
   parts.push(record ? "对局按 10Hz 录制到 training/artifacts/matches/" : "未开启录制");
   if (train) parts.push("结束后自动转数据集并做一轮 BC（写新 run，不覆盖模型）");
   if (match && match.running) parts.push(`当前阶段：${MATCH_PHASE_TEXT[match.phase] || match.phase}`);

@@ -346,13 +346,22 @@ export class ActionDispatcher {
     if (held && typeof held.name === 'string' && /_sword$/.test(held.name)) {
       return;
     }
-    try {
-      await selectItem(bot, 'sword');
-    } catch (error) {
-      if (error instanceof ItemError) {
-        throw new ActionError(error.code, error.message);
+    // 每次死亡/传送后 mineflayer 会重开背包窗口，期间 items() 会短暂为空：
+    // 立刻判定会误报 ITEM_MISSING（真机 23:48 每杀一次报一条）。给两个短重试窗口。
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await selectItem(bot, 'sword');
+        return;
+      } catch (error) {
+        if (error instanceof ItemError) {
+          if (error.code === 'ITEM_MISSING' && attempt < 2) {
+            await sleep(120);
+            continue;
+          }
+          throw new ActionError(error.code, error.message);
+        }
+        throw error;
       }
-      throw error;
     }
   }
 

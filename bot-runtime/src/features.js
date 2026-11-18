@@ -121,13 +121,29 @@ export function nearestPlayer(observation, username, allowed = null) {
  * 从实体里读对手血量（协议实体列表不带血量，但 mineflayer 有时能从 metadata 拿到）。
  *
  * <p>返回 `null` 表示读不到，调用方应回落到 RCON `/gladiator stats`（块 B 提供）。
+ *
+ * <p><b>玩家实体的 0 不是「死了」，而是「不知道」</b>：1.8 不通过实体元数据下发其他玩家的血量，
+ * mineflayer 对 player 实体的 `health` 默认是 0。早期实现把 0 当成真实血量，导致 brain 在对手
+ * 满血时记「击杀」、并把 `target_health=0` 喂给策略（真机 2026-11-18 23:32 复现：
+ * 开局就打印「对手血量归零」）。所以 player 只接受 > 0 的值，其余一律当未知。
  */
 export function entityHealth(entity) {
   if (!entity) {
     return null;
   }
-  const direct = Number(entity.health);
-  if (Number.isFinite(direct)) {
+  const isPlayer = entity.kind === 'player' || entity.type === 'player';
+  const accept = (value) => {
+    const health = Number(value);
+    if (!Number.isFinite(health)) {
+      return null;
+    }
+    if (isPlayer && health <= 0) {
+      return null;
+    }
+    return health;
+  };
+  const direct = accept(entity.health);
+  if (direct !== null) {
     return direct;
   }
   const meta = entity.metadata;
@@ -137,14 +153,18 @@ export function entityHealth(entity) {
       if (!entry || typeof entry !== 'object') {
         continue;
       }
-      if ((entry.key === 6 || entry.key === 'health') && Number.isFinite(Number(entry.value))) {
-        return Number(entry.value);
+      if (entry.key === 6 || entry.key === 'health') {
+        const health = accept(entry.value);
+        if (health !== null) {
+          return health;
+        }
       }
     }
   } else if (meta && typeof meta === 'object') {
     for (const key of ['6', 'health']) {
-      if (Number.isFinite(Number(meta[key]))) {
-        return Number(meta[key]);
+      const health = accept(meta[key]);
+      if (health !== null) {
+        return health;
       }
     }
   }

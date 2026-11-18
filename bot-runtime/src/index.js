@@ -15,6 +15,11 @@
  */
 import path from 'node:path';
 import { ActionDispatcher } from './actions.js';
+import {
+  DEFAULT_ATTACK_COOLDOWN_MS,
+  needsSwordSwap,
+  shouldThrottleAttack,
+} from './attack-guard.js';
 import { LinkClient } from './connection.js';
 import { decodeAction, encodeObservation, entityHealth, nearestPlayer } from './features.js';
 import { EnvLinkServer } from './link-server.js';
@@ -54,8 +59,19 @@ const controlHz = Number(arg('observation-hz', process.env.OBSERVATION_HZ ?? 10)
 // 给模型后运行时自己闭环决策，人机对战不需要训练环境在跑。
 const brainSpec = String(arg('brain', process.env.GLADIATOR_BRAIN ?? '') || '').trim();
 const modelsDir = path.resolve(String(arg('models-dir', path.resolve('../dashboard/var/models'))));
-const brainHz = Math.max(1, Math.min(20, Number(arg('brain-hz', 5)) || 5));
+// 20Hz 与训练/BC 的控制频率对齐（`controlHz=10` 的每步 0.05s 决策步长）；
+// 5Hz 时同一策略的出手频率只有训练时的 1/4，近身几乎打不出伤害（真机 2026-11-18 实测）。
+const brainHzRaw = Number(arg('brain-hz', 20));
+const brainHz = Math.max(1, Math.min(20, Number.isFinite(brainHzRaw) && brainHzRaw > 0 ? brainHzRaw : 20));
 const brainEpsilon = Math.max(0, Math.min(1, Number(arg('brain-epsilon', 0)) || 0));
+// 1.8 受击无敌 500ms：连续攻击时按该窗口节流，避免刷无效点击。
+const attackCooldownRaw = Number(arg('attack-cooldown-ms', DEFAULT_ATTACK_COOLDOWN_MS));
+const attackCooldownMs = Math.max(
+  0,
+  Math.min(5000, Number.isFinite(attackCooldownRaw) && attackCooldownRaw >= 0
+    ? attackCooldownRaw
+    : DEFAULT_ATTACK_COOLDOWN_MS),
+);
 const targetPlayerArg = String(arg('target-player', '') || '').trim();
 const rconSpec = parseRconSpec(
   arg('rcon', process.env.GLADIATOR_RCON ?? ''),
@@ -169,6 +185,9 @@ const brainState = {
   damage: 0,
   kills: 0,
   actionFailures: 0,
+  attackStreak: 0,
+  attacksThrottled: 0,
+  swordSwaps: 0,
   startedAt: Date.now(),
   seq: 0,
   tick: 0,
@@ -185,7 +204,14 @@ const brainState = {
 };
 
 const brainScheduler = new ActionScheduler({
-  maxPerSecond: Math.max(10, Math.ceil(cliProfile.cps + cliProfile.cpsJitter)),
+  // 大脑每 tick 最多发 3 条动作（look/move/attack），20Hz 就是 60 条/秒。
+  // 沿用训练用的 17/s 上限会把 look 丢掉（真机 2026-11-18 23:34 复现 ACTION_RATE_LIMITED），
+  // 所以只在启用大脑时放宽到「每秒动作预算」，通道 B 训练路径的上限不变。
+  maxPerSecond: Math.max(
+    10,
+    Math.ceil(cliProfile.cps + cliProfile.cpsJitter),
+    brainEnabled ? brainHz * 3 : 0,
+  ),
 });
 
 /** 用户名像 Bot 的一律不当对手（人机对战里要打的是真人）。 */
@@ -345,10 +371,33 @@ async function brainTick() {
     const index = brainEpsilon > 0 && Math.random() < brainEpsilon
       ? Math.floor(Math.random() * policy.numActions)
       : policy.greedy(features);
-    const actions = decodeAction(index, observation, selfName(), {
+    let actions = decodeAction(index, observation, selfName(), {
       allowed: [targetName],
       reach: activeProfile.reach,
     });
+    // 连续选 attack 说明已经贴身：按 1.8 的无敌帧（500ms）节流，别每 tick 刷空点击。
+    const choseAttack = actions.some((action) => action.type === 'attack');
+    brainState.attackStreak = choseAttack ? brainState.attackStreak + 1 : 0;
+    const throttled = choseAttack && shouldThrottleAttack({
+      streak: brainState.attackStreak,
+      lastAttackAt: brainState.lastAttackAt,
+      now: nowMs,
+      cooldownMs: attackCooldownMs,
+    });
+    if (throttled) {
+      actions = actions.filter((action) => action.type !== 'attack');
+      if (actions.length === 0) {
+        actions = [{ type: 'idle', params: { durationMs: 40 } }];
+      }
+      brainState.attacksThrottled += 1;
+      if (brainState.attacksThrottled === 1) {
+        console.log(`[brain] 敌人仍在无敌帧内，攻击节流到 ${attackCooldownMs}ms 一刀`);
+      }
+    } else if (choseAttack && needsSwordSwap(bot.heldItem)) {
+      // 手上不是剑就先切剑再打：直接 attack 只会空手挥（训练里模型看不到手持物）。
+      actions = [{ type: 'use', params: { item: 'sword', holdMs: 50 } }, ...actions];
+      brainState.swordSwaps += 1;
+    }
     brainState.decisions += 1;
     for (const action of actions) {
       brainState.seq += 1;
@@ -389,7 +438,8 @@ function startBrain() {
     brainState.timer.unref();
   }
   console.log(`[brain] 已启动 ${brainHz}Hz，目标=${targetPlayerArg || '自动（最近的非 Bot 玩家）'}`
-    + ` epsilon=${brainEpsilon} rcon=${rconSpec ? `${rconSpec.host}:${rconSpec.port}` : 'off'}`);
+    + ` epsilon=${brainEpsilon} attackCooldown=${attackCooldownMs}ms`
+    + ` rcon=${rconSpec ? `${rconSpec.host}:${rconSpec.port}` : 'off'}`);
   if (rconSpec) {
     const poller = setInterval(() => {
       pollOpponentHealth().catch(() => {});
@@ -433,6 +483,10 @@ function printMatchSummary(reason) {
     model: brainSpec,
     target: brainState.target || null,
     actionFailures: brainState.actionFailures,
+    attacksThrottled: brainState.attacksThrottled,
+    swordSwaps: brainState.swordSwaps,
+    brainHz,
+    attackCooldownMs,
   }));
 }
 
@@ -575,7 +629,9 @@ async function handleSpawn(spawn) {
             }
           })
           .catch((error) => console.warn(`[gladiator] 穿护甲失败：${error?.message ?? error}`));
-      }, 2000);
+        // 800ms 而不是 2s：RCON give 之后 mineflayer 的背包同步可能要等一个 tick，
+        // 2s 的间隔会让大脑在开局头两秒一直报 ITEM_MISSING（真机 23:48 实测）。
+      }, 800);
       if (equipTimer.unref) {
         equipTimer.unref();
       }

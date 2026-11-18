@@ -195,6 +195,17 @@ test('entityHealth 支持直连字段与 metadata（数组/对象）', () => {
   assert.equal(entityHealth(null), null);
 });
 
+test('玩家实体的 health=0 视为「未知」而不是「已死亡」', () => {
+  // 1.8 不下发其他玩家血量，mineflayer 给 player 实体的默认 health 是 0。
+  assert.equal(entityHealth({ kind: 'player', health: 0 }), null);
+  assert.equal(entityHealth({ kind: 'player', metadata: [{ key: 6, value: 0 }] }), null);
+  assert.equal(entityHealth({ kind: 'player', health: 0, metadata: { 6: 0 } }), null);
+  // 玩家血量正常时报真实值。
+  assert.equal(entityHealth({ kind: 'player', health: 12.5 }), 12.5);
+  // 非玩家实体（僵尸等）0 就是真的死了，保留原值。
+  assert.equal(entityHealth({ kind: 'zombie', health: 0 }), 0);
+});
+
 test('decodeAction：attack 在射程内先转向再挥击', () => {
   const observation = baseObservation();
   const actions = decodeAction(ACTION_NAMES.indexOf('attack'), observation, 'Glad_Bot_1', {

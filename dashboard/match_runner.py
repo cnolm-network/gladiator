@@ -143,6 +143,108 @@ def _looks_respawned(previous: Optional[dict], current: dict) -> bool:
     return before <= 12.0 and after >= 19.5
 
 
+#: 默认出生点相对中点的横向偏移：玩家 -4 格、Bot +4 格（面对面 8 格）。
+DEFAULT_SPAWN_OFFSET = 4.0
+
+#: 死亡后回到站位的判定半径（格）。1.8 的 tp 落点会有 ±0.5 的实体碰撞修正。
+SPAWN_TOLERANCE = 2.0
+
+#: 强制重生后最多等多久确认双方回到站位（秒）。
+RESPAWN_RECOVER_TIMEOUT = 5.0
+
+#: 恢复窗口内重发 ``tp`` 的间隔（秒）：客户端重生后的本地位置预测会覆盖一次 tp。
+RESPAWN_PLACE_REFRESH = 0.4
+
+#: 触发「强制重生 + 重新摆位」的判定原因（离线不属于此列：人不在线重生也没用）。
+DEATH_REASONS = ("kill", "player-respawn", "bot-respawn")
+
+#: 单局内最多强制重生几次：防止异常状态（一直掉血/一直读不到位置）把这一局拖死。
+MAX_RESPAWNS_PER_ROUND = 20
+
+
+def derive_default_spawns(player_name: str, player_stats: Optional[dict],
+                          bot_name: str, bot_stats: Optional[dict]) -> Optional[dict]:
+    """未指定 ``spawns`` 时按双方当前位置推导出生点。
+
+    规则（任务书 bug1-2）：中点 ``x/z`` 为场地中心、``y`` 取玩家当前 ``y``；
+    玩家落在中心 ``-4`` 格、Bot 落在 ``+4`` 格。任一方的 stats 读不到时返回 ``None``
+    （调用方记一条告警并放弃自动出生点，而不是拿 0,0,0 乱传）。
+
+    返回 ``{player_name: (x, y, z), bot_name: (x, y, z)}``，坐标保留 2 位小数，
+    与 RCON 命令里的格式一致。
+    """
+    if not player_stats or not bot_stats:
+        return None
+    try:
+        px = float(player_stats["x"])
+        pz = float(player_stats["z"])
+        py = float(player_stats.get("y", 4.0))
+        bx = float(bot_stats["x"])
+        bz = float(bot_stats["z"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    center_x = (px + bx) / 2.0
+    center_z = (pz + bz) / 2.0
+    return {
+        player_name: (round(center_x - DEFAULT_SPAWN_OFFSET, 2), round(py, 2), round(center_z, 2)),
+        bot_name: (round(center_x + DEFAULT_SPAWN_OFFSET, 2), round(py, 2), round(center_z, 2)),
+    }
+
+
+def rekit_commands(names: list, kit: str) -> list[str]:
+    """死亡后的补装命令（只补死掉的那一方，不打扰还活着的对手）。
+
+    1.8 死亡会清空背包并掉落物品；不补装的话，剩下半局只能用拳头，
+    而 brain 会因为「背包里没有剑」一直空挥（ITEM_MISSING）。
+    不含倒计时免伤（抗性 V）：重生后无敌 5 秒会破坏对局。
+    """
+    commands: list[str] = []
+    for name in names:
+        commands.append(f"clear {name}")
+    for name in names:
+        commands.append(f"gamemode 0 {name}")
+    for name in names:
+        for item in KITS.get(kit, ()):
+            commands.append(f"give {name} {item}")
+    for name in names:
+        commands.append(f"effect {name} clear")
+    for name in names:
+        for effect in HEAL_EFFECTS:
+            commands.append(f"effect {name} {effect} 1 20 true")
+    return commands
+
+
+def _dead_sides(plan: MatchPlan, player: Optional[dict], bot: Optional[dict],
+                reason: Optional[str]) -> list:
+    """这一刀到底谁死了（用于只给死者补装）。
+
+    血量能判断时以血量为准；「重生启发式」命中时血量已经回到满值，只能看判定原因。
+    """
+    dead: list = []
+    player_health = 20.0 if player is None else float(player.get("health", 20.0))
+    bot_health = 20.0 if bot is None else float(bot.get("health", 20.0))
+    if reason == "player-respawn" or player_health <= 0:
+        dead.append(plan.player)
+    if reason == "bot-respawn" or bot_health <= 0:
+        dead.append(plan.bot)
+    return dead or [plan.player, plan.bot]
+
+
+def _at_spawn(stats: Optional[dict], point: Optional[tuple],
+              tolerance: float = SPAWN_TOLERANCE) -> bool:
+    """该玩家是否「活着且已经回到出生点」（只看水平距离，y 由服务器落地决定）。"""
+    if not stats or not point:
+        return False
+    if float(stats.get("health", 0.0)) <= 0:
+        return False
+    try:
+        dx = float(stats.get("x", 0.0)) - float(point[0])
+        dz = float(stats.get("z", 0.0)) - float(point[2])
+    except (TypeError, ValueError):
+        return False
+    return abs(dx) <= tolerance and abs(dz) <= tolerance
+
+
 def round_place_commands(player: str, bot: str,
                          spawns: Optional[dict]) -> list[str]:
     """开局摆位命令：双方传送到起点、重生点设到起点、解除倒计时保护。
@@ -284,6 +386,8 @@ class MatchPlan:
     record: bool = True
     train_after: bool = False
     brain_path: Optional[str] = None
+    #: 强制重生后等多久再传送（毫秒）：等待客户端完成重生、实体重新进入世界。
+    respawn_delay_ms: int = 800
 
     @classmethod
     def from_payload(cls, payload: dict, cfg: DashboardConfig) -> "MatchPlan":
@@ -309,9 +413,12 @@ class MatchPlan:
         brain = str(brain).strip() if brain not in (None, "") else None
         record = parse_bool(payload.get("record", True), "record")
         train_after = parse_bool(payload.get("trainAfter", False), "trainAfter")
+        respawn_delay_ms = parse_int(payload.get("respawnDelayMs", 800), "重生等待（毫秒）",
+                                     minimum=0, maximum=5000)
         return cls(mode=mode, bot=bot, env_port=env_port, player=player,
                    rounds=rounds, round_seconds=float(round_seconds), kit=kit,
-                   spawns=spawns, brain=brain, record=record, train_after=train_after)
+                   spawns=spawns, brain=brain, record=record, train_after=train_after,
+                   respawn_delay_ms=respawn_delay_ms)
 
     def to_dict(self) -> dict:
         return {
@@ -326,6 +433,7 @@ class MatchPlan:
             "brain": self.brain,
             "record": self.record,
             "trainAfter": self.train_after,
+            "respawnDelayMs": self.respawn_delay_ms,
         }
 
 
@@ -395,6 +503,7 @@ class MatchRunner:
                     "score": {"player": 0, "bot": 0, "draws": 0},
                     "roundsDetail": [],
                     "brain": None,
+                    "defaultSpawns": None,
                     "error": None,
                     "log": [],
                     "startedAt": None,
@@ -514,6 +623,8 @@ class MatchRunner:
                 "countdown": None,
                 "recordDir": None,
                 "runtime": None,
+                # plan.spawns 为 null 时，开局会用双方的 stats 推导一组默认出生点写在这里。
+                "defaultSpawns": None,
                 "error": None,
                 "strategyLabel": plan.brain or "脚本策略",
             },
@@ -600,6 +711,7 @@ class MatchRunner:
             conn = self._connect()
             self._ensure_runtime(match, plan)
             self._ensure_spawned(match, plan, conn)
+            self._ensure_spawns(match, plan, conn)
             self._begin_recording(match, plan)
             for index in range(1, plan.rounds + 1):
                 if self._cancelled(match):
@@ -695,7 +807,8 @@ class MatchRunner:
         return [
             "--brain", plan.brain_path,
             "--models-dir", str((self.cfg.var_dir / "models").resolve()),
-            "--brain-hz", "5",
+            # 20Hz 与 BC/训练的控制步长对齐；5Hz 时出手频率只有 1/4（真机 2026-11-18 实测）。
+            "--brain-hz", "20",
             "--rcon", f"{self.cfg.rcon_host}:{self.cfg.rcon_port}:{self.cfg.rcon_password}",
             "--target-player", plan.player,
         ]
@@ -736,6 +849,40 @@ class MatchRunner:
             self._sleep(1.0)
         raise RuntimeError(f"等待 {plan.bot} 就绪超时（40s）；可查看运行时日志")
 
+    def _ensure_spawns(self, match: dict, plan: MatchPlan, conn) -> None:
+        """``plan.spawns`` 为空时，用开局第一次 stats 推导默认出生点。
+
+        为什么要推导：真机自测（2026-11-18 22:53/22:56/22:58 三场）都没填 spawns，
+        结果整局没有摆位、也没有重生点，玩家死后回到世界出生点，Bot 连人都找不到。
+        """
+        if plan.spawns:
+            with self._lock:
+                match["snapshot"]["spawns"] = {name: list(point)
+                                               for name, point in plan.spawns.items()}
+            return
+        player_stats = bot_stats = None
+        for _ in range(4):
+            if self._cancelled(match):
+                raise _Cancelled()
+            player_stats = self._stats(conn, plan.player)
+            bot_stats = self._stats(conn, plan.bot)
+            if player_stats and bot_stats:
+                break
+            self._sleep(0.5)
+        spawns = derive_default_spawns(plan.player, player_stats, plan.bot, bot_stats)
+        if spawns is None:
+            self._log(match, "无法读取双方坐标，跳过自动出生点（死后可能回到世界出生点）", ok=False)
+            return
+        plan.spawns = spawns
+        with self._lock:
+            match["snapshot"]["spawns"] = {name: list(point) for name, point in spawns.items()}
+            match["snapshot"]["defaultSpawns"] = {name: list(point)
+                                                  for name, point in spawns.items()}
+        px, py, pz = spawns[plan.player]
+        bx, _, bz = spawns[plan.bot]
+        self._log(match, "未指定出生点，使用自动出生点："
+                         f"玩家({px:.1f}, {py:.1f}, {pz:.1f}) / Bot({bx:.1f}, {py:.1f}, {bz:.1f})")
+
     # --- 每局 -----------------------------------------------------------
     def _prepare_round(self, match: dict, plan: MatchPlan, conn) -> None:
         for command in round_setup_commands(plan.player, plan.bot, plan.kit, plan.spawns,
@@ -775,6 +922,78 @@ class MatchRunner:
         # 传送是异步生效的：等客户端位置回包，再取基线血量。
         self._sleep(0.4)
 
+    def _recover_after_death(self, match: dict, plan: MatchPlan, conn,
+                             dead: Optional[list] = None) -> bool:
+        """死亡后：强制重生 → 补装 → 传送回出生点 → 确认站位。
+
+        1.8 的死亡界面必须客户端点「重生」，服务端用 `Player#spigot().respawn()` 代理这一步
+        （插件命令 `gladiator respawn <player>`）。对双方都发一次：活着的那一方返回「跳过」，
+        这是预期行为，不是错误。
+
+        ``dead`` 是确实死掉的一方（用于补装）：只补死者，不动还活着的对手。
+        返回 ``True`` 表示双方 5 秒内回到站位、本局可以继续；``False`` 表示按死亡判负。
+        """
+        spawns = plan.spawns or {}
+        targets = list(dead or [plan.player, plan.bot])
+        self._log(match, f"检测到死亡（{', '.join(targets)}）：已强制重生 + 重新摆位")
+        for name in (plan.player, plan.bot):
+            output = strip_formatting(self._command(conn, f"gladiator respawn {name}")).strip()
+            self._log(match, f"respawn {name}: {output or '(无输出)'}",
+                      ok=not output.startswith("respawn 失败"))
+        # 1.8 重生后客户端要重新加载世界，立刻 tp 会被拉回原位置。
+        self._sleep(max(0.0, plan.respawn_delay_ms / 1000.0))
+        # 死亡清空背包：补装，否则剩下半局只能空手，brain 会一直 ITEM_MISSING。
+        for command in rekit_commands(targets, plan.kit):
+            if self._cancelled(match):
+                raise _Cancelled()
+            self._command(conn, command)
+        for name in (plan.player, plan.bot):
+            point = spawns.get(name)
+            if not point:
+                continue
+            self._command(conn, f"tp {name} {point[0]:.2f} {point[1]:.2f} {point[2]:.2f}")
+            self._command(conn,
+                          f"spawnpoint {name} {point[0]:.2f} {point[1]:.2f} {point[2]:.2f}")
+        # 重生后的客户端会先做一次「回到世界出生点」的本地预测，再被服务端拉回：
+        # 只发一次 tp 很容易被这次本地预测覆盖，因此窗口内按 REFRESH 周期重发，
+        # 直到死者真的站在出生点。存活的一方不要求站定——它会自己追击，站定反而
+        # 会把正常对局判成恢复失败（真机 23:44 就是这样：bot 追出去 → 判负）。
+        deadline = self._clock() + RESPAWN_RECOVER_TIMEOUT
+        next_refresh = self._clock() + RESPAWN_PLACE_REFRESH
+        while self._clock() < deadline:
+            if self._cancelled(match):
+                raise _Cancelled()
+            player = self._stats(conn, plan.player)
+            bot = self._stats(conn, plan.bot)
+            if (self._sides_recovered(plan, targets, spawns, player, bot)):
+                self._log(match, "双方已回到站位，本局继续")
+                return True
+            if self._clock() >= next_refresh:
+                next_refresh = self._clock() + RESPAWN_PLACE_REFRESH
+                for name in targets:
+                    point = spawns.get(name)
+                    if not point:
+                        continue
+                    self._command(
+                        conn, f"tp {name} {point[0]:.2f} {point[1]:.2f} {point[2]:.2f}")
+                    self._command(
+                        conn, f"spawnpoint {name} {point[0]:.2f} {point[1]:.2f} {point[2]:.2f}")
+            self._sleep(0.2)
+        self._log(match, f"{RESPAWN_RECOVER_TIMEOUT:.0f} 秒内未回到站位，按死亡判负", ok=False)
+        return False
+
+    @staticmethod
+    def _sides_recovered(plan: MatchPlan, dead: list, spawns: dict,
+                         player: Optional[dict], bot: Optional[dict]) -> bool:
+        """死者必须「活着且站在出生点」；存活方只要求活着（它正在打，不该站定）。"""
+        for name, stats in ((plan.player, player), (plan.bot, bot)):
+            if name in dead:
+                if not _at_spawn(stats, spawns.get(name)):
+                    return False
+            elif not stats or float(stats.get("health", 0.0)) <= 0:
+                return False
+        return True
+
     def _fight_round(self, match: dict, plan: MatchPlan, index: int, conn) -> dict:
         self._place_sides(match, plan, conn)
         start_stats = {
@@ -785,6 +1004,8 @@ class MatchRunner:
         previous = {"player": start_stats["player"], "bot": start_stats["bot"]}
         # 防止时钟被冻结（例如测试注入的假时钟不前进）导致死循环。
         max_iterations = int(plan.round_seconds / self._period(plan)) + 100
+        # 死亡不再直接结束这一局：强制重生 + 摆位后继续，直到时间上限或恢复失败。
+        recoveries = 0
         verdict = None
         for _ in range(max_iterations):
             if self._cancelled(match):
@@ -798,6 +1019,17 @@ class MatchRunner:
                                   previous["player"], previous["bot"])
             previous = {"player": player, "bot": bot}
             if verdict is not None:
+                if (verdict.get("reason") in DEATH_REASONS
+                        and plan.spawns
+                        and recoveries < MAX_RESPAWNS_PER_ROUND):
+                    recoveries += 1
+                    dead = _dead_sides(plan, player, bot, verdict.get("reason"))
+                    if self._recover_after_death(match, plan, conn, dead):
+                        previous = {
+                            "player": self._stats(conn, plan.player),
+                            "bot": self._stats(conn, plan.bot),
+                        }
+                        continue
                 verdict["elapsed"] = elapsed
                 break
             self._sleep(self._period(plan))
