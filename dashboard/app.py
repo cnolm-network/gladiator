@@ -70,7 +70,7 @@ class DashboardApp:
             pass
         self.training = TrainingRunner(cfg, self.procs, self.artifacts, self.runtimes,
                                        self.reward_presets, self.scripts, self.models)
-        self.match = MatchRunner(cfg, self.server, self.runtimes)
+        self.match = MatchRunner(cfg, self.server, self.runtimes, self.models)
         self.presets = PresetStore(cfg.var_dir / "presets")
         self.terminal = TerminalService(cfg, self.server, self.runtimes, self.training,
                                         self.artifacts, self.procs)
@@ -218,9 +218,15 @@ class DashboardApp:
                 roles[name] = ("policy", f"代码驱动 · {mode or '启发式'}",
                                f"脚本策略：{mode or '启发式'}，不学习，用于对抗训练")
         match = self.match.current(refresh=False)
-        for bot_name in (match.get("bots") or []):
-            roles[str(bot_name).lower()] = ("match", "人机对战 · 代码驱动",
-                                            f"由 {match.get('strategy') or '脚本策略'} 驱动，与人类玩家对战")
+        for entry in (match.get("bots") or []):
+            name = str((entry or {}).get("username") or "").lower()
+            if not name:
+                continue
+            roles[name] = (
+                "match",
+                f"人机对战 · {match.get('strategyLabel') or '策略'}",
+                f"与人类玩家 {match.get('player') or ''} 对战（模型 {match.get('brain') or '无'}）",
+            )
         annotated = []
         for item in runtimes:
             entry = dict(item)

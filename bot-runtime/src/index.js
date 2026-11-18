@@ -13,10 +13,16 @@
  * 环境变量：GLADIATOR_BRIDGE_PORT / GLADIATOR_BRIDGE_TOKEN / GLADIATOR_ENV_PORT /
  *          MC_HOST / MC_PORT / BOT_USERNAME / MC_VERSION / OBSERVATION_HZ
  */
+import path from 'node:path';
 import { ActionDispatcher } from './actions.js';
 import { LinkClient } from './connection.js';
+import { decodeAction, encodeObservation, entityHealth, nearestPlayer } from './features.js';
 import { EnvLinkServer } from './link-server.js';
 import { describeLoginFailure, launchBot } from './minecraft.js';
+import { buildObservation } from './observation.js';
+import { loadPolicy, resolvePolicyFile } from './policy.js';
+import { RconClient, parseRconSpec, parseStatsLine } from './rcon.js';
+import { ActionScheduler } from './scheduler.js';
 import { equipArmor } from './items.js';
 import { Navigator } from './navigation.js';
 import { RestrictionCache } from './restriction-cache.js';
@@ -42,6 +48,20 @@ const mcPort = Number(arg('mc-port', process.env.MC_PORT ?? 25565));
 const mcVersion = arg('mc-version', process.env.MC_VERSION ?? '1.8.8');
 const envPort = Number(arg('env-port', process.env.GLADIATOR_ENV_PORT ?? 8766));
 const controlHz = Number(arg('observation-hz', process.env.OBSERVATION_HZ ?? 10));
+
+// --- 本地大脑（块 A）--------------------------------------------------------
+// 空字符串 = 旧行为：只执行通道 B 下发的动作（Layer 3 训练时就是这个模式）。
+// 给模型后运行时自己闭环决策，人机对战不需要训练环境在跑。
+const brainSpec = String(arg('brain', process.env.GLADIATOR_BRAIN ?? '') || '').trim();
+const modelsDir = path.resolve(String(arg('models-dir', path.resolve('../dashboard/var/models'))));
+const brainHz = Math.max(1, Math.min(20, Number(arg('brain-hz', 5)) || 5));
+const brainEpsilon = Math.max(0, Math.min(1, Number(arg('brain-epsilon', 0)) || 0));
+const targetPlayerArg = String(arg('target-player', '') || '').trim();
+const rconSpec = parseRconSpec(
+  arg('rcon', process.env.GLADIATOR_RCON ?? ''),
+  String(arg('rcon-password', process.env.GLADIATOR_RCON_PASSWORD ?? 'devpass')),
+);
+const brainEnabled = brainSpec.length > 0;
 
 // 每个 Bot 独立的“手感”配置（G-507）：CLI/env 给基线，SPAWN 里的 profile 可整体覆盖。
 const cliProfile = normalizeProfile({
@@ -88,6 +108,8 @@ const envServer = new EnvLinkServer({
     }
     return session;
   },
+  // 本地大脑模式下通道 B 的 ACTION 一律忽略：两套指令源同时下发会让 Bot 抽风。
+  acceptActions: () => !brainEnabled,
   logger: console,
 });
 
@@ -108,6 +130,310 @@ function makeSession(currentBot) {
       console.warn(`[gladiator] 动作被规则拒绝 ${action.type}: ${reason}`);
     },
   };
+}
+
+// --- 本地大脑（块 A）------------------------------------------------------
+// 加载策略：(1) `--brain` 为空 → 完全不启用，保持「只执行通道 B 动作」的旧行为；
+// (2) 给了模型 → 按 brainHz 自己决策，并把通道 B 的 ACTION 忽略掉（避免两套指令打架）。
+let policy = null;
+if (brainEnabled) {
+  const policyFile = resolvePolicyFile(brainSpec, { modelsDir });
+  if (!policyFile) {
+    console.error(`[brain] 找不到模型 ${brainSpec}（已试路径与 --models-dir=${modelsDir}），退出`);
+    process.exit(2);
+  }
+  try {
+    policy = loadPolicy(policyFile);
+  } catch (error) {
+    console.error(`[brain] 模型加载失败: ${error.message}`);
+    process.exit(2);
+  }
+  if (policy.numActions !== 11) {
+    console.error(`[brain] 模型动作空间 ${policy.numActions} != 11，无法与 ACTION_NAMES 对齐`);
+    process.exit(2);
+  }
+  if (policy.obsDim !== 23) {
+    console.warn(`[brain] 模型 obsDim=${policy.obsDim}（运行时特征 23 维）：窄的字段按 0 补齐，`
+      + '相当于忽略新增特征，效果可能弱于 23 维模型');
+  }
+  console.log(`[brain] 模型 ${policyFile} obsDim=${policy.obsDim} actions=${policy.numActions}`
+    + ` hidden=${policy.hidden} temperature=${policy.temperature}`);
+}
+
+const brainState = {
+  timer: null,
+  poller: null,
+  busy: false,
+  decisions: 0,
+  attacks: 0,
+  damage: 0,
+  kills: 0,
+  actionFailures: 0,
+  startedAt: Date.now(),
+  seq: 0,
+  tick: 0,
+  lastAttackAt: 0,
+  target: targetPlayerArg || null,
+  targetPickedAt: 0,
+  opponentHealth: null,
+  lastOpponentHealth: null,
+  killCounted: false,
+  deathSummaryPrinted: false,
+  rcon: null,
+  rconLastPollAt: 0,
+  rconWarned: false,
+};
+
+const brainScheduler = new ActionScheduler({
+  maxPerSecond: Math.max(10, Math.ceil(cliProfile.cps + cliProfile.cpsJitter)),
+});
+
+/** 用户名像 Bot 的一律不当对手（人机对战里要打的是真人）。 */
+function isLikelyBot(name) {
+  return /^(glad[_-]|gladbot|bot[_-]|goblin|ai_)/i.test(String(name || ''));
+}
+
+function selfName() {
+  return (bot && bot.username) || username;
+}
+
+/**
+ * 选对手：`--target-player` 显式指定时固定用它；否则取最近的、看起来不是 Bot 的玩家。
+ * 锁定后 3 秒内不换人（避免观战者路过时策略来回切目标）。
+ */
+function pickTarget(observation, nowMs) {
+  if (targetPlayerArg) {
+    return targetPlayerArg;
+  }
+  const self = selfName().toLowerCase();
+  const entities = observation.entities || [];
+  const keep = brainState.target;
+  if (keep && nowMs - brainState.targetPickedAt < 3000) {
+    const stillThere = entities.some((entity) => entity
+      && entity.kind === 'player'
+      && String(entity.name || '').toLowerCase() === keep.toLowerCase());
+    if (stillThere) {
+      return keep;
+    }
+  }
+  let best = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const entity of entities) {
+    if (!entity || entity.kind !== 'player') {
+      continue;
+    }
+    const name = String(entity.name || '');
+    if (!name || name.toLowerCase() === self || isLikelyBot(name)) {
+      continue;
+    }
+    const distance = Number(entity.distance);
+    if (Number.isFinite(distance) && distance < bestDistance) {
+      bestDistance = distance;
+      best = name;
+    }
+  }
+  if (best && best !== brainState.target) {
+    console.log(`[brain] 目标锁定 ${best}（距离 ${bestDistance.toFixed(1)} 格）`);
+    brainState.target = best;
+    brainState.targetPickedAt = nowMs;
+    brainState.lastOpponentHealth = null;
+    brainState.opponentHealth = null;
+    brainState.killCounted = false;
+  }
+  return brainState.target;
+}
+
+/** 记录一次对手血量采样：掉的血记成 damage，归零记一次 kill。 */
+function recordOpponentHealth(health) {
+  const value = Number(health);
+  if (!Number.isFinite(value)) {
+    return;
+  }
+  const previous = brainState.lastOpponentHealth;
+  if (previous !== null && value < previous - 0.05) {
+    brainState.damage += previous - value;
+  }
+  if (value <= 0 && !brainState.killCounted) {
+    brainState.killCounted = true;
+    brainState.kills += 1;
+    console.log('[brain] 对手血量归零，记一次击杀');
+  }
+  if (value > 0) {
+    brainState.killCounted = false;
+  }
+  brainState.lastOpponentHealth = value;
+  brainState.opponentHealth = value;
+}
+
+/**
+ * RCON 采样对手血量（1.8 的玩家血量不通过实体元数据稳定暴露）。
+ * 失败只告警一次并丢弃连接，下次 tick 自动重连——不能因为采样失败停掉决策。
+ */
+async function pollOpponentHealth() {
+  if (!rconSpec || !brainState.target) {
+    return;
+  }
+  const nowMs = Date.now();
+  if (nowMs - brainState.rconLastPollAt < 900) {
+    return;
+  }
+  brainState.rconLastPollAt = nowMs;
+  try {
+    if (!brainState.rcon || !brainState.rcon.ready) {
+      if (brainState.rcon) {
+        brainState.rcon.close();
+      }
+      brainState.rcon = new RconClient(rconSpec);
+      await brainState.rcon.connect();
+      console.log(`[brain] RCON 已连接 ${rconSpec.host}:${rconSpec.port}（轮询 /gladiator stats）`);
+    }
+    const raw = await brainState.rcon.command(`gladiator stats ${brainState.target}`);
+    const stats = parseStatsLine(raw);
+    if (stats) {
+      recordOpponentHealth(stats.health);
+    }
+  } catch (error) {
+    if (!brainState.rconWarned) {
+      brainState.rconWarned = true;
+      console.warn(`[brain] RCON 采样失败（会重试）: ${error?.message ?? error}`);
+    }
+    if (brainState.rcon) {
+      brainState.rcon.close();
+      brainState.rcon = null;
+    }
+  }
+}
+
+/** 一次决策：编码 23 维 → 策略 → 解码成协议动作 → 经 ActionDispatcher 下发。 */
+async function brainTick() {
+  if (!policy || brainState.busy || !bot || !session || !bot.entity) {
+    return;
+  }
+  brainState.busy = true;
+  const currentSession = session;
+  try {
+    brainState.tick += 1;
+    const observation = buildObservation(bot, {
+      tick: brainState.tick,
+      gameId,
+      state: gameState,
+      restrictions: restrictionCache.snapshot(),
+      chat: chatLines,
+      pendingNotices: notices,
+    });
+    const nowMs = Date.now();
+    const targetName = pickTarget(observation, nowMs);
+    if (!targetName) {
+      await currentSession.dispatcher.dispatch({ type: 'idle', params: { durationMs: 180 } });
+      return;
+    }
+    // 没有 RCON 时退化成读实体血量（有就用，读不到就保持上次的采样值）。
+    if (!rconSpec) {
+      const entity = (observation.entities || []).find((item) => item
+        && item.kind === 'player'
+        && String(item.name || '').toLowerCase() === targetName.toLowerCase());
+      recordOpponentHealth(entityHealth(entity));
+    }
+    const features = encodeObservation(observation, {
+      username: selfName(),
+      stepFraction: 0,
+      opponentHealth: brainState.opponentHealth,
+      allowed: [targetName],
+      reach: activeProfile.reach,
+      sinceAttack: brainState.lastAttackAt ? (nowMs - brainState.lastAttackAt) / 1000 : 5,
+    });
+    const index = brainEpsilon > 0 && Math.random() < brainEpsilon
+      ? Math.floor(Math.random() * policy.numActions)
+      : policy.greedy(features);
+    const actions = decodeAction(index, observation, selfName(), {
+      allowed: [targetName],
+      reach: activeProfile.reach,
+    });
+    brainState.decisions += 1;
+    for (const action of actions) {
+      brainState.seq += 1;
+      const result = await brainScheduler.run(
+        brainState.seq,
+        () => currentSession.dispatcher.dispatch(action),
+      );
+      if (result && result.ok === false) {
+        brainState.actionFailures += 1;
+        if (brainState.actionFailures <= 5) {
+          console.warn(`[brain] 动作失败 ${action.type}: ${result.code || '?'} ${result.reason || ''}`);
+        }
+      }
+      if (action.type === 'attack') {
+        brainState.attacks += 1;
+        brainState.lastAttackAt = Date.now();
+      }
+    }
+  } catch (error) {
+    console.warn(`[brain] 决策失败: ${error?.message ?? error}`);
+  } finally {
+    brainState.busy = false;
+  }
+}
+
+function startBrain() {
+  if (!brainEnabled || !policy) {
+    return;
+  }
+  if (brainState.timer) {
+    clearInterval(brainState.timer);
+  }
+  const interval = Math.max(50, Math.floor(1000 / brainHz));
+  brainState.timer = setInterval(() => {
+    brainTick().catch((error) => console.warn(`[brain] tick 异常: ${error?.message ?? error}`));
+  }, interval);
+  if (brainState.timer.unref) {
+    brainState.timer.unref();
+  }
+  console.log(`[brain] 已启动 ${brainHz}Hz，目标=${targetPlayerArg || '自动（最近的非 Bot 玩家）'}`
+    + ` epsilon=${brainEpsilon} rcon=${rconSpec ? `${rconSpec.host}:${rconSpec.port}` : 'off'}`);
+  if (rconSpec) {
+    const poller = setInterval(() => {
+      pollOpponentHealth().catch(() => {});
+    }, 1000);
+    if (poller.unref) {
+      poller.unref();
+    }
+    brainState.poller = poller;
+  }
+}
+
+function stopBrain() {
+  if (brainState.timer) {
+    clearInterval(brainState.timer);
+    brainState.timer = null;
+  }
+  if (brainState.poller) {
+    clearInterval(brainState.poller);
+    brainState.poller = null;
+  }
+  if (brainState.rcon) {
+    brainState.rcon.close();
+    brainState.rcon = null;
+  }
+}
+
+/** 对局结束/退出时的机器可读汇总（Dashboard 直接读该行）。 */
+function printMatchSummary(reason) {
+  if (!brainEnabled) {
+    return;
+  }
+  const duration = Math.round((Date.now() - brainState.startedAt) / 100) / 10;
+  console.log(JSON.stringify({
+    event: 'match-summary',
+    decisions: brainState.decisions,
+    attacks: brainState.attacks,
+    damage: Math.round(brainState.damage * 10) / 10,
+    kills: brainState.kills,
+    duration,
+    reason: reason || 'exit',
+    model: brainSpec,
+    target: brainState.target || null,
+    actionFailures: brainState.actionFailures,
+  }));
 }
 
 client.on('welcome', (payload) => {
@@ -134,11 +460,23 @@ client.on('message', async (envelope) => {
     return;
   }
   if (envelope.type === 'STATE') {
+    const previous = payload.state ?? gameState;
     gameState = payload.state ?? gameState;
     if (payload.gameId) {
       gameId = payload.gameId;
     }
     console.log(`[gladiator] STATE ${payload.previous ?? '?'} → ${gameState}${payload.reason ? ` (${payload.reason})` : ''}`);
+    // 对局结束信号：自己被淘汰或死亡时输出一次汇总（回到 Alive 后允许再次输出）。
+    if (brainEnabled) {
+      const ended = gameState === 'Dead' || gameState === 'Eliminated' || previous === 'Eliminated';
+      if (ended && gameState !== 'Alive' && !brainState.deathSummaryPrinted) {
+        brainState.deathSummaryPrinted = true;
+        printMatchSummary(`state:${gameState}`);
+      }
+      if (gameState === 'Alive' || gameState === 'Respawning') {
+        brainState.deathSummaryPrinted = false;
+      }
+    }
     return;
   }
   if (envelope.type === 'NOTICE') {
@@ -209,6 +547,11 @@ async function handleSpawn(spawn) {
     const current = bot;
     session = makeSession(current);
     navigator.setBot(current);
+    // 本地大脑在 Bot 实体就绪后开始决策（不需要 Layer 3 接入通道 B）。
+    if (brainEnabled) {
+      brainState.deathSummaryPrinted = false;
+      startBrain();
+    }
     // 调用方（训练场/对局）给完套件后自动穿上护甲。
     // 注意：不能只靠 bot.inventory 的 'update' 事件——1.8.8 实测 RCON give 之后
     // 该事件不一定触发，护甲会一直躺在背包里；这里用轮询兜底，穿上 4 件后停止。
@@ -222,24 +565,16 @@ async function handleSpawn(spawn) {
         equipAttempts += 1;
         equipArmor(current)
           .then((worn) => {
+            // 不能穿上就停：人机对战每局都会 clear + give，死后护甲也会掉落，
+            // 停掉的定时器会让第二局开始就裸奔。equipArmor 在没有可穿物品时本就是空操作。
             if (worn.length && worn.every((name) => !name.startsWith('!'))) {
-              if (worn.length >= 4) {
-                clearInterval(equipTimer);
-                equipTimer = null;
-              }
               if (worn.join(',') !== lastWorn) {
                 lastWorn = worn.join(',');
                 console.log(`[gladiator] 已穿戴护甲: ${worn.join(', ')}`);
               }
             }
           })
-          .catch((error) => console.warn(`[gladiator] 穿护甲失败：${error?.message ?? error}`))
-          .finally(() => {
-            if (equipAttempts > 60 && equipTimer) {
-              clearInterval(equipTimer);
-              equipTimer = null;
-            }
-          });
+          .catch((error) => console.warn(`[gladiator] 穿护甲失败：${error?.message ?? error}`));
       }, 2000);
       if (equipTimer.unref) {
         equipTimer.unref();
@@ -268,6 +603,8 @@ async function handleSpawn(spawn) {
     current.once('end', (reason) => {
       console.warn(`[gladiator] Bot 断线：${reason ?? 'unknown'}`);
       if (bot === current) {
+        stopBrain();
+        printMatchSummary(`disconnect:${reason ?? 'unknown'}`);
         bot = null;
         session = null;
         restrictionCache.clear();
@@ -296,6 +633,8 @@ async function shutdown(signal) {
   if (quitting) return;
   quitting = true;
   console.log(`[gladiator] 收到 ${signal}，正在退出`);
+  stopBrain();
+  printMatchSummary(`signal:${signal}`);
   envServer.stop();
   client.stop();
   if (bot) {

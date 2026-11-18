@@ -21,6 +21,7 @@ import top.cnolm.gladiator.bridge.LinkServer;
 import top.cnolm.gladiator.core.BotHandle;
 import top.cnolm.gladiator.core.BotRegistry;
 import top.cnolm.gladiator.core.GladiatorServiceImpl;
+import top.cnolm.gladiator.core.PlayerTelemetry;
 import top.cnolm.gladiator.core.SpectatorService;
 
 import java.util.Locale;
@@ -82,6 +83,9 @@ public final class GladiatorCommand implements CommandExecutor {
             case "pvp":
                 handlePvp(sender, label, args);
                 return true;
+            case "stats":
+                handleStats(sender, label, args);
+                return true;
             case "spectate":
                 handleSpectate(sender, label, args);
                 return true;
@@ -91,9 +95,40 @@ public final class GladiatorCommand implements CommandExecutor {
             default:
                 sender.sendMessage("[Gladiator] 用法: /" + label
                         + " <status|spawn <username>|train <username>|list|game|analyze [session] [windowSec]"
-                        + "|pvp <x> <y> <z>|spectate [bot]|unspectate|reload>");
+                        + "|pvp <x> <y> <z>|stats <player>|spectate [bot]|unspectate|reload>");
                 return true;
         }
+    }
+
+    /**
+     * `/gladiator stats <player>` 的路由（块 B）：{@code target == null} → 失败文案，
+     * 否则单行遥测。抽成静态方法，单测可以直接断言两个分支，不需要真实服务端。
+     */
+    static String statsResponse(Player target) {
+        return target == null ? PlayerTelemetry.OFFLINE_MESSAGE : PlayerTelemetry.format(target);
+    }
+
+    /** 按名字找在线玩家；没有服务端实例（单测/早期初始化）时按离线处理，不抛给调用方。 */
+    private static Player findOnlinePlayer(String name) {
+        try {
+            return org.bukkit.Bukkit.getPlayerExact(name);
+        } catch (RuntimeException ex) {
+            return null;
+        }
+    }
+
+    /**
+     * 只读遥测：给 Dashboard 的每局采样与 Bot 运行时的 {@code target_health} 用。
+     *
+     * <p>输出刻意不带 {@code [Gladiator]} 前缀与颜色码：RCON 侧按 {@code key=value} 直接解析。
+     * 不传送、不修改任何状态，也不含对局规则（谁赢由编排层判断）。
+     */
+    private void handleStats(CommandSender sender, String label, String[] args) {
+        if (args.length < 2) {
+            sender.sendMessage("[Gladiator] 用法: /" + label + " stats <player>");
+            return;
+        }
+        sender.sendMessage(statsResponse(findOnlinePlayer(args[1])));
     }
 
     private static boolean flag(String value) {

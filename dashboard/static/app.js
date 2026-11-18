@@ -2029,41 +2029,177 @@ function renderTrainingReport(report) {
 
 /* ---------------- 人机对战 ---------------- */
 
+const MATCH_PHASE_TEXT = {
+  idle: "空闲",
+  preparing: "摆位与发装备",
+  countdown: "倒计时",
+  fighting: "交战中",
+  roundEnd: "本局结束",
+  finished: "已完成",
+  stopped: "已停止",
+  failed: "失败",
+};
+
+const MATCH_REASON_TEXT = {
+  kill: "击杀",
+  timeout: "超时判负",
+  "player-offline": "玩家离线",
+  "bot-offline": "Bot 离线",
+  "player-respawn": "玩家死亡重生",
+  "bot-respawn": "Bot 死亡重生",
+  budget: "采样预算耗尽",
+};
+
+function matchWinnerLabel(winner, match) {
+  if (winner === "player") return match.player || "玩家";
+  if (winner === "bot") return match.bot || "Bot";
+  return "平局";
+}
+
+function renderMatchBotOptions(match) {
+  const list = $("#match-bot-options");
+  const input = $("#match-bot");
+  if (!list || !input) return;
+  const bots = match.availableBots || [];
+  list.innerHTML = bots.map((bot) => {
+    const tags = [bot.ready ? "ready" : "未就绪"];
+    if (bot.envPort) tags.push(`:${bot.envPort}`);
+    if (bot.external) tags.push("外部进程");
+    return `<option value="${escapeHtml(bot.username)}" label="${escapeHtml(`${bot.username} · ${tags.join(" · ")}`)}"></option>`;
+  }).join("");
+  if (!input.value && bots.length) {
+    const preferred = bots.find((bot) => bot.ready) || bots[0];
+    input.value = preferred.username;
+    const portInput = $("#match-env-port");
+    if (portInput && !portInput.dataset.touched && preferred.envPort) {
+      portInput.value = preferred.envPort;
+    }
+  }
+}
+
+function renderMatchBrainOptions(match) {
+  const select = $("#match-brain");
+  if (!select) return;
+  const previous = select.value || (match && match.brain) || "";
+  const models = (state.models || []).filter((model) => model.valid !== false);
+  const options = ['<option value="">（不使用：Bot 站立）</option>'];
+  models.forEach((model) => {
+    const suffix = model.kind === "gmod" ? " · 文件模型" : "";
+    options.push(`<option value="${escapeHtml(model.id)}">${escapeHtml(model.name || model.id)}${escapeHtml(suffix)}</option>`);
+  });
+  select.innerHTML = options.join("");
+  const valid = models.some((model) => model.id === previous);
+  select.value = valid ? previous : "";
+}
+
+function renderMatchHint(match) {
+  const hint = $("#match-hint");
+  if (!hint) return;
+  const brain = $("#match-brain") ? $("#match-brain").value : "";
+  if (!brain) {
+    hint.textContent = "未选择模型：Bot 不会自己决策，只会站着。要让 Bot 真的打，请选一个 brain 模型（或新建运行时并选模型）。";
+    return;
+  }
+  const record = $("#match-record") && $("#match-record").checked;
+  const train = $("#match-train-after") && $("#match-train-after").checked;
+  const parts = [`模型 ${brain} 会在运行时里以 5Hz 自主决策`];
+  parts.push(record ? "对局按 10Hz 录制到 training/artifacts/matches/" : "未开启录制");
+  if (train) parts.push("结束后自动转数据集并做一轮 BC（写新 run，不覆盖模型）");
+  if (match && match.running) parts.push(`当前阶段：${MATCH_PHASE_TEXT[match.phase] || match.phase}`);
+  hint.textContent = parts.join("；");
+}
+
 function renderMatch() {
   const match = state.match;
   if (!match) return;
-  const ready = (match.bots || []).filter((bot) => bot.ready).length;
+  const phase = match.phase || "idle";
+  const score = match.score || { player: 0, bot: 0, draws: 0 };
+  const totalRounds = Number(match.rounds) || 0;
+  const currentRound = Number(match.round) || 0;
+  const countdown = match.countdown;
+  const runningPill = match.running
+    ? '<span class="pill ok">进行中</span>'
+    : `<span class="pill neutral">${escapeHtml(MATCH_PHASE_TEXT[phase] || phase)}</span>`;
+
   const cards = [
-    statCard("对战状态", STATUS_TEXT[match.status] || match.status || "空闲",
-      match.running ? `已运行 ${fmtDuration(match.durationSeconds)}` : "尚未启动",
-      `<div style="margin-top:6px">${match.running ? '<span class="pill ok">进行中</span>' : '<span class="pill neutral">空闲</span>'}</div>`),
-    statCard("Bot 就绪", `${ready} / ${match.count || 0}`, "ready=true 才算真正进服"),
-    statCard("服务器", match.mcRunning ? "在线" : "离线", match.rconReachable ? "RCON 可达" : "RCON 不可达"),
-    statCard("进服地址", escapeHtml(match.address || " — "), "Minecraft 1.8.9 · offline"),
+    statCard("对局阶段", MATCH_PHASE_TEXT[phase] || phase,
+      match.running ? `已运行 ${fmtDuration(match.durationSeconds)}` : `耗时 ${fmtDuration(match.durationSeconds || 0)}`,
+      `<div style="margin-top:6px">${runningPill}</div>`),
+    statCard("比分", `${score.player} : ${score.bot}`, `平局 ${score.draws}`,
+      `<div class="muted small" style="margin-top:6px">${escapeHtml(match.player || "玩家")} vs ${escapeHtml(match.bot || "Bot")}</div>`),
+    statCard("当前局", totalRounds ? `${Math.max(currentRound, 1)} / ${totalRounds}` : "—",
+      phase === "countdown" && countdown != null
+        ? `倒计时 ${Math.max(0, Math.round(countdown))} 秒`
+        : (match.roundSeconds ? `每局 ${Math.round(match.roundSeconds)} 秒` : "未开始")),
+    statCard("Bot 策略", match.brain ? escapeHtml(match.brain) : "未启用大脑",
+      match.brain ? "浏览器之外的本地推理（不占服务端 TPS）" : "没有模型时 Bot 不会主动攻击"),
   ];
   $("#match-cards").innerHTML = cards.join("");
+  const phasePill = $("#match-phase-pill");
+  if (phasePill) phasePill.textContent = MATCH_PHASE_TEXT[phase] || phase;
   $("#match-address").textContent = match.address || "127.0.0.1:25566";
 
   const commands = [];
   commands.push(`<div class="command-row"><code data-copy="${escapeHtml(match.address || "")}">${escapeHtml(match.address || "")}</code><button class="btn tiny ghost" data-copy="${escapeHtml(match.address || "")}" type="button">复制地址</button></div>`);
-  (match.bots || []).forEach((bot) => {
-    const command = `/gladiator spectate ${bot.username}`;
+  if (match.bot) {
+    const command = `/gladiator spectate ${match.bot}`;
     commands.push(`<div class="command-row"><code>${escapeHtml(command)}</code><button class="btn tiny ghost" data-copy="${escapeHtml(command)}" type="button">复制</button></div>`);
-  });
-  commands.push(`<div class="command-row"><code>/gladiator unspectate</code><button class="btn tiny ghost" data-copy="/gladiator unspectate" type="button">复制</button></div>`);
+  }
+  if (match.recordDir) {
+    commands.push(`<div class="command-row"><code>${escapeHtml(match.recordDir)}</code></div>`);
+  }
   $("#match-commands").innerHTML = commands.join("");
 
+  const roundRows = (match.roundsDetail || []).map((entry) => {
+    const playerHealth = entry.player || {};
+    const botHealth = entry.bot || {};
+    const winner = entry.winner === "draw"
+      ? '<span class="pill neutral">平局</span>'
+      : `<span class="pill ${entry.winner === "player" ? "ok" : "warn"}">${escapeHtml(matchWinnerLabel(entry.winner, match))}</span>`;
+    return `<tr>
+      <td>${entry.round}</td>
+      <td>${winner}</td>
+      <td>${escapeHtml(MATCH_REASON_TEXT[entry.reason] || entry.reason || "—")}</td>
+      <td>${entry.duration != null ? `${entry.duration}s` : "—"}</td>
+      <td>${playerHealth.healthBefore ?? "—"} → ${playerHealth.healthAfter ?? "—"}</td>
+      <td>${botHealth.healthBefore ?? "—"} → ${botHealth.healthAfter ?? "—"}</td>
+    </tr>`;
+  }).join("");
+  $("#match-rounds").innerHTML = roundRows;
+  $("#match-rounds-empty").classList.toggle("hidden", roundRows.length > 0);
+
+  const training = match.training;
+  const scoreItems = [
+    kvItem("玩家", escapeHtml(match.player || "—")),
+    kvItem("Bot", escapeHtml(match.bot || "—")),
+    kvItem("比分", `${score.player} : ${score.bot}（平 ${score.draws}）`),
+    kvItem("模式", match.mode === "attach" ? "接入已有运行时" : "新建运行时"),
+    kvItem("套件", match.kit === "none" ? "不发" : `钻石套（${escapeHtml(match.kit || "diamond")}）`),
+    kvItem("录制", match.record === false ? "未开启" : (match.recordDir ? escapeHtml(match.recordDir) : "等待开始")),
+    kvItem("赛后导入", training ? `${escapeHtml(training.status)}` : (match.trainAfter ? "等待对局结束" : "未开启")),
+  ];
+  $("#match-score").innerHTML = scoreItems.join("");
+
   $("#match-bots").innerHTML = (match.bots || []).map((bot) => `<tr>
-    <td>${escapeHtml(bot.username)}</td>
+    <td>${escapeHtml(bot.username || "—")}</td>
     <td>${bot.envPort ?? "—"}</td>
-    <td>${escapeHtml(bot.runtimeId || "—")}</td>
-    <td>${boolPill(bot.ready, "ready", "未就绪")}</td>
-    <td>${bot.pid ?? "—"}</td>
+    <td>${boolPill(Boolean(bot.ready), "ready", "未就绪")}</td>
   </tr>`).join("");
   $("#match-bots-empty").classList.toggle("hidden", (match.bots || []).length > 0);
-  $("#match-log").textContent = (match.log || []).map((entry) => `[${entry.at}] ${entry.text}`).join("\n") || "—";
-  $("#btn-match-start").disabled = !state.health || state.health.readOnly || match.running;
-  $("#btn-match-stop").disabled = !state.health || state.health.readOnly || !match.running;
+
+  const logLines = (match.log || []).map((entry) => `[${entry.at}] ${entry.text}`);
+  if (training && training.output) {
+    logLines.push("", "--- 赛后导入输出 ---", String(training.output).trim());
+  }
+  $("#match-log").textContent = logLines.join("\n") || "—";
+
+  renderMatchBotOptions(match);
+  renderMatchBrainOptions(match);
+  renderMatchHint(match);
+
+  const readOnly = !state.health || state.health.readOnly;
+  $("#btn-match-start").disabled = readOnly || Boolean(match.running);
+  $("#btn-match-stop").disabled = readOnly || !match.running;
 }
 
 /* ---------------- 数据可视化 ---------------- */
@@ -3418,24 +3554,82 @@ function bindTraining() {
 }
 
 
+function collectMatchSpawns() {
+  const read = (prefix) => {
+    const raw = ["x", "y", "z"].map((axis) => {
+      const element = $(`#match-spawn-${prefix}-${axis}`);
+      return element ? element.value.trim() : "";
+    });
+    const filled = raw.filter((value) => value !== "").length;
+    if (filled === 0) return null;
+    if (filled !== 3) throw new Error(`${prefix === "player" ? "玩家" : "Bot"} 出生点需要同时填 x / y / z`);
+    const values = raw.map(Number);
+    if (values.some((value) => !Number.isFinite(value))) {
+      throw new Error(`${prefix === "player" ? "玩家" : "Bot"} 出生点必须是数字`);
+    }
+    return { x: values[0], y: values[1], z: values[2] };
+  };
+  const player = read("player");
+  const bot = read("bot");
+  if (!player && !bot) return null;
+  return { ...(player ? { player } : {}), ...(bot ? { bot } : {}) };
+}
+
 function bindMatch() {
+  ["#match-bot", "#match-env-port"].forEach((id) => {
+    const element = $(id);
+    if (element) element.addEventListener("input", () => { element.dataset.touched = "1"; });
+  });
+  ["#match-brain", "#match-record", "#match-train-after"].forEach((id) => {
+    const element = $(id);
+    if (element) element.addEventListener("change", () => renderMatchHint(state.match));
+  });
+
   $("#btn-match-start").addEventListener("click", (event) => withBusy(event.currentTarget, async () => {
+    let spawns;
+    try {
+      spawns = collectMatchSpawns();
+    } catch (err) {
+      toast(err.message, "err");
+      return;
+    }
+    const bot = $("#match-bot").value.trim();
+    const player = $("#match-player").value.trim();
+    if (!bot) {
+      toast("请先选择或填写 Bot 用户名", "err");
+      return;
+    }
+    if (!player) {
+      toast("请填写你的游戏 ID（玩家名）", "err");
+      return;
+    }
+    const brain = $("#match-brain").value || null;
+    if (!brain && !window.confirm("没有选择模型时 Bot 不会主动攻击（只会站着）。仍要开始吗？")) return;
     const payload = {
-      count: Number($("#match-count").value),
-      usersPrefix: $("#match-prefix").value.trim(),
-      portsBase: Number($("#match-base").value),
+      mode: $("#match-mode").value,
+      bot,
+      envPort: Number($("#match-env-port").value),
+      player,
+      rounds: Number($("#match-rounds").value),
+      roundSeconds: Number($("#match-round-seconds").value),
+      kit: $("#match-kit").value,
+      brain,
+      record: $("#match-record").checked,
+      trainAfter: $("#match-train-after").checked,
+      spawns,
     };
     const data = await api("/api/match/start", { method: "POST", body: payload });
     state.match = data.match;
     renderMatch();
-    toast("正在拉起 Bot，进度见启动日志", "ok");
+    toast(brain ? "对局已开始，Bot 由模型驱动" : "对局已开始（未选模型，Bot 不会主动攻击）", "ok");
     setTimeout(loadMatch, 1500);
   }));
+
   $("#btn-match-stop").addEventListener("click", (event) => {
-    if (!window.confirm("结束对战并停止本场拉起的 Bot？")) return;
+    if (!window.confirm("停止对局？本场由 Dashboard 拉起的运行时会一起关闭。")) return;
     withBusy(event.currentTarget, async () => {
       await api("/api/match/stop", { method: "POST" });
-      toast("对战已结束", "ok");
+      toast("对局已停止", "ok");
       await loadMatch();
       await loadRuntimes();
     });

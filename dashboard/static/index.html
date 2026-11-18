@@ -254,36 +254,83 @@
     <!-- 人机对战 -->
     <section class="panel" id="panel-match">
       <div class="section-head">
-        <div><h2>人机对战</h2><p class="muted small">启动 N 个 bot-runtime，通过 RCON 让插件 spawn，人类玩家直接进服观战/对战。</p></div>
+        <div>
+          <h2>人机对战</h2>
+          <p class="muted small">真人对指定 Bot：每局自动摆位、发套件、倒计时、按血量判胜负。选模型后 Bot 由模型自己决策；不选模型时 Bot 只会站着（运行时只执行外部动作）。</p>
+        </div>
         <div class="actions">
-          <button class="btn primary" id="btn-match-start" type="button">启动人机对战</button>
-          <button class="btn danger" id="btn-match-stop" type="button">结束对战</button>
+          <button class="btn primary" id="btn-match-start" type="button">开始对战</button>
+          <button class="btn danger" id="btn-match-stop" type="button">停止</button>
         </div>
       </div>
+
       <div class="card">
-        <form class="inline-form" id="match-form">
-          <label class="field inline"><span>Bot 数量</span><input id="match-count" type="number" min="1" max="8" value="2"></label>
-          <label class="field inline"><span>用户名前缀</span><input id="match-prefix" value="Glad_Bot"></label>
-          <label class="field inline"><span>起始端口</span><input id="match-base" type="number" min="1024" max="65000" value="8770"></label>
+        <div class="card-head"><h3>对局配置</h3><span class="pill neutral" id="match-phase-pill">空闲</span></div>
+        <form class="inline-form" id="match-form" autocomplete="off">
+          <label class="field inline"><span>接入方式</span>
+            <select id="match-mode">
+              <option value="attach">接入已有运行时</option>
+              <option value="spawn">新建运行时</option>
+            </select>
+          </label>
+          <label class="field inline"><span>Bot</span>
+            <input id="match-bot" list="match-bot-options" value="Glad_Bot_1" placeholder="Glad_Bot_1">
+            <datalist id="match-bot-options"></datalist>
+          </label>
+          <label class="field inline"><span>通道 B 端口</span><input id="match-env-port" type="number" min="1024" max="65535" value="8775"></label>
+          <label class="field inline"><span>玩家名</span><input id="match-player" value="Steve" placeholder="你的游戏 ID"></label>
+          <label class="field inline"><span>局数</span><input id="match-rounds" type="number" min="1" max="20" value="3"></label>
+          <label class="field inline"><span>每局时长（秒）</span><input id="match-round-seconds" type="number" min="10" max="1800" value="120"></label>
+          <label class="field inline"><span>套件</span>
+            <select id="match-kit">
+              <option value="diamond">钻石套 + 剑 + 5 苹果 + 鱼竿</option>
+              <option value="none">不发（用自己背包）</option>
+            </select>
+          </label>
+          <label class="field inline"><span>Brain 模型</span>
+            <select id="match-brain"><option value="">（不使用：Bot 站立）</option></select>
+          </label>
+          <label class="field inline"><span>录制</span><input id="match-record" type="checkbox" checked></label>
+          <label class="field inline"><span>赛后导入训练</span><input id="match-train-after" type="checkbox"></label>
         </form>
+        <form class="inline-form" id="match-spawn-form" autocomplete="off">
+          <span class="muted small">出生点（留空 = 双方原地开局）</span>
+          <label class="field inline"><span>玩家 x</span><input id="match-spawn-player-x" type="number" step="0.5"></label>
+          <label class="field inline"><span>y</span><input id="match-spawn-player-y" type="number" step="0.5"></label>
+          <label class="field inline"><span>z</span><input id="match-spawn-player-z" type="number" step="0.5"></label>
+          <label class="field inline"><span>Bot x</span><input id="match-spawn-bot-x" type="number" step="0.5"></label>
+          <label class="field inline"><span>y</span><input id="match-spawn-bot-y" type="number" step="0.5"></label>
+          <label class="field inline"><span>z</span><input id="match-spawn-bot-z" type="number" step="0.5"></label>
+        </form>
+        <p class="muted small" id="match-hint"></p>
       </div>
+
       <div class="grid cards" id="match-cards"></div>
+
       <div class="two-col">
+        <div class="card">
+          <div class="card-head"><h3>比分与每局结果</h3></div>
+          <div class="kv" id="match-score"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>局</th><th>胜者</th><th>原因</th><th>时长</th><th>玩家血量</th><th>Bot 血量</th></tr></thead>
+              <tbody id="match-rounds"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="match-rounds-empty">还没有打完的局。</div>
+        </div>
         <div class="card join-card">
           <div class="card-head"><h2>进入服务器</h2><span class="pill neutral">1.8.9 · offline</span></div>
           <div class="address" id="match-address">127.0.0.1:25566</div>
-          <p class="muted">观战前请先以普通玩家身份进入服务器。</p>
+          <p class="muted">先以普通玩家身份进服，再回到这里点「开始对战」。</p>
           <div class="command-list" id="match-commands"></div>
-        </div>
-        <div class="card">
-          <div class="card-head"><h3>Bot 状态</h3></div>
           <div class="table-wrap">
-            <table><thead><tr><th>用户名</th><th>通道 B</th><th>runtime</th><th>ready</th><th>PID</th></tr></thead><tbody id="match-bots"></tbody></table>
+            <table><thead><tr><th>Bot</th><th>通道 B</th><th>ready</th></tr></thead><tbody id="match-bots"></tbody></table>
           </div>
-          <div class="empty" id="match-bots-empty">还没有启动对战。</div>
+          <div class="empty" id="match-bots-empty">还没有启动 Bot。</div>
         </div>
       </div>
-      <div class="card"><div class="card-head"><h3>启动日志</h3></div><pre class="log tall" id="match-log">—</pre></div>
+      <div class="card"><div class="card-head"><h3>对局日志</h3></div><pre class="log tall" id="match-log">—</pre></div>
     </section>
 
 

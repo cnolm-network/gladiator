@@ -96,7 +96,12 @@ class RuntimeManager:
 
     # --- 启动/停止 ------------------------------------------------------
     def start(self, username: str, env_port: int, *, mc_host: str | None = None,
-              mc_port: int | None = None) -> dict:
+              mc_port: int | None = None, extra_args: list[str] | None = None) -> dict:
+        """启动一个 bot-runtime。
+
+        ``extra_args`` 追加到命令行末尾（人机对战用 ``--brain``/``--rcon``/``--target-player``），
+        不改动默认参数顺序，训练与手动启动路径完全不变。
+        """
         username = validate_username(username)
         env_port = parse_port(env_port, "通道 B 端口", self._reserved_ports())
         if not self.cfg.allow_process_control:
@@ -129,6 +134,8 @@ class RuntimeManager:
                 "--env-port",
                 str(env_port),
             ]
+            if extra_args:
+                argv.extend(str(item) for item in extra_args)
             self.procs.spawn(
                 proc_id=runtime_id,
                 kind="runtime",

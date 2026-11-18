@@ -35,6 +35,7 @@ export class EnvLinkServer {
     controlHz = 10,
     maxActionsPerSecond = 10,
     resolveSession,
+    acceptActions = null,
     logger = console,
   } = {}) {
     this.port = port;
@@ -42,6 +43,9 @@ export class EnvLinkServer {
     this.controlHz = Math.max(1, Math.min(20, controlHz));
     this.maxActionsPerSecond = maxActionsPerSecond;
     this.resolveSession = resolveSession || (() => null);
+    // 运行时本地大脑（`--brain`）开着时返回 false：通道 B 仍然推观测，但下发的 ACTION 被忽略。
+    this.acceptActions = typeof acceptActions === 'function' ? acceptActions : () => true;
+    this.actionIgnoreWarned = false;
     this.logger = logger;
     this.server = null;
     this.clients = new Set();
@@ -170,6 +174,18 @@ export class EnvLinkServer {
     const session = this.resolveSession(client.botId);
     if (!session || !session.dispatcher) {
       this.send(client, 'ACTION_RESULT', { ok: false, code: 'BOT_NOT_READY', reason: 'Bot 尚未登录' }, seq);
+      return;
+    }
+    if (!this.acceptActions()) {
+      if (!this.actionIgnoreWarned) {
+        this.actionIgnoreWarned = true;
+        this.logger.warn('[env] 运行时由本地大脑（--brain）驱动，通道 B 的 ACTION 将被忽略');
+      }
+      this.send(client, 'ACTION_RESULT', {
+        ok: false,
+        code: 'ACTION_IGNORED',
+        reason: '运行时由本地大脑驱动（--brain），忽略通道 B 下发的动作',
+      }, seq);
       return;
     }
     const action = { type: payload.type, params: payload.params || {} };

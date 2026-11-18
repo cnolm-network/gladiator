@@ -1,0 +1,351 @@
+/**
+ * 23 维特征编码 + 离散动作解码（`spaces.py` 的 JS 镜像）。
+ *
+ * <p>**必须与 `training/gladiator_env/spaces.py::encode_observation` 逐项一致**：
+ * 字段顺序、默认值、归一化尺度、clip 全部照抄。任何一侧改了观测定义，另一侧必须同步，
+ * 否则模型看到的输入和训练时不同（实测会导致策略直接失效）。
+ * 每个赋值后面标注了 spaces.py 的行号，便于逐行对照。
+ *
+ * <p>同时提供 `decodeAction()`：把 `ACTION_NAMES` 的离散动作编号翻译成协议动作列表，
+ * 逻辑与 `spaces.py::decode_action` 一致（含「够不到就先追一步」与「没目标就待机」）。
+ * 运行时需要它才能在本地闭环决策，而不依赖 Layer 3 下发动作。
+ */
+
+export const OBS_DIM = 23;
+export const NUM_ACTIONS = 11;
+
+/** 观测裁剪范围（spaces.py:46 OBS_CLIP）。 */
+export const OBS_CLIP = 5.0;
+
+/** 复合动作的移动时长（spaces.py:64 MOVE_MS）。 */
+export const MOVE_MS = 180;
+
+/** 观测距离与运行时 eyeDistance 的偏差余量（spaces.py:223 REACH_TOLERANCE）。 */
+export const REACH_TOLERANCE = 0.15;
+
+/** 与 `spaces.py:19 OBS_FIELDS` 完全同序。 */
+export const OBS_FIELDS_JS = Object.freeze([
+  'self_health',            // 0
+  'self_food',              // 1
+  'self_saturation',        // 2
+  'self_on_ground',         // 3
+  'self_yaw_sin',           // 4
+  'self_yaw_cos',           // 5
+  'self_pitch',             // 6
+  'target_dx',              // 7
+  'target_dy',              // 8
+  'target_dz',              // 9
+  'target_distance',        // 10
+  'target_health',          // 11
+  'target_on_ground',       // 12
+  'has_target',             // 13
+  'step_fraction',          // 14
+  'state_alive',            // 15
+  'self_held_durability',   // 16
+  'self_armor_remaining',   // 17
+  'self_gapples',           // 18
+  'opponent_speed',         // 19
+  'opponent_vertical_speed',// 20
+  'self_since_attack',      // 21
+  'in_reach',               // 22
+]);
+
+/** 动作名（spaces.py:49 ACTION_NAMES），下标即离散动作编号。 */
+export const ACTION_NAMES = Object.freeze([
+  'idle',
+  'approach',
+  'attack',
+  'strafe_left',
+  'strafe_right',
+  'retreat',
+  'jump',
+  'use_rod',
+  'eat_gapple',
+  'block',
+  'switch_sword',
+]);
+
+/** `spaces.py:71 _f`：非数字 / NaN / Inf 一律回落到默认值。 */
+function num(value, fallback = 0.0) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return parsed;
+}
+
+function clamp(value, low, high) {
+  if (value < low) {
+    return low;
+  }
+  return value > high ? high : value;
+}
+
+/**
+ * 找最近的其它玩家（spaces.py:81 nearest_player）。
+ *
+ * @param {object} observation 观测帧
+ * @param {string} username    自己
+ * @param {Iterable<string>|null} allowed 只接受名单内的玩家（大小写不敏感）
+ * @returns {object|null}
+ */
+export function nearestPlayer(observation, username, allowed = null) {
+  const allow = allowed ? new Set(Array.from(allowed, (name) => String(name).toLowerCase())) : null;
+  const self = String(username || '').toLowerCase();
+  let best = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const entity of (observation && observation.entities) || []) {
+    if (!entity || typeof entity !== 'object') {
+      continue;
+    }
+    if (entity.kind !== 'player') {
+      continue;
+    }
+    const name = String(entity.name ?? '');
+    if (name.toLowerCase() === self) {
+      continue;
+    }
+    if (allow && !allow.has(name.toLowerCase())) {
+      continue;
+    }
+    const distance = num(entity.distance, Number.POSITIVE_INFINITY);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = entity;
+    }
+  }
+  return best;
+}
+
+/**
+ * 从实体里读对手血量（协议实体列表不带血量，但 mineflayer 有时能从 metadata 拿到）。
+ *
+ * <p>返回 `null` 表示读不到，调用方应回落到 RCON `/gladiator stats`（块 B 提供）。
+ */
+export function entityHealth(entity) {
+  if (!entity) {
+    return null;
+  }
+  const direct = Number(entity.health);
+  if (Number.isFinite(direct)) {
+    return direct;
+  }
+  const meta = entity.metadata;
+  if (Array.isArray(meta)) {
+    // 1.8 里 LivingEntity 的血量在 metadata index 6（float）。
+    for (const entry of meta) {
+      if (!entry || typeof entry !== 'object') {
+        continue;
+      }
+      if ((entry.key === 6 || entry.key === 'health') && Number.isFinite(Number(entry.value))) {
+        return Number(entry.value);
+      }
+    }
+  } else if (meta && typeof meta === 'object') {
+    for (const key of ['6', 'health']) {
+      if (Number.isFinite(Number(meta[key]))) {
+        return Number(meta[key]);
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * 编码一帧观测为 23 维特征（`spaces.py:111 encode_observation`）。
+ *
+ * @param {object} observation `buildObservation()` 的输出
+ * @param {object} options
+ * @param {string} options.username       自己
+ * @param {number} [options.stepFraction] 当前步数 / 最大步数（spaces.py:114）
+ * @param {number|null} [options.opponentHealth] 对手血量（优先于实体字段，spaces.py:114）
+ * @param {Iterable<string>|null} [options.allowed] 只把这些玩家当目标
+ * @param {number} [options.reach]        自己的攻击距离（默认 3.99）
+ * @param {number} [options.sinceAttack]  距上次 attack 的秒数（默认 5）
+ * @returns {Float64Array} 长度 23
+ *
+ * <p>返回 float64（numpy 那边是 float32，逐项差 ≤1e-7，属 float32 舍入；
+ * 策略前向一律按 float64 算，所以对最终概率无可见影响）。
+ */
+export function encodeObservation(observation, {
+  username = '',
+  stepFraction = 0.0,
+  opponentHealth = null,
+  allowed = null,
+  reach = 3.99,
+  sinceAttack = 5.0,
+} = {}) {
+  const selfPayload = (observation && observation.self) || {};
+  const pos = selfPayload.pos || {};
+  const sx = num(pos.x);
+  const sy = num(pos.y);
+  const sz = num(pos.z);
+  const yaw = num(selfPayload.yaw);
+  const pitch = num(selfPayload.pitch);
+  const target = nearestPlayer(observation, username, allowed);
+  const state = String((observation && observation.state) ?? 'Alive');
+
+  const vector = new Float64Array(OBS_DIM);
+  vector[0] = num(selfPayload.health, 20.0) / 20.0;          // spaces.py:137
+  vector[1] = num(selfPayload.food, 20.0) / 20.0;            // spaces.py:138
+  vector[2] = num(selfPayload.saturation) / 5.0;             // spaces.py:139
+  vector[3] = selfPayload.onGround ? 1.0 : 0.0;              // spaces.py:140
+  vector[4] = Math.sin(yaw);                                 // spaces.py:141
+  vector[5] = Math.cos(yaw);                                 // spaces.py:142
+  vector[6] = clamp(pitch / (Math.PI / 2.0), -1.0, 1.0);     // spaces.py:143
+  vector[13] = 0.0;                                          // spaces.py:144
+  vector[14] = clamp(num(stepFraction), 0.0, 1.0);           // spaces.py:145
+  vector[15] = state === 'Alive' ? 1.0 : 0.0;                // spaces.py:146
+  const held = selfPayload.heldItem || {};
+  const heldDurability = (held.durability || {}).remaining;
+  vector[16] = clamp(num(heldDurability, 1.0), 0.0, 1.0);    // spaces.py:149
+  vector[17] = clamp(num(selfPayload.armorRemaining), 0.0, 1.0); // spaces.py:150
+  const inventory = selfPayload.inventory || [];
+  let gapples = 0;
+  for (const item of inventory) {
+    if (item && item.name === 'golden_apple') {
+      gapples += num(item.count);
+    }
+  }
+  vector[18] = clamp(gapples / 5.0, 0.0, 1.0);               // spaces.py:153
+  vector[21] = clamp(num(sinceAttack, 5.0), 0.0, 5.0) / 5.0; // spaces.py:156
+
+  if (target !== null) {
+    const tpos = target.pos || {};
+    const dx = num(tpos.x) - sx;                             // spaces.py:160
+    const dy = num(tpos.y) - sy;                             // spaces.py:161
+    const dz = num(tpos.z) - sz;                             // spaces.py:162
+    const horizontal = Math.sqrt(dx * dx + dz * dz);         // spaces.py:163
+    const distance = num(target.distance, Math.sqrt(dx * dx + dy * dy + dz * dz)); // spaces.py:164
+    vector[7] = dx / 16.0;                                   // spaces.py:165
+    vector[8] = dy / 8.0;                                    // spaces.py:166
+    vector[9] = dz / 16.0;                                   // spaces.py:167
+    vector[10] = distance / 32.0;                            // spaces.py:168
+    const health = opponentHealth !== null && opponentHealth !== undefined
+      ? num(opponentHealth)
+      : num(target.health, 20.0);                            // spaces.py:170
+    vector[11] = clamp(health / 20.0, 0.0, 1.0);             // spaces.py:169-173
+    vector[12] = target.onGround ? 1.0 : 0.0;                // spaces.py:174
+    vector[13] = 1.0;                                        // spaces.py:175
+    const velocity = target.velocity || {};
+    const vx = num(velocity.x);
+    const vy = num(velocity.y);
+    const vz = num(velocity.z);
+    vector[19] = clamp(Math.sqrt(vx * vx + vz * vz), 0.0, 10.0) / 10.0; // spaces.py:179
+    vector[20] = clamp(vy, -5.0, 5.0) / 5.0;                 // spaces.py:180
+    vector[22] = horizontal <= num(reach, 3.99) ? 1.0 : 0.0;  // spaces.py:183
+  }
+
+  for (let index = 0; index < OBS_DIM; index += 1) {
+    vector[index] = clamp(vector[index], -OBS_CLIP, OBS_CLIP); // spaces.py:185
+  }
+  return vector;
+}
+
+/** yaw 指向目标（spaces.py:195 `yaw_to_target`，YAW_FORMULA="neg"）。 */
+export function yawToTarget(dx, dz) {
+  return Math.atan2(-dx, -dz);
+}
+
+/** pitch 指向目标（spaces.py:202 `pitch_to_target`，mineflayer 正值向下）。 */
+export function pitchToTarget(dy, horizontal) {
+  if (horizontal < 1e-6) {
+    return 0.0;
+  }
+  return Math.atan2(-dy, horizontal);
+}
+
+/** 构造让 Bot 面朝目标的 `look` 动作（spaces.py:209 `look_at`）。 */
+export function lookAt(target, selfPos) {
+  const tpos = target.pos || {};
+  const dx = num(tpos.x) - num(selfPos.x);
+  const dy = num(tpos.y) + 1.4 - (num(selfPos.y) + 1.62);
+  const dz = num(tpos.z) - num(selfPos.z);
+  const horizontal = Math.sqrt(dx * dx + dz * dz);
+  return {
+    type: 'look',
+    params: { yaw: yawToTarget(dx, dz), pitch: pitchToTarget(dy, horizontal) },
+  };
+}
+
+const IDLE_ACTION = Object.freeze({ type: 'idle', params: { durationMs: MOVE_MS } });
+
+/**
+ * 离散动作 → 协议动作列表（spaces.py:226 `decode_action`）。
+ *
+ * @param {number} index 0..10
+ * @param {object} observation 与编码用的是同一帧
+ * @param {string} username 自己
+ * @param {object} [options] `{allowed, reach}`
+ * @returns {Array<{type:string, params:object}>}
+ */
+export function decodeAction(index, observation, username, { allowed = null, reach = 3.99 } = {}) {
+  const actionIndex = Number(index);
+  if (!Number.isInteger(actionIndex) || actionIndex < 0 || actionIndex >= NUM_ACTIONS) {
+    throw new Error(`动作编号越界: ${index}（合法范围 0..${NUM_ACTIONS - 1}）`);
+  }
+  const name = ACTION_NAMES[actionIndex];
+  const selfPayload = (observation && observation.self) || {};
+  const selfPos = selfPayload.pos || {};
+  const target = nearestPlayer(observation, username, allowed);
+  const distance = target ? num(target.distance, Number.POSITIVE_INFINITY) : Number.POSITIVE_INFINITY;
+
+  if (name === 'idle') {
+    return [{ type: 'idle', params: { durationMs: MOVE_MS } }];                    // spaces.py:246-247
+  }
+  if (name === 'jump') {
+    return [{ type: 'jump', params: {} }];                                         // spaces.py:248-249
+  }
+  if (name === 'eat_gapple') {
+    const health = num(selfPayload.health, 20.0);                                  // spaces.py:252
+    if (health >= 19.5) {
+      return [{ type: 'idle', params: { durationMs: MOVE_MS } }];
+    }
+    return [{ type: 'use', params: { item: 'gapple', holdMs: 1600 } }];            // spaces.py:255
+  }
+  if (name === 'block') {
+    return [{ type: 'use', params: { item: 'sword', holdMs: 300 } }];              // spaces.py:257
+  }
+  if (name === 'switch_sword') {
+    return [{ type: 'use', params: { item: 'sword', holdMs: 50 } }];               // spaces.py:259
+  }
+  if (target === null) {
+    return [{ type: 'idle', params: { durationMs: MOVE_MS } }];                    // spaces.py:261-263
+  }
+
+  const look = lookAt(target, selfPos);                                            // spaces.py:265
+  const effectiveReach = Math.max(0.0, num(reach, 3.99) - REACH_TOLERANCE);        // spaces.py:269
+  if (name === 'approach') {
+    const sprint = distance > 2.5;                                                 // spaces.py:272
+    const duration = distance <= 4.0 ? MOVE_MS : MOVE_MS * 2;                      // spaces.py:273
+    return [look, { type: 'move', params: { direction: 'forward', durationMs: duration, sprint } }];
+  }
+  if (name === 'retreat') {
+    return [look, { type: 'move', params: { direction: 'back', durationMs: MOVE_MS } }];
+  }
+  if (name === 'strafe_left') {
+    return [look, { type: 'move', params: { direction: 'left', durationMs: MOVE_MS } }];
+  }
+  if (name === 'strafe_right') {
+    return [look, { type: 'move', params: { direction: 'right', durationMs: MOVE_MS } }];
+  }
+  if (name === 'use_rod') {
+    if (distance > 6.0 || distance < 2.0) {                                        // spaces.py:284
+      return [look, { type: 'move', params: { direction: 'forward', durationMs: MOVE_MS, sprint: true } }];
+    }
+    return [look, { type: 'use', params: { item: 'rod' } }];                       // spaces.py:287
+  }
+  if (name === 'attack') {
+    const entityId = target.id;
+    if (entityId === undefined || entityId === null || distance > effectiveReach) { // spaces.py:290
+      return [look, {
+        type: 'move',
+        params: { direction: 'forward', durationMs: MOVE_MS, sprint: distance > 2.5 },
+      }];
+    }
+    return [look, { type: 'attack', params: { targetEntityId: Number(entityId) } }, look]; // spaces.py:296
+  }
+  throw new Error(`未处理的动作: ${name}`);
+}
+
+export { IDLE_ACTION };

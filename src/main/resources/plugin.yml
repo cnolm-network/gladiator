@@ -9,7 +9,7 @@ softdepend: [WorldGuard, Golem]
 commands:
   gladiator:
     description: Gladiator 管理命令
-    usage: /gladiator <status|spawn|train|list|game|analyze|pvp|spectate|unspectate|reload>
+    usage: /gladiator <status|spawn|train|list|game|analyze|pvp|stats|spectate|unspectate|reload>
     aliases: [gl]
     permission: gladiator.admin
 permissions:
