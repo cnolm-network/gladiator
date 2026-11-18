@@ -61,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mc-port", type=int, default=25566)
     parser.add_argument("--rcon", default="127.0.0.1:25575:devpass")
     parser.add_argument("--no-spawn", action="store_true")
+    parser.add_argument("--greedy", action="store_true", help="两边都用 argmax 动作（去掉随机性）")
     parser.add_argument("--out", default="artifacts/evals")
     return parser
 
@@ -99,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
             steps = 0
             final_info = info
             while not done and steps < args.max_steps:
-                action = policy.act(observation, rng)
+                action = policy.act(observation, rng, greedy=args.greedy)
                 observation, _reward, terminated, truncated, final_info = env.step(action)
                 done = bool(terminated or truncated)
                 steps += 1
