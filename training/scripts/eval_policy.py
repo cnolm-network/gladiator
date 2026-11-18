@@ -32,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--greedy", type=int, default=12, help="贪心评估局数")
     parser.add_argument("--max-steps", type=int, default=400, help="每局最多步数")
     parser.add_argument("--seed", type=int, default=303, help="随机种子")
+    parser.add_argument("--opponent-mode", default="scripted",
+                        help="对手模式：scripted/rusher/aimbot/random/wander/idle")
     parser.add_argument("--reward-preset", default=None, help="reward 预设 JSON（可选）")
     parser.add_argument("--rcon-port", type=int, default=25575, help="RCON 端口")
     parser.add_argument("--rcon-password", default="devpass", help="RCON 密码")
@@ -59,6 +61,7 @@ def main() -> int:
         max_steps=args.max_steps,
         auto_spawn=not args.no_spawn,
         rcon={"host": args.host, "port": args.rcon_port, "password": args.rcon_password},
+        opponent_mode=args.opponent_mode,
         reward_preset=preset,
     )
     try:
