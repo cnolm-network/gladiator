@@ -124,6 +124,120 @@ MAX_PLAN_ITEMS = 50
 MAX_TOTAL_EPISODES = 5000
 
 
+# ---------------------------------------------------------------------------
+# 软约束（运行时参数，不写进模型）
+# ---------------------------------------------------------------------------
+
+#: 布尔键别名（全部小写、去掉 ``-``/``_``）。与 bot-runtime/src/soft-constraints.js 同表。
+SOFT_BOOL_ALIASES = {
+    "rod": "allowRod",
+    "allowrod": "allowRod",
+    "userod": "allowRod",
+    "gapple": "allowGapple",
+    "apple": "allowGapple",
+    "goldenapple": "allowGapple",
+    "allowgapple": "allowGapple",
+    "block": "allowBlock",
+    "swordblock": "allowBlock",
+    "allowblock": "allowBlock",
+    "jump": "allowJumpCrit",
+    "jumpcrit": "allowJumpCrit",
+    "crit": "allowJumpCrit",
+    "allowjumpcrit": "allowJumpCrit",
+}
+#: 数值键：别名 → (字段名, 最小, 最大)
+SOFT_NUMBER_ALIASES = {
+    "cps": ("maxCps", 1, 40),
+    "maxcps": ("maxCps", 1, 40),
+    "reachoffset": ("minReachOffset", 0, 3),
+    "minreachoffset": ("minReachOffset", 0, 3),
+}
+SOFT_KEY_LABELS = {
+    "allowRod": "rod",
+    "allowGapple": "gapple",
+    "allowBlock": "block",
+    "allowJumpCrit": "jump",
+    "maxCps": "cps",
+    "minReachOffset": "reachOffset",
+}
+SOFT_TRUE_WORDS = {"1", "true", "yes", "on", "enable", "enabled"}
+SOFT_FALSE_WORDS = {"0", "false", "no", "off", "disable", "disabled"}
+MAX_SOFT_SPEC = 200
+
+
+def _soft_token(text: Any) -> str:
+    return re.sub(r"[-_\s]+", "", str(text or "").lower())
+
+
+def parse_soft_spec(value: Any, field: str = "软约束") -> str:
+    """校验 ``--soft`` 串并原样返回（供运行时透传）。
+
+    规则与 ``bot-runtime/src/soft-constraints.js::parseSoft`` 一致：逗号分隔，
+    ``name`` / ``noName`` / ``name=on|off`` 三种布尔写法，``cps=12``、``reachOffset=0.5``
+    两种数值写法；未知键与非法值都报 400（不静默忽略，否则用户会以为生效了）。
+    """
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        raise BadRequest(f"{field} 需要字符串（如 cps=12,noRod）")
+    text = value.strip()
+    if not text:
+        return ""
+    if len(text) > MAX_SOFT_SPEC:
+        raise BadRequest(f"{field} 太长（上限 {MAX_SOFT_SPEC} 字符）")
+    for chunk in text.split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        name, sep, raw_value = token.partition("=")
+        name = name.strip()
+        raw_value = raw_value.strip() if sep else None
+        normalized = _soft_token(name)
+        if not normalized:
+            raise BadRequest(f"{field} 里有空键（{token}）")
+
+        negated = False
+        key = SOFT_BOOL_ALIASES.get(normalized)
+        if key is None and normalized.startswith("no"):
+            base = normalized[2:]
+            if base in SOFT_BOOL_ALIASES:
+                key = SOFT_BOOL_ALIASES[base]
+                negated = True
+            elif base in SOFT_NUMBER_ALIASES:
+                label = SOFT_KEY_LABELS[SOFT_NUMBER_ALIASES[base][0]]
+                raise BadRequest(f"{name} 没有意义（{label} 是数值键，请用 {label}=值）")
+        if key is None and normalized in SOFT_NUMBER_ALIASES:
+            label, minimum, maximum = SOFT_NUMBER_ALIASES[normalized]
+            if negated:
+                raise BadRequest(f"{name} 没有意义（数值键请用 {SOFT_KEY_LABELS[label]}=值）")
+            if raw_value is None:
+                raise BadRequest(f"{SOFT_KEY_LABELS[label]} 需要值（例如 {SOFT_KEY_LABELS[label]}=12）")
+            try:
+                number = float(raw_value)
+            except ValueError as exc:
+                raise BadRequest(f"{SOFT_KEY_LABELS[label]} 的值 {raw_value} 不是数字") from exc
+            if not minimum <= number <= maximum:
+                raise BadRequest(f"{SOFT_KEY_LABELS[label]} 需要在 {minimum}..{maximum} 之间"
+                                 f"（收到 {raw_value}）")
+            continue
+        if key is None:
+            raise BadRequest(
+                f"未知软约束键: {name}（可用: rod, gapple, block, jump, cps, reachOffset；"
+                "取反写 noRod）")
+        label = SOFT_KEY_LABELS[key]
+        if negated and raw_value is not None:
+            raise BadRequest(f"{name} 不能同时带值（写成 {label}=off）")
+        if negated:
+            continue          # noRod 合法
+        if raw_value is None:
+            continue          # 裸写 rod = 打开
+        word = _soft_token(raw_value)
+        if word in SOFT_TRUE_WORDS or word in SOFT_FALSE_WORDS:
+            continue
+        raise BadRequest(f"{label} 的值 \"{raw_value}\" 不是布尔（on/off/true/false/1/0）")
+    return text
+
+
 def parse_plan(value: Any, *, fallback_mode: str = "scripted",
                fallback_episodes: int = 4) -> list[tuple[str, int]]:
     """把训练计划规范化为 ``[(opponentMode, episodes), ...]``。

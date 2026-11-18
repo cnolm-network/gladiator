@@ -2103,6 +2103,8 @@ function renderMatchHint(match) {
   const record = $("#match-record") && $("#match-record").checked;
   const train = $("#match-train-after") && $("#match-train-after").checked;
   const parts = [`模型 ${brain} 会在运行时里以 20Hz 自主决策`];
+  const softText = $("#match-soft") ? $("#match-soft").value.trim() : "";
+  if (softText) parts.push(`软约束 ${softText}（运行参数，不写进模型）`);
   parts.push(record ? "对局按 10Hz 录制到 training/artifacts/matches/" : "未开启录制");
   if (train) parts.push("结束后自动转数据集并做一轮 BC（写新 run，不覆盖模型）");
   if (match && match.running) parts.push(`当前阶段：${MATCH_PHASE_TEXT[match.phase] || match.phase}`);
@@ -2114,6 +2116,11 @@ function renderMatch() {
   if (!match) return;
   const phase = match.phase || "idle";
   const score = match.score || { player: 0, bot: 0, draws: 0 };
+  // 软约束是运行参数：刷新页面/重连后回显当前对局生效的值（用户正在改就不覆盖）。
+  const softInput = $("#match-soft");
+  if (softInput && !softInput.dataset.touched && document.activeElement !== softInput) {
+    softInput.value = match.soft || "";
+  }
   const totalRounds = Number(match.rounds) || 0;
   const currentRound = Number(match.round) || 0;
   const countdown = match.countdown;
@@ -3580,6 +3587,10 @@ function bindMatch() {
     const element = $(id);
     if (element) element.addEventListener("input", () => { element.dataset.touched = "1"; });
   });
+  const softElement = $("#match-soft");
+  if (softElement) {
+    softElement.addEventListener("input", () => { softElement.dataset.touched = "1"; });
+  }
   ["#match-brain", "#match-record", "#match-train-after"].forEach((id) => {
     const element = $(id);
     if (element) element.addEventListener("change", () => renderMatchHint(state.match));
@@ -3614,6 +3625,8 @@ function bindMatch() {
       roundSeconds: Number($("#match-round-seconds").value),
       kit: $("#match-kit").value,
       brain,
+      // 运行时参数（不写进模型）：留空 = 全部招式允许。
+      soft: $("#match-soft").value.trim(),
       record: $("#match-record").checked,
       trainAfter: $("#match-train-after").checked,
       spawns,

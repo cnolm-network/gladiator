@@ -12,12 +12,12 @@ from __future__ import annotations
 import argparse
 import statistics
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gladiator_env import ArenaConfig, BotConfig, GladiatorEnv  # noqa: E402
+from gladiator_train.eval_suite import reset_with_retry, rollout  # noqa: E402
 from gladiator_train.policy import Policy  # noqa: E402
 
 
@@ -70,27 +70,15 @@ def main() -> int:
             count = args.episodes if label == "采样" else args.greedy
             rows = []
             for _ in range(count):
-                prepared = False
-                for attempt in range(4):
-                    try:
-                        obs, _info = env.reset(seed=args.seed + attempt)
-                        prepared = True
-                        break
-                    except TimeoutError:
-                        print(f"[eval] reset 第 {attempt + 1} 次超时，等 3s 重试")
-                        time.sleep(3)
-                if not prepared:
-                    raise SystemExit("Bot 始终未就绪：检查通道 B 与 spawn")
-                done = False
-                total = 0.0
-                steps = 0
-                while not done and steps < args.max_steps:
-                    action = policy.act(obs, rng, greedy=greedy)
-                    obs, reward, terminated, truncated, _info = env.step(action)
-                    total += float(reward)
-                    steps += 1
-                    done = bool(terminated or truncated)
-                rows.append((steps, total, bool(terminated)))
+                # 坑（与 eval_suite 共用同一份实现）：Bot 未就绪时 reset 会超时，
+                # 重试要用新的 seed，否则同一局的地图抖动会重复。
+                try:
+                    obs, _info = reset_with_retry(env, args.seed, logger=print)
+                except RuntimeError as exc:
+                    raise SystemExit(str(exc)) from exc
+                result = rollout(env, policy, obs, max_steps=args.max_steps,
+                                 rng=rng, greedy=greedy)
+                rows.append((result["steps"], result["reward"], result["terminated"]))
             wins = sum(1 for _s, _r, term in rows if term)
             print(
                 f"[eval/{label}] {wins}/{count} 胜, mean reward {statistics.mean(r[1] for r in rows):.2f}, "

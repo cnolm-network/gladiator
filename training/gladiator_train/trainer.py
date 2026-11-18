@@ -12,7 +12,7 @@ import json
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -304,22 +304,56 @@ class Trainer:
 
     # ------------------------------------------------------------------- ppo
     def ppo_update(self, result: EpisodeResult) -> Dict[str, Any]:
-        """整回合采样 → GAE → 优势标准化 → ``epochs`` 轮裁剪更新。
+        """单个回合的 PPO 更新（老路径，语义不变）。
 
-        返回该回合最后一次更新后的统计量（policyLoss/valueLoss/entropy/approxKL/clipFraction），
-        写进 history，便于判断「策略还在学」还是「被 clip 卡死」。
+        多场地并行采样请用 :meth:`ppo_update_many`；单条轨迹走同一个实现，
+        避免出现两套 GAE/归一化口径。
         """
-        observations = result.observations
-        actions = result.actions
+        return self.ppo_update_many([result])
+
+    def ppo_update_many(self, results: Sequence[EpisodeResult],
+                        seed: Optional[int] = None) -> Dict[str, Any]:
+        """多个**独立轨迹**的 PPO 更新：逐条算 GAE，拼成一个大 batch 只做一组更新。
+
+        关键点（VecEnv 正确性的核心）：
+
+        - 每条轨迹**单独** bootstrap（末步 ``done=1``），绝不把不同场地的 reward 拼成一条
+          ——那会让 A 场的 ``V(s_{t+1})`` 串到 B 场；
+        - ``returns`` 用同一份 running stats 归一化（跨轨迹统计更稳），优势在整批上
+          ``normalize_advantages``（PPO 标准做法）；
+        - ``epochs`` / ``minibatch`` / lr 调度 / 熵控制器全部沿用实例配置；
+        - ``seed`` 只影响 minibatch 洗牌（``None`` = 旧行为：按 history 长度取种子）。
+        """
+        observations: List[np.ndarray] = []
+        actions: List[int] = []
+        old_logp_parts: List[np.ndarray] = []
+        values_parts: List[np.ndarray] = []
+        advantage_parts: List[np.ndarray] = []
+        return_parts: List[np.ndarray] = []
+        for result in results or []:
+            if not result.observations:
+                continue
+            old_logp, _, values = self.policy.evaluate_actions(result.observations, result.actions)
+            rewards = list(result.rewards)
+            dones = [0.0] * len(rewards)
+            if dones:
+                # 回合已结束（terminated/truncated 都按终止处理）：末步 bootstrap=0。
+                dones[-1] = 1.0
+            advantages, returns = gae(rewards, list(values), dones,
+                                      gamma=self.gamma, lam=self.gae_lambda)
+            observations.extend(result.observations)
+            actions.extend(result.actions)
+            old_logp_parts.append(np.asarray(old_logp, dtype=np.float64))
+            values_parts.append(np.asarray(values, dtype=np.float64))
+            advantage_parts.append(advantages)
+            return_parts.append(returns)
         if not observations:
             return {}
-        old_logp, _, values = self.policy.evaluate_actions(observations, actions)
-        dones = [0.0] * len(result.rewards)
-        if dones:
-            # 回合已结束（terminated/truncated 都按终止处理）：末步 bootstrap=0。
-            dones[-1] = 1.0
-        advantages, returns = gae(result.rewards, list(values), dones,
-                                  gamma=self.gamma, lam=self.gae_lambda)
+        old_logp = np.concatenate(old_logp_parts)
+        values = np.concatenate(values_parts)
+        advantages = np.concatenate(advantage_parts)
+        returns = np.concatenate(return_parts)
+
         # P2：价值目标与优势都做 running 归一化；原始 reward 仍原样进 report。
         if self.normalize_returns:
             self._ret_stats.update(returns)
@@ -336,7 +370,7 @@ class Trainer:
         batch_size = total if self.minibatch <= 0 else min(int(self.minibatch), total)
         stats: Dict[str, float] = {}
         early_stopped = False
-        rng = np.random.default_rng(len(self.history) + 1)
+        rng = np.random.default_rng(len(self.history) + 1 if seed is None else int(seed))
 
         for _epoch in range(self.epochs):
             order = rng.permutation(total) if batch_size < total else np.arange(total)

@@ -226,6 +226,18 @@ export class EnvLinkServer {
     }
   }
 
+  /**
+   * 把通道 A 的 STATE 迁移转给训练侧（协议 §2.4 的同一份语义）。
+   *
+   * <p>观测是按 controlHz 轮询的，1.8 的「死→自动重生」只有 2 tick，训练侧 5Hz 采样
+   * 经常整个跳过：回合不结束、对手裸奔。STATE 是事件，不会漏。
+   */
+  broadcastState(payload) {
+    for (const client of this.clients.values()) {
+      this.send(client, 'STATE', payload, null);
+    }
+  }
+
   send(client, type, payload, replyTo = null) {
     if (!client.socket || client.socket.readyState !== 1) {
       return false;

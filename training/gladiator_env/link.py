@@ -48,6 +48,7 @@ class LinkClient:
         self._observation: dict | None = None
         self._results: dict[int, dict] = {}
         self._idle_events: list[dict] = []
+        self._state_events: list[dict] = []
         self._cond = threading.Condition()
 
     # --- 生命周期 -------------------------------------------------------
@@ -129,6 +130,13 @@ class LinkClient:
                 # G-405：空闲信号只做记录，训练循环不会因此发起任何外部查询。
                 self._idle_events.append(payload)
                 del self._idle_events[:-32]
+            elif kind == "STATE":
+                # 协议 §2.4：服务端状态迁移（Alive/Dead/Respawning/…）。
+                # 训练侧必须靠它判死：观测是 5Hz 采样，1.8 的「死→自动重生」
+                # 只有 2 tick，采样经常整个跳过去（真机实测对手因此反复裸奔、
+                # 回合也不结束）。
+                self._state_events.append(payload)
+                del self._state_events[:-32]
             # PONG / 其他帧当前不参与训练循环
 
     def stop(self) -> None:
@@ -184,6 +192,13 @@ class LinkClient:
         with self._cond:
             events = list(self._idle_events)
             self._idle_events.clear()
+            return events
+
+    def state_events(self) -> list[dict]:
+        """取走当前累积的 STATE 迁移（协议 §2.4：Alive/Dead/Respawning/…）。"""
+        with self._cond:
+            events = list(self._state_events)
+            self._state_events.clear()
             return events
 
     def control_hz(self) -> float:

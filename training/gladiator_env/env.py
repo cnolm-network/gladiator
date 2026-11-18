@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass, replace, field
 from typing import Any, Callable
@@ -72,6 +73,30 @@ _RESTOCK_MAX_ROUNDS = 3
 _RESTOCK_CHECK_EVERY = 10
 #: 这些运行时失败码说明「手上有动作但没东西」，直接当作补装触发源。
 _RESTOCK_TRIGGER_CODES = frozenset({"ITEM_MISSING", "ITEM_NOT_FOUND", "NO_ITEM"})
+
+
+def _coerce_opponent_policy(value: Any, *, obs_dim: int = OBS_DIM) -> tuple[Any | None, str]:
+    """把 ``opponent_policy`` 归一成 ``(策略对象, 来源描述)``。
+
+    接受 ``None`` / ``Policy`` 之类的对象（只要有 ``act``）/ ``.npz`` 路径（``str`` 或
+    ``PathLike``，用 ``Policy.load`` 读，并把旧模型的 ``W1`` 右侧补零到当前 ``obs_dim``）。
+    """
+    if value is None:
+        return None, "hand-written"
+    if isinstance(value, (str, bytes)) or hasattr(value, "__fspath__"):
+        # 延迟导入：``gladiator_env`` 不应该在 import 期就依赖训练侧模块。
+        from gladiator_train.policy import Policy  # noqa: WPS433 - 见上
+
+        path = os.fspath(value)
+        if isinstance(path, bytes):
+            path = path.decode("utf-8")
+        policy = Policy.load(str(path), obs_dim=int(obs_dim))
+        return policy, str(path)
+    if callable(getattr(value, "act", None)):
+        return value, "memory"
+    raise ValueError(
+        f"opponent_policy 需要 Policy 对象或 .npz 路径，收到 {type(value).__name__}"
+    )
 
 
 def loadout_report(observation: dict | None) -> dict:
@@ -240,6 +265,8 @@ class GladiatorEnv(gym.Env):
         idle_threshold: float = 5.0,
         wait_action_results: bool = False,
         opponent_mode: str = "random",
+        opponent_policy: Any | None = None,
+        opponent_epsilon: float = 0.0,
         reward_mode: str = "shaped",
         shaping_weights: ShapingWeights | None = None,
         reward_preset: dict | None = None,
@@ -279,6 +306,31 @@ class GladiatorEnv(gym.Env):
         self.opponent_mode = str(opponent_mode)
         if self.opponent_mode not in ("random", "wander", "idle", "scripted", "rusher", "aimbot"):
             raise ValueError(f"未知 opponent_mode: {opponent_mode}")
+        # 自博弈：对手由**策略**驱动（传 Policy 或 .npz 路径）。非 None 时忽略 opponent_mode
+        # 的手写控制器（含起手延迟/出手间隔这些「手写补偿」），完全由策略决定动作。
+        self.opponent_policy, self.opponent_policy_source = _coerce_opponent_policy(
+            opponent_policy, obs_dim=OBS_DIM)
+        if self.opponent_policy is not None and not self.single_agent:
+            # 多智能体模式下动作表由调用方提供（环境不替对手决策），给 opponent_policy
+            # 只会「看起来配了但完全不生效」——直接报错，别让它静默失效。
+            raise ValueError("opponent_policy 只支持 single_agent=True"
+                             "（多智能体时所有动作由调用方传入）")
+        self.opponent_epsilon = float(opponent_epsilon or 0.0)
+        if not 0.0 <= self.opponent_epsilon <= 1.0:
+            raise ValueError(f"opponent_epsilon 必须在 [0, 1]，收到 {opponent_epsilon}")
+        #: 对手（策略驱动）最近一次真下发 attack 的时刻，观测 self_since_attack 用。
+        self._opponent_last_attack_at: dict[str, float] = {}
+        #: 对手策略的运行统计（累计，不随 reset 清零）：决策数/随机探索数/动作失败数。
+        self.opponent_policy_stats: dict[str, Any] = {
+            "decisions": 0,
+            "epsilonPicks": 0,
+            "emptyObservations": 0,
+            "invalidActions": 0,
+            "errors": 0,
+            "actionFailures": {},
+            "lastAction": None,
+            "lastGreedy": None,
+        }
         self.reward_mode = str(reward_mode)
         if self.reward_mode not in ("default", "shaped"):
             raise ValueError(f"未知 reward_mode: {reward_mode}")
@@ -385,6 +437,7 @@ class GladiatorEnv(gym.Env):
         self._restock_tick.clear()
         self._restock_rounds.clear()
         self._last_attack_at.clear()
+        self._opponent_last_attack_at.clear()
         self._ensure_connected()
 
         if self._rcon is not None and not self._rcon.is_connected():
@@ -428,27 +481,43 @@ class GladiatorEnv(gym.Env):
             raw = self._raw[i] if i < len(self._raw) else {}
             # 代码驱动的对手比学习方多留 0.75 格余量：它没有「奖励」纠偏，而观测到出手之间
             # 有 1 个 tick 的延迟（约 5 格/s × 0.2s ≈ 1.1 格），加上击退会让边界攻击吃 OUT_OF_REACH。
-            reach = float(bot.reach) if i == 0 else self._opponent_reach(i, float(bot.reach))
+            # 策略驱动的对手不扣这个余量：它的观测里 reach 就是 bot.reach（见 _policy_opponent_action），
+            # 编码与解码必须同一个 reach，否则 in_reach=1 的动作会被解码成「先靠近」。
+            if i == 0 or self.opponent_policy is not None:
+                reach = float(bot.reach)
+            else:
+                reach = self._opponent_reach(i, float(bot.reach))
             actions = decode_action(index, raw, bot.username, opponents, reach=reach)
             if i != 0 and self._respawn_grace.get(bot.username, 0) > 0:
                 # 刚重生（可能被传送到出生点）：本 tick 只做观察，避免对旧坐标出手。
                 self._respawn_grace[bot.username] -= 1
                 self._clear_opponent_hold(bot.username)
                 actions = [{"type": "idle", "params": {"durationMs": MOVE_MS}}]
-            elif i != 0:
+            elif i != 0 and self.opponent_policy is None:
                 # 对手「出手前先确认」：观测与出手之间隔着一个 tick（≈1.1 格位移）+ 击退，
                 # 直接出拳会在边界吃 OUT_OF_REACH。这里把第一次判到的 attack 换成贴近，
                 # 下一 tick 用新观测复核距离，仍在射程内才真的挥。
+                # 策略驱动的对手不走这一步：它是手写控制器的补偿，不是协议要求。
                 actions = self._confirm_opponent_attack(bot, actions)
             if self._restock_pending.get(bot.username, 0) > 0:
                 # 重生补装确认中：背包可能还没同步，进攻动作直接不发
                 # （否则运行时回 ITEM_MISSING，日志刷屏且这一 tick 白费）。
-                actions = self._strip_combat_actions(actions)
+                if i != 0:
+                    # 代码驱动的对手没有「策略动作」需要保护：整条动作换成穿甲/切剑。
+                    # 只剥进攻动作时，`_send_use` 的补发会和本 tick 的对手动作撞车，
+                    # 运行时常常只执行后者 → 护甲一直 0/4（真机 2026-11-19 01:0x 实测：
+                    # 4 个 B 侧 Bot 全裸，A 侧全有甲，且每 tick 补发把 steps/s 打到 1.8）。
+                    actions = self._equip_actions()
+                else:
+                    actions = self._strip_combat_actions(actions)
             if any(action.get("type") == "attack" for action in actions):
                 # 只要真的下发了 attack 就记时（含运行时把它改成追击的情况）。
                 # 必须在下发时记，而不是算奖励时：观测在这一 tick 末尾生成，
                 # 策略要能看到「我刚挥过一刀」（冷却/连击节奏靠这个）。
                 self._last_attack_at[bot.username] = time.monotonic()
+                if i != 0 and self.opponent_policy is not None:
+                    # 对手自己的「距上次攻击」是它观测的一维，单独维护（与学习方对称）。
+                    self._opponent_last_attack_at[bot.username] = time.monotonic()
             dispatch.append(actions)
             self._last_dispatch[bot.username] = list(actions)
             self._handle_action_results(i, self._safe_send(i, actions))
@@ -458,6 +527,10 @@ class GladiatorEnv(gym.Env):
             self._drain_results()
         previous = self._raw
         self._raw = self._refresh_raw(previous)
+        # A2：观测是 5Hz 采样，1.8 的「死→自动重生」只有 2 tick，采样常常整个跳过：
+        # 回合不结束、对手裸奔、补装窗口每 tick 发 give 把 steps/s 打到 1.8。
+        # STATE 帧（协议 §2.4）是事件推送、不会漏，这里用它把「刚死的」写回观测。
+        deaths = self._apply_state_deaths()
         # A2：重生补装确认（必须在观测刷新之后、算奖励之前，让策略看到补齐后的状态）。
         self._confirm_restock()
         # 兜底体检：局内「死→活」可能整个被刷新跳过（is_out 看不到），这里只看现状。
@@ -535,6 +608,19 @@ class GladiatorEnv(gym.Env):
     def raw_observations(self) -> list[dict]:
         """最近一次 step 的原始观测（复盘用）。"""
         return list(self._raw)
+
+    @property
+    def opponent_mode_label(self) -> str:
+        """报告/统计用的对手标签：策略驱动时是 ``policy:<快照名>``。
+
+        ``opponent_mode`` 本身不动（它描述的是**手写**控制器的模式，策略驱动的对手
+        根本不看它）；只是别让报告把自博弈的对局误记成 "scripted"。
+        """
+        if self.opponent_policy is not None:
+            source = self.opponent_policy_source or "memory"
+            name = os.path.basename(source) if source != "memory" else "memory"
+            return f"policy:{name}"
+        return self.opponent_mode
 
     def last_events(self) -> dict[str, list[dict]]:
         """最近一次 step 的塑形事件（hit/whiff/combo/kill/death）。"""
@@ -678,6 +764,9 @@ class GladiatorEnv(gym.Env):
 
     def _opponent_action(self, index: int) -> int:
         """非受控 Bot 的动作：课程学习的不同难度。"""
+        if self.opponent_policy is not None and index != 0:
+            # 自博弈：对手也走策略（不看 opponent_mode，也没有起手延迟/出手间隔）。
+            return self._policy_opponent_action(index)
         username = self.bots[index].username if 0 <= index < len(self.bots) else ""
         if not self._opponent_ready(index):
             # 起手延迟：只观察，不动也不打。
@@ -707,6 +796,63 @@ class GladiatorEnv(gym.Env):
                 return 2
             return 6
         return int(self.np_random.integers(NUM_ACTIONS))
+
+    def _policy_opponent_action(self, index: int) -> int:
+        """策略驱动的对手动作（自博弈）。
+
+        观测来源：``self._raw[index]`` —— 就是该 Bot 通道 B 上最近一帧 OBSERVATION
+        （``_refresh_raw`` 用 ``link.wait_observation`` 取回、与学习方 ``_encode_all``
+        用的是同一份数据），不需要另开协议。
+
+        编码口径与学习方完全一致（同一个 ``encode_observation``）：把**对手自己**当
+        ``username``、``opponent_health`` 取学习方血量、``reach`` 用对手自己的、
+        ``since_attack`` 用 ``_opponent_last_attack_at``。返回离散动作编号，
+        decode + 发送沿用 ``step()`` 里与学习方相同的那条路径。
+
+        ``opponent_epsilon``：以该概率把动作**换成随机动作**（``act`` 仍会被调用一次，
+        统计里能对上步数，也便于观察策略到底想干什么）。
+        """
+        bot = self.bots[index]
+        stats = self.opponent_policy_stats
+        raw = self._raw[index] if index < len(self._raw) else {}
+        if not raw:
+            # 还没收到该 Bot 的观测帧：这一 tick 只能 idle（不去猜坐标）。
+            stats["emptyObservations"] += 1
+            return 0
+        target = self._opponent_index(index)
+        opponent_health = (self_health(self._raw[target])
+                           if target is not None and target < len(self._raw) else None)
+        last_attack = self._opponent_last_attack_at.get(bot.username)
+        since_attack = 5.0 if last_attack is None else max(0.0, time.monotonic() - last_attack)
+        fraction = self._steps / float(self.max_steps) if self.max_steps else 0.0
+        vector = encode_observation(
+            raw,
+            bot.username,
+            step_fraction=fraction,
+            opponent_health=opponent_health,
+            opponents=self._opponent_names(),
+            reach=float(bot.reach),
+            since_attack=since_attack,
+        )
+        explore = float(self.np_random.random()) < self.opponent_epsilon
+        try:
+            action = int(self.opponent_policy.act(vector, self.np_random, greedy=not explore))
+        except Exception as exc:  # noqa: BLE001 - 坏快照不该打断整局采样
+            stats["errors"] += 1
+            if stats["errors"] == 1:
+                self._log(f"{bot.username}: 对手策略异常（后续只计数）: "
+                          f"{type(exc).__name__}: {exc}")
+            action = 0
+        stats["decisions"] += 1
+        if explore:
+            action = int(self.np_random.integers(NUM_ACTIONS))
+            stats["epsilonPicks"] += 1
+        if not 0 <= int(action) < NUM_ACTIONS:
+            stats["invalidActions"] += 1
+            action = 0
+        stats["lastAction"] = int(action)
+        stats["lastGreedy"] = not explore
+        return int(action)
 
     @staticmethod
     def _key(index: int) -> str:
@@ -852,6 +998,19 @@ class GladiatorEnv(gym.Env):
 
     def _select_sword(self, index: int) -> None:
         self._send_use(index, {"item": "sword", "select": True})
+
+    @staticmethod
+    def _equip_actions() -> list[dict]:
+        """「先把装备穿好」的一条动作：穿甲 → 切剑 → 站住。
+
+        用于补装窗口里**代码驱动的对手**：它们没有策略动作，直接把整条动作换成
+        装备动作，避免 ``_send_use`` 另发的一条 ``use`` 与本 tick 的对手动作互相挤掉。
+        """
+        return [
+            {"type": "use", "params": {"item": "armor"}},
+            {"type": "use", "params": {"item": "sword", "select": True}},
+            {"type": "idle", "params": {"durationMs": MOVE_MS}},
+        ]
 
     def _ensure_loadout(self, index: int, bot: BotConfig, attempts: int = 3) -> None:
         """校验并补齐套装，最后把主手固定在剑上。
@@ -1035,7 +1194,10 @@ class GladiatorEnv(gym.Env):
                 suffix = f"，第 {rounds + 1} 轮" if rounds else ""
                 self._log(f"[restock] {bot.username} 已补齐（第 {tick} tick{suffix}）")
                 continue
-            self._give_missing(index, bot, report)
+            # 隔 tick 才补发一次：给/穿都是 RCON 或动作往返，每 tick 都发会把
+            # 4 场地的 steps/s 打到 1.8（真机 2026-11-19 01:0x 实测）。
+            if tick % 2 == 1:
+                self._give_missing(index, bot, report)
             if bot.username not in self._restock_logged:
                 self._restock_logged.add(bot.username)
                 self._log(
@@ -1346,6 +1508,48 @@ class GladiatorEnv(gym.Env):
                     return other
         return None
 
+    def _apply_state_deaths(self) -> set[str]:
+        """把 STATE 帧里的「刚死」补回 ``self._raw``，返回本次补上的用户名集合。
+
+        1.8 的死亡→自动重生只有 2 tick（≈100ms），而观测刷新是 5Hz，采样几乎必然
+        跨过去。漏掉的后果不只是「回合不结束」：对手会带着 0 护甲反复重生、补装窗口
+        每 tick 发 ``give``，把 4 场地的 steps/s 从 6+ 打到 1.8。
+        """
+        deaths: set[str] = set()
+        for index, link in enumerate(self.links):
+            getter = getattr(link, "state_events", None)
+            if getter is None:
+                continue
+            try:
+                events = getter()
+            except Exception:  # noqa: BLE001 - 观测线程上的异常不应打断训练
+                continue
+            for event in events:
+                if str(event.get("state")) != "Dead":
+                    continue
+                if str(event.get("previous")) == "Dead":
+                    continue
+                if index >= len(self.bots) or index >= len(self._raw):
+                    continue
+                raw = dict(self._raw[index] or {})
+                if is_out(raw):
+                    continue  # 采样已经看到了，不必改写
+                # 观测结构是 {"self": {"health": ...}, "state": ...}；只改 state 不够，
+                # 奖励/胜负判据看的是 self.health。
+                inner = dict(raw.get("self") or {})
+                inner["health"] = 0.0
+                raw["self"] = inner
+                raw["state"] = "Dead"
+                self._raw[index] = raw
+                username = self.bots[index].username
+                deaths.add(username)
+                # 本局已结束；下一局的补装窗口照旧（重生后第一 tick 就要穿甲）。
+                self._restock_pending[username] = max(
+                    self._restock_pending.get(username, 0), _RESTOCK_TICKS)
+                self._respawn_grace[username] = max(
+                    self._respawn_grace.get(username, 0), _RESTOCK_TICKS)
+        return deaths
+
     def _winner(self) -> str | None:
         for i, bot in enumerate(self.bots):
             if not is_out(self._raw[i]):
@@ -1393,10 +1597,16 @@ class GladiatorEnv(gym.Env):
         if not results:
             return
         user = self.bots[index].username if 0 <= index < len(self.bots) else "?"
+        policy_opponent = index != 0 and self.opponent_policy is not None
         for result in results:
             if not result or result.get("ok") is not False:
                 continue
             code = str(result.get("code") or "")
             self._log(f"{user}: 动作失败 code={code} {result.get('reason', '')}")
+            if policy_opponent:
+                # 对手自己的失误只计数：它不该影响学习方的 reward，也不该静默消失
+                # （自博弈里 OUT_OF_REACH/ITEM_MISSING 的比例是判断快照是否可用的信号）。
+                failures = self.opponent_policy_stats["actionFailures"]
+                failures[code] = int(failures.get(code, 0)) + 1
             if code in _RESTOCK_TRIGGER_CODES:
                 self._request_restock(index, reason=f"code={code}")

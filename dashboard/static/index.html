@@ -290,9 +290,13 @@
           <label class="field inline"><span>Brain 模型</span>
             <select id="match-brain"><option value="">（不使用：Bot 站立）</option></select>
           </label>
+          <label class="field inline"><span>软约束</span>
+            <input id="match-soft" placeholder="如 cps=12,noRod" size="18">
+          </label>
           <label class="field inline"><span>录制</span><input id="match-record" type="checkbox" checked></label>
           <label class="field inline"><span>赛后导入训练</span><input id="match-train-after" type="checkbox"></label>
         </form>
+        <p class="muted small">软约束是<b>运行参数</b>（不写进模型）：<code>noRod</code>/<code>noGapple</code>/<code>noBlock</code>/<code>noJump</code> 禁用对应招式，<code>cps=12</code> 限每秒点击，<code>reachOffset=0.5</code> 预留攻击距离；留空 = 全开。</p>
         <form class="inline-form" id="match-spawn-form" autocomplete="off">
           <span class="muted small">出生点（留空 = 双方原地开局）</span>
           <label class="field inline"><span>玩家 x</span><input id="match-spawn-player-x" type="number" step="0.5"></label>

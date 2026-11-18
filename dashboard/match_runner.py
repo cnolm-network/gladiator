@@ -32,7 +32,8 @@ from ports import is_port_free, is_port_open
 from rcon_client import RconClient, RconError, run_command, strip_formatting
 from runtime_manager import RuntimeManager
 from server_manager import ServerManager
-from validation import parse_bool, parse_center, parse_int, validate_username
+from validation import (parse_bool, parse_center, parse_int, parse_soft_spec,
+                        validate_username)
 
 _RE_LIST_BOT = re.compile(r"^\s*-\s+\S+\s+name=(\S+).*?ready=(true|false)", re.MULTILINE)
 
@@ -388,6 +389,9 @@ class MatchPlan:
     brain_path: Optional[str] = None
     #: 强制重生后等多久再传送（毫秒）：等待客户端完成重生、实体重新进入世界。
     respawn_delay_ms: int = 800
+    #: 软约束串（运行时参数，默认 "" = 全开）：``cps=12,noRod``。
+    #: 只透传给 bot-runtime 的 ``--soft``，**不写进模型 / 模型清单**。
+    soft: str = ""
 
     @classmethod
     def from_payload(cls, payload: dict, cfg: DashboardConfig) -> "MatchPlan":
@@ -415,10 +419,12 @@ class MatchPlan:
         train_after = parse_bool(payload.get("trainAfter", False), "trainAfter")
         respawn_delay_ms = parse_int(payload.get("respawnDelayMs", 800), "重生等待（毫秒）",
                                      minimum=0, maximum=5000)
+        # 软约束是运行参数：语法错就在这里 400，别等拉起运行时才炸。
+        soft = parse_soft_spec(payload.get("soft", ""), "软约束（soft）")
         return cls(mode=mode, bot=bot, env_port=env_port, player=player,
                    rounds=rounds, round_seconds=float(round_seconds), kit=kit,
                    spawns=spawns, brain=brain, record=record, train_after=train_after,
-                   respawn_delay_ms=respawn_delay_ms)
+                   respawn_delay_ms=respawn_delay_ms, soft=soft)
 
     def to_dict(self) -> dict:
         return {
@@ -434,6 +440,7 @@ class MatchPlan:
             "record": self.record,
             "trainAfter": self.train_after,
             "respawnDelayMs": self.respawn_delay_ms,
+            "soft": self.soft,
         }
 
 
@@ -580,6 +587,8 @@ class MatchRunner:
             "onlineMode": "offline",
             "mcRunning": is_port_open(self.cfg.mc_host, self.cfg.mc_port),
             "rconReachable": is_port_open(self.cfg.rcon_host, self.cfg.rcon_port),
+            # 空闲时也给出 soft 字段，前端不用区分「没有这个键」与「空串」。
+            "soft": "",
             "commands": {
                 "join": f"{self.cfg.mc_host}:{self.cfg.mc_port}",
                 "spectate": "/gladiator spectate <bot>",
@@ -804,7 +813,7 @@ class MatchRunner:
     def _brain_argv(self, plan: MatchPlan) -> list[str]:
         if not plan.brain_path:
             return []
-        return [
+        argv = [
             "--brain", plan.brain_path,
             "--models-dir", str((self.cfg.var_dir / "models").resolve()),
             # 20Hz 与 BC/训练的控制步长对齐；5Hz 时出手频率只有 1/4（真机 2026-11-18 实测）。
@@ -812,6 +821,10 @@ class MatchRunner:
             "--rcon", f"{self.cfg.rcon_host}:{self.cfg.rcon_port}:{self.cfg.rcon_password}",
             "--target-player", plan.player,
         ]
+        if plan.soft:
+            # 运行参数：只决定「这一个进程怎么用这个模型」，模型文件一字不动。
+            argv.extend(["--soft", plan.soft])
+        return argv
 
     def _wait_listening(self, env_port: int, timeout: float = 20.0) -> None:
         deadline = self._clock() + timeout

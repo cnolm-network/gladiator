@@ -28,6 +28,12 @@ import { buildObservation } from './observation.js';
 import { loadPolicy, resolvePolicyFile } from './policy.js';
 import { RconClient, parseRconSpec, parseStatsLine } from './rcon.js';
 import { ActionScheduler } from './scheduler.js';
+import {
+  applySoftActions,
+  describeSoft,
+  parseSoft,
+  softDropReason,
+} from './soft-constraints.js';
 import { equipArmor } from './items.js';
 import { Navigator } from './navigation.js';
 import { RestrictionCache } from './restriction-cache.js';
@@ -73,11 +79,41 @@ const attackCooldownMs = Math.max(
     : DEFAULT_ATTACK_COOLDOWN_MS),
 );
 const targetPlayerArg = String(arg('target-player', '') || '').trim();
+// --- 软约束（运行参数，**不写进模型**）----------------------------------------
+// 只影响「本进程怎么用这个模型」：同一份 .npz 在演示/评测/对战时可以开不同约束。
+// 任何情况下都不要把它写进 policy.npz 或 model.json —— 那是运行期选择，不是模型事实。
+const softSpec = String(arg('soft', process.env.GLADIATOR_SOFT ?? '') || '').trim();
+const softParsed = parseSoft(softSpec);
+if (!softParsed.ok) {
+  console.error(`[soft] ${softParsed.error}`);
+  process.exit(1);
+}
+let soft = softParsed.soft;
+const softMaxCpsArg = String(arg('soft-max-cps', '') || '').trim();
+if (softMaxCpsArg) {
+  const value = Number(softMaxCpsArg);
+  if (!Number.isFinite(value) || value < 1 || value > 40) {
+    console.error(`[soft] --soft-max-cps 需要在 1..40 之间（收到 ${softMaxCpsArg}）`);
+    process.exit(1);
+  }
+  soft = { ...soft, maxCps: value };
+}
+// CPS 上限换算成攻击冷却：20Hz 下每 tick 都能挥，但 1.8 的受击无敌只有 500ms，
+// 超过 2 次/秒的点击本来就没有收益。只节流攻击，不裁剪动作集合。
+// 注意 max() 的语义：cps ≥ 2 时被 500ms 保护盖住（只记录意图），cps=1 才真的变慢。
+const softAttackCooldownMs = soft.maxCps
+  ? Math.max(attackCooldownMs, Math.round(1000 / soft.maxCps))
+  : attackCooldownMs;
 const rconSpec = parseRconSpec(
   arg('rcon', process.env.GLADIATOR_RCON ?? ''),
   String(arg('rcon-password', process.env.GLADIATOR_RCON_PASSWORD ?? 'devpass')),
 );
 const brainEnabled = brainSpec.length > 0;
+console.log(`[soft] ${describeSoft(soft)}`);
+if (!brainEnabled && softSpec) {
+  console.warn('[soft] 软约束只作用于本地大脑（--brain）；当前未启用大脑，'
+    + '本进程仍只执行通道 B 下发的动作，约束不会生效');
+}
 
 // 每个 Bot 独立的“手感”配置（G-507）：CLI/env 给基线，SPAWN 里的 profile 可整体覆盖。
 const cliProfile = normalizeProfile({
@@ -188,6 +224,8 @@ const brainState = {
   attackStreak: 0,
   attacksThrottled: 0,
   swordSwaps: 0,
+  //: 被软约束剔除的宏动作次数（运行期统计，不进模型）。
+  softDropped: 0,
   startedAt: Date.now(),
   seq: 0,
   tick: 0,
@@ -221,6 +259,17 @@ function isLikelyBot(name) {
 
 function selfName() {
   return (bot && bot.username) || username;
+}
+
+/**
+ * 大脑本地决策用的有效 reach：软约束的 `reachOffset` 从这里扣。
+ *
+ * 只影响**自己的编码与解码**（观测里的 `in_reach` 与攻击判定），不改服务端的
+ * `BotProfile.reach`——所以它是「自己给自己留余量」，不是改物理属性。
+ */
+function brainReach() {
+  const offset = Number(soft.minReachOffset || 0);
+  return Math.max(1.0, Number(activeProfile.reach || 0) - offset);
 }
 
 /**
@@ -365,7 +414,7 @@ async function brainTick() {
       stepFraction: 0,
       opponentHealth: brainState.opponentHealth,
       allowed: [targetName],
-      reach: activeProfile.reach,
+      reach: brainReach(),
       sinceAttack: brainState.lastAttackAt ? (nowMs - brainState.lastAttackAt) / 1000 : 5,
     });
     const index = brainEpsilon > 0 && Math.random() < brainEpsilon
@@ -373,8 +422,17 @@ async function brainTick() {
       : policy.greedy(features);
     let actions = decodeAction(index, observation, selfName(), {
       allowed: [targetName],
-      reach: activeProfile.reach,
+      reach: brainReach(),
     });
+    // 软约束：策略选了被禁的宏动作就在这里剔除（补 idle），不碰模型、不改变动作空间。
+    const softDropped = actions.filter((action) => softDropReason(action, soft) !== null).length;
+    if (softDropped > 0) {
+      actions = applySoftActions(actions, soft);
+      brainState.softDropped += softDropped;
+      if (brainState.softDropped === softDropped) {
+        console.log(`[soft] ${describeSoft(soft)}（被禁动作已改为 idle/位移）`);
+      }
+    }
     // 连续选 attack 说明已经贴身：按 1.8 的无敌帧（500ms）节流，别每 tick 刷空点击。
     const choseAttack = actions.some((action) => action.type === 'attack');
     brainState.attackStreak = choseAttack ? brainState.attackStreak + 1 : 0;
@@ -382,7 +440,7 @@ async function brainTick() {
       streak: brainState.attackStreak,
       lastAttackAt: brainState.lastAttackAt,
       now: nowMs,
-      cooldownMs: attackCooldownMs,
+      cooldownMs: softAttackCooldownMs,
     });
     if (throttled) {
       actions = actions.filter((action) => action.type !== 'attack');
@@ -391,7 +449,7 @@ async function brainTick() {
       }
       brainState.attacksThrottled += 1;
       if (brainState.attacksThrottled === 1) {
-        console.log(`[brain] 敌人仍在无敌帧内，攻击节流到 ${attackCooldownMs}ms 一刀`);
+        console.log(`[brain] 敌人仍在无敌帧内，攻击节流到 ${softAttackCooldownMs}ms 一刀`);
       }
     } else if (choseAttack && needsSwordSwap(bot.heldItem)) {
       // 手上不是剑就先切剑再打：直接 attack 只会空手挥（训练里模型看不到手持物）。
@@ -438,7 +496,7 @@ function startBrain() {
     brainState.timer.unref();
   }
   console.log(`[brain] 已启动 ${brainHz}Hz，目标=${targetPlayerArg || '自动（最近的非 Bot 玩家）'}`
-    + ` epsilon=${brainEpsilon} attackCooldown=${attackCooldownMs}ms`
+    + ` epsilon=${brainEpsilon} attackCooldown=${softAttackCooldownMs}ms`
     + ` rcon=${rconSpec ? `${rconSpec.host}:${rconSpec.port}` : 'off'}`);
   if (rconSpec) {
     const poller = setInterval(() => {
@@ -485,8 +543,10 @@ function printMatchSummary(reason) {
     actionFailures: brainState.actionFailures,
     attacksThrottled: brainState.attacksThrottled,
     swordSwaps: brainState.swordSwaps,
+    softDropped: brainState.softDropped,
+    soft: describeSoft(soft),
     brainHz,
-    attackCooldownMs,
+    attackCooldownMs: softAttackCooldownMs,
   }));
 }
 
@@ -520,6 +580,14 @@ client.on('message', async (envelope) => {
       gameId = payload.gameId;
     }
     console.log(`[gladiator] STATE ${payload.previous ?? '?'} → ${gameState}${payload.reason ? ` (${payload.reason})` : ''}`);
+    // 训练侧靠这条事件判死：观测轮询会跳过 1.8 的「死→自动重生」（只有 2 tick）。
+    envServer.broadcastState({
+      state: gameState,
+      previous: payload.previous ?? previous,
+      reason: payload.reason,
+      gameId,
+      at: Date.now(),
+    });
     // 对局结束信号：自己被淘汰或死亡时输出一次汇总（回到 Alive 后允许再次输出）。
     if (brainEnabled) {
       const ended = gameState === 'Dead' || gameState === 'Eliminated' || previous === 'Eliminated';
