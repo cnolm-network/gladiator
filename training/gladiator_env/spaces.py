@@ -15,7 +15,7 @@ import numpy as np
 
 # --- 观测 ---------------------------------------------------------------
 
-OBS_DIM = 19
+OBS_DIM = 23
 OBS_FIELDS = (
     "self_health",       # 0  自身血量 / 20
     "self_food",         # 1  饱食度 / 20
@@ -36,6 +36,10 @@ OBS_FIELDS = (
     "self_held_durability",   # 16 手里物品剩余耐久（0..1；无耐久=1）
     "self_armor_remaining",   # 17 护甲平均剩余耐久（0..1；没穿=0）
     "self_gapples",           # 18 金苹果数量 / 5
+    "opponent_speed",         # 19 对手水平速度 √(vx²+vz²)，clip0–10 后 /10
+    "opponent_vertical_speed",  # 20 对手竖直速度 vy，clip-5..5 后 /5
+    "self_since_attack",      # 21 距上次 attack 动作的秒数，clip0–5 后 /5（初始 5）
+    "in_reach",               # 22 双方水平距离 ≤ 自己 reach
 )
 
 #: 观测裁剪范围：协议字段理论上有限，但 NaN/异常值不应该进网络。
@@ -110,11 +114,15 @@ def encode_observation(
     step_fraction: float = 0.0,
     opponent_health: float | None = None,
     opponents: "set[str] | None" = None,
+    reach: float = 3.99,
+    since_attack: float = 5.0,
 ) -> np.ndarray:
     """把一条 OBSERVATION 编码成固定长度的 float32 向量。
 
     ``opponent_health`` 由环境从对手自己的观测里取（协议实体列表不带血量）。
     ``opponents`` 见 :func:`nearest_player`。
+    ``reach`` 是**自己**的攻击距离（P1 新增 ``in_reach`` 用）；
+    ``since_attack`` 是距上次 attack 动作的秒数（P1 新增 ``self_since_attack`` 用，默认 5）。
     """
     self_payload = observation.get("self") or {}
     pos = self_payload.get("pos") or {}
@@ -144,11 +152,15 @@ def encode_observation(
     gapples = sum(_f(item.get("count")) for item in inventory if item.get("name") == "golden_apple")
     vector[18] = _clamp(gapples / 5.0, 0.0, 1.0)
 
+    # P1：距上次 attack 的时间（初始 5 秒 = 已经"冷却完毕"）。
+    vector[21] = _clamp(_f(since_attack, 5.0), 0.0, 5.0) / 5.0
+
     if target is not None:
         tpos = target.get("pos") or {}
         dx = _f(tpos.get("x")) - sx
         dy = _f(tpos.get("y")) - sy
         dz = _f(tpos.get("z")) - sz
+        horizontal = math.sqrt(dx * dx + dz * dz)
         distance = _f(target.get("distance"), math.sqrt(dx * dx + dy * dy + dz * dz))
         vector[7] = dx / 16.0
         vector[8] = dy / 8.0
@@ -161,6 +173,14 @@ def encode_observation(
         )
         vector[12] = 1.0 if target.get("onGround") else 0.0
         vector[13] = 1.0
+        # 对手速度（缺字段=0）：水平速度用 √(vx²+vz²)，竖直分量单独给。
+        velocity = target.get("velocity") or {}
+        vx, vy, vz = _f(velocity.get("x")), _f(velocity.get("y")), _f(velocity.get("z"))
+        vector[19] = _clamp(math.sqrt(vx * vx + vz * vz), 0.0, 10.0) / 10.0
+        vector[20] = _clamp(vy, -5.0, 5.0) / 5.0
+        # 水平距离 ≤ reach 才算「这一刀打得中」；竖直差再大也不该判 false
+        # （原版攻击判定是 3D 距离，但训练里跳劈的干扰远小于水平贴身/拉开）。
+        vector[22] = 1.0 if horizontal <= float(reach) else 0.0
 
     return np.clip(vector, -OBS_CLIP, OBS_CLIP).astype(np.float32)
 

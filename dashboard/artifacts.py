@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from chart_view import build_chart_view, mean_metrics
 from errors import BadRequest, NotFound
 from eval_semantics import normalize_eval
 
@@ -72,6 +73,29 @@ def _read_json(path: Path) -> dict | list | None:
             return json.load(fh)
     except (OSError, ValueError):
         return None
+
+
+def _dagger_rounds(dagger: Any) -> list[dict]:
+    """P2.3：DAgger 每轮的样本量 / 一致率 / 评估（结构固定，缺字段给 None）。"""
+    if not isinstance(dagger, list):
+        return []
+    out: list[dict] = []
+    for item in dagger:
+        if not isinstance(item, dict):
+            continue
+        evaluation = item.get("evaluation") if isinstance(item.get("evaluation"), dict) else {}
+        entry: dict = {
+            "round": item.get("round"),
+            "samples": item.get("samples"),
+            "agreement": item.get("agreement"),
+            "agreementBefore": item.get("agreementBefore"),
+            "loss": item.get("loss"),
+        }
+        for key in ("sampling", "greedy"):
+            bucket = evaluation.get(key)
+            entry[key] = bucket if isinstance(bucket, dict) else None
+        out.append(entry)
+    return out
 
 
 def _slim_history(history: Any) -> list[dict]:
@@ -236,6 +260,11 @@ class ArtifactStore:
             "summary": _history_summary(history),
             # P1-1：分对手胜率（旧 run 缺失时从 history 现算，再缺就空表）。
             "byOpponent": _by_opponent(summary, payload.get("history"), train_user),
+            # P2.0：图表视图参数（Y 轴分位裁剪 / 胜局标记 / 窗口胜率）与 PPO 诊断均值。
+            "chart": build_chart_view(payload.get("history"), train_user, 10),
+            "ppo": mean_metrics(payload.get("history")),
+            # P2.3：DAgger 每轮表（旧 run 没有 → 空数组）。
+            "dagger": _dagger_rounds(payload.get("dagger")),
             "evaluationByOpponent": (payload.get("evaluationByOpponent")
                                      if isinstance(payload.get("evaluationByOpponent"), dict) else {}),
             "history": history,
@@ -513,13 +542,21 @@ class ArtifactStore:
         if report_path:
             report = self.multi_report(Path(report_path)) if meta.get("kind") == "multi" else self.train_report(Path(report_path))
             meta["history"] = report.get("history") or []
+            # P2.0：run 详情直接拿视图参数与 PPO 诊断均值（缺失时给安全默认）。
+            meta["chart"] = report.get("chart") or build_chart_view(meta["history"], None, 10)
+            meta["ppo"] = report.get("ppo") or mean_metrics(meta["history"])
             meta["evaluation"] = report.get("evaluation") or []
+            # P2.3：DAgger 每轮表（旧 run 无此字段 → []）。
+            meta["dagger"] = report.get("dagger") or []
             meta["config"] = report.get("config")
             meta["pairs"] = report.get("pairs") or []
             meta["policyPath"] = report.get("policyPath")
         else:
             meta["history"] = []
+            meta["chart"] = build_chart_view([], None, 10)
+            meta["ppo"] = mean_metrics([])
             meta["evaluation"] = []
+            meta["dagger"] = []
             meta["config"] = None
             meta["pairs"] = []
         meta["detail"] = True

@@ -60,6 +60,11 @@ class EpisodeReview:
     damage_dealt: float = 0.0
     damage_taken: float = 0.0
     hits: int = 0
+    #: 命中里「本 step 真的下发了 attack」的次数；
+    #: ``environment_hits`` 是「对手掉血但本 step 没挥刀」——击退摔落/环境伤害等。
+    #: 二者相加必须等于 ``hits``（见 EpisodeTracker.update）。
+    attack_hits: int = 0
+    environment_hits: int = 0
     whiffs: int = 0
     max_combo: int = 0
     attack_actions: int = 0
@@ -98,6 +103,8 @@ class EpisodeReview:
             "damageTaken": round(self.damage_taken, 3),
             "damageRatio": None if self.damage_ratio is None else round(self.damage_ratio, 3),
             "hits": self.hits,
+            "attackHits": self.attack_hits,
+            "environmentHits": self.environment_hits,
             "whiffs": self.whiffs,
             "hitRate": round(self.hit_rate, 3),
             "maxCombo": self.max_combo,
@@ -140,14 +147,24 @@ class EpisodeTracker:
         opponent_current: dict[str, Any] | None,
         reward: float,
         events: list[dict[str, Any]] | None = None,
+        attacked: bool | None = None,
     ) -> None:
+        """累计一步统计。
+
+        ``attacked`` 表示本 step **实际下发**了 attack（由环境给出）；不传时按
+        「策略选的动作编号是不是 attack」推断（旧调用方兼容）。
+        这样 ``hits`` 能拆成「真挥刀命中」与「非攻击来源掉血」，
+        避免出现「attack=0 却有 6 点伤害」这种对不上的读数。
+        """
         r = self.review
         r.steps += 1
         r.total_reward += float(reward)
+        # 下标与动作名同源：都来自 spaces.ACTION_NAMES（策略输出的就是它的下标）。
         name = ACTION_NAMES[action_index] if 0 <= action_index < len(ACTION_NAMES) else str(action_index)
         r.action_counts[name] = r.action_counts.get(name, 0) + 1
         if name == "attack":
             r.attack_actions += 1
+        did_attack = (name == "attack") if attacked is None else bool(attacked)
 
         own_before, own_after = _health(previous), _health(current)
         opp_before, opp_after = _health(opponent_previous), _health(opponent_current)
@@ -157,6 +174,11 @@ class EpisodeTracker:
         if opp_before is not None and opp_after is not None and opp_after < opp_before:
             r.damage_dealt += opp_before - opp_after
             r.hits += 1
+            if did_attack:
+                r.attack_hits += 1
+            else:
+                # 没挥刀却掉血：击退摔落、环境伤害等。单独计数，并在复盘里写明。
+                r.environment_hits += 1
             if self._last_hit_step >= 0 and r.steps - self._last_hit_step <= 15:
                 self._combo += 1
             else:
@@ -213,6 +235,7 @@ def to_markdown(review: EpisodeReview) -> str:
         f"| 承受伤害 | {r.damage_taken:.1f} |",
         f"| 伤害比 | {'—' if r.damage_ratio is None else f'{r.damage_ratio:.2f}'} |",
         f"| 命中 / 空挥 | {r.hits} / {r.whiffs} |",
+        f"| 其中：挥刀命中 / 非攻击掉血 | {r.attack_hits} / {r.environment_hits} |",
         f"| 命中率 | {r.hit_rate * 100:.0f}% |",
         f"| 连击峰值 | {r.max_combo} |",
         f"| 平均距离 | {'—' if r.mean_distance is None else f'{r.mean_distance:.2f} 格'} |",

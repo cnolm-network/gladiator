@@ -32,6 +32,20 @@ def build_env(**kwargs) -> tuple[GladiatorEnv, list[FakeLink]]:
     return env, links
 
 
+def pin_profile(env: GladiatorEnv) -> None:
+    """把对手参数固定成确定值：本文件测的是「出手前确认」，不是对手池随机性。
+
+    P1.6 起 aimbot 的 attackProb/approachThreshold 每局采样，若不固定，
+    「射程内必出手」的前提会以 ~10% 的概率不成立，测试变 flaky。
+    """
+    env._opp_profile = {"mode": "aimbot", "attackProb": 1.0,
+                        "approachThreshold": 3.9, "reachOffset": 0.5,
+                        "startDelayTicks": 0, "attackCooldownTicks": 0}
+    # P1.7：reset 已按采样值装载了起手延迟/冷静期，这里一并清零，保持"射程内每次都能出手"。
+    env._opp_hold_ticks = {bot.username: 0 for bot in env.bots}
+    env._opp_next_attack_tick = {bot.username: 0 for bot in env.bots}
+
+
 def push_observation(env: GladiatorEnv, links: list[FakeLink], observation: dict,
                      index: int = 1) -> None:
     """把新观测同时塞给通道与 env._raw。
@@ -53,6 +67,7 @@ class OpponentConfirmTest(unittest.TestCase):
     def test_first_tick_only_approaches(self):
         env, links = build_env()
         env.reset()
+        pin_profile(env)
         links[1].actions.clear()
 
         env.step(0)
@@ -66,6 +81,7 @@ class OpponentConfirmTest(unittest.TestCase):
     def test_second_tick_actually_attacks(self):
         env, links = build_env()
         env.reset()
+        pin_profile(env)
         links[1].actions.clear()
         env.step(0)  # 第一次判到出手 → 只贴近
 
@@ -80,6 +96,7 @@ class OpponentConfirmTest(unittest.TestCase):
     def test_distance_grows_on_second_tick_falls_back_to_move(self):
         env, links = build_env()
         env.reset()
+        pin_profile(env)
         links[1].actions.clear()
         env.step(0)  # hold=1
         self.assertEqual(env._opponent_hold.get("Glad_Bot_2"), 1)
@@ -97,6 +114,7 @@ class OpponentConfirmTest(unittest.TestCase):
     def test_switching_target_requires_reconfirm(self):
         env, links = build_env()
         env.reset()
+        pin_profile(env)
         links[1].actions.clear()
         env.step(0)
         self.assertEqual(env._opponent_target.get("Glad_Bot_2"), 1)
@@ -117,6 +135,7 @@ class OpponentConfirmTest(unittest.TestCase):
         """学习方（index 0）不受影响：同一 tick 的 attack 照发。"""
         env, links = build_env()
         env.reset()
+        pin_profile(env)
         links[0].actions.clear()
 
         env.step(2)  # 学习方选 attack

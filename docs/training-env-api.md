@@ -391,7 +391,7 @@ training/artifacts/runs/20261107-2320-multi-Bot_C/
   "name": "均衡（默认）",
   "description": "默认权重",
   "base": {
-    "kill": 20.0, "death": -20.0,
+    "victory": 50.0, "kill": 2.0, "death": -2.0,
     "damageDealt": 2.5, "damageTaken": -1.2,
     "combo": 0.6, "comboCap": 3.0,
     "threatWindow": 0.3, "pressure": 0.05,
@@ -408,9 +408,30 @@ training/artifacts/runs/20261107-2320-multi-Bot_C/
 }
 ```
 
-**`base` 键**：`kill` / `death` / `damageDealt` / `damageTaken` / `combo` / `comboCap` /
-`threatWindow` / `pressure` / `whiff` / `still` / `waste` / `closing` / `attackAttempt` /
-`counter` / `inactive`（兼容旧名，默认 0）。
+**`base` 键**：`victory` / `kill` / `death` / `damageDealt` / `damageTaken` / `combo` /
+`comboCap` / `threatWindow` / `pressure` / `whiff` / `still` / `waste` / `closing` /
+`attackAttempt` / `counter` / `inactive`（兼容旧名，默认 0）/ `attackInReach` /
+`pbrsAlpha` / `pbrsBeta` / `pbrsGamma` / `shapingCap`。
+
+**P2：胜负是唯一的大信号**
+
+- `victory`（默认 50）：终局赢下 +50、输掉 -50；`kill`/`death` 已降到 ±2，只作小额补充。
+  旧预设若显式写了 `kill: 20`，仍按旧值生效（不会覆盖用户显式值）。
+- `shapingCap`（默认 5.0）：**每步**除 `victory` 外的 dense 奖励合计裁剪到 `[-cap, +cap]`，
+  裁剪量累计进 `totals["capped"]`。原因：单步 6 点伤害就值 +15，不封顶会盖过胜负信号。
+- PBRS（potential-based reward shaping，policy-invariant）：
+  `Φ(s) = alpha·phi_hp + beta·phi_dist`，
+  `phi_hp = (20-opp_hp)/20 - (20-self_hp)/20`（裁剪 [-1,1]），
+  `phi_dist = 1 - min(水平距离, 8)/8`（无目标 0）；
+  每步追加 `F = pbrsGamma·Φ(s') - Φ(s)`，首步的 `Φ(s)` 取 reset 时的状态。
+  `pbrsGamma` 默认 **1.0**（非折扣）：回合动辄 400 步，γ<1 会把后半程的势能差分衰减到无感。
+  事件为 `{"type":"pbrs","value":F}`，累计进 `totals["pbrs"]`；`use_pbrs=false` 可完全关闭。
+- `terms` 新增终局条件 `won` / `lost`（布尔），可直接写 `"when": {"won": true}`；
+  `weight` 支持符号名 `"victory"`（解析成 50.0），用于「赢下这局额外再加一点」这类配法：
+
+```json
+{"id": "win_bonus", "weight": "victory", "unit": "step", "when": {"won": true}}
+```
 
 - 伤害类按 HP 计：`damageDealt * 造成伤害`，`damageTaken * 承受伤害`。
 - `still`：**连续 3 秒没有水平位移**才按秒扣分；走动本身不扣分（G-619 起）。

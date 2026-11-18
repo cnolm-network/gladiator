@@ -1863,7 +1863,17 @@ function renderTraining() {
   statusEl.textContent = STATUS_TEXT[job.status] || job.status;
 
   const total = Math.max(1, job.totalEpisodes || 1);
-  const pct = Math.min(100, Math.round(((job.episodesCompleted || 0) / total) * 100));
+  // P1.7：训练跑完后还有两遍评估（采样 + 贪心，各 20 局 × 最多 400 步）。
+  // 之前面板只跟 episodesCompleted，评估期间会一直显示「20/20、进度条满格、运行中」，
+  // 看起来像卡死；这里按 phase 切到评估进度。
+  const phase = job.phase || "train";
+  const inEval = phase === "eval" || phase === "eval-greedy";
+  const evalDone = Number(job.evalCompleted) || 0;
+  const evalTotal = Number(job.evalTotal) || 0;
+  const evalPassNo = Number(job.evalPass) || (phase === "eval-greedy" ? 2 : 1);
+  const pct = inEval && evalTotal > 0
+    ? Math.min(100, Math.round((evalDone / evalTotal) * 100))
+    : Math.min(100, Math.round(((job.episodesCompleted || 0) / total) * 100));
   $("#training-progress-bar").style.width = `${pct}%`;
 
   const lastReward = job.rewards && job.rewards.length ? job.rewards[job.rewards.length - 1] : null;
@@ -1887,9 +1897,12 @@ function renderTraining() {
   const stageValue = job.currentStage
     ? `<span>${escapeHtml(job.currentStage)}</span><small class="sub">${stageSub}</small>`
     : "—";
-  const roundText = isMulti
-    ? `<span>${job.episodesCompleted || 0} / ${job.totalEpisodes || 0}</span><small class="sub">已完成 / 计划（${pairs} 场地 × ${perPair} 局）</small>`
-    : `<span>${job.episodesCompleted || 0} / ${job.totalEpisodes || 0}</span><small class="sub">训练总局数</small>`;
+  const roundText = inEval
+    ? `<span>评估 ${evalDone} / ${evalTotal || "—"}</span>` +
+      `<small class="sub">第 ${evalPassNo}/2 遍（${phase === "eval-greedy" ? "贪心" : "采样"}）</small>`
+    : isMulti
+      ? `<span>${job.episodesCompleted || 0} / ${job.totalEpisodes || 0}</span><small class="sub">已完成 / 计划（${pairs} 场地 × ${perPair} 局）</small>`
+      : `<span>${job.episodesCompleted || 0} / ${job.totalEpisodes || 0}</span><small class="sub">训练总局数</small>`;
   const evalParams = job.params || {};
   const evalRounds = Number(evalParams.evalRounds);
   const evalEpisodes = Number(evalParams.evalEpisodes);
@@ -1994,12 +2007,21 @@ function renderTrainingReport(report) {
   if (!report || !report.exists) { card.style.display = "none"; return; }
   card.style.display = "";
   const s = report.summary || {};
+  const cfg = report.config || {};
+  // P2.2：目标熵 / 价值裁剪（旧 run 没有这两个字段 → 不显示，不伪造默认值）。
+  const ppoParams = [
+    cfg.targetEntropy == null ? null : `targetEntropy=${num(cfg.targetEntropy, 2)}`,
+    cfg.valueClip == null ? null : `valueClip=${num(cfg.valueClip, 2)}`,
+    cfg.entropyCoefMax == null ? null : `entropyCoefMax=${num(cfg.entropyCoefMax, 2)}`,
+    cfg.minibatch == null ? null : `minibatch=${num(cfg.minibatch)}`,
+  ].filter(Boolean);
   const items = [
     kvItem("回合", s.episodes ?? "—"),
     kvItem("总步数", num(s.totalSteps)),
     kvItem("平均 reward", num(s.meanReward, 2)),
     kvItem("最佳 / 最差", `${num(s.bestReward, 2)} / ${num(s.worstReward, 2)}`),
     kvItem("命中率", s.hitRate == null ? "—" : `${(s.hitRate * 100).toFixed(1)}%`),
+    ...(ppoParams.length ? [kvItem("PPO 参数", ppoParams.join(" · "))] : []),
     kvItem("报告", escapeHtml(report.path || "—")),
   ];
   $("#training-report").innerHTML = `<div class="kv">${items.join("")}</div>`;
@@ -2266,9 +2288,87 @@ function renderRunDetail() {
   if (byOpponentEmpty) byOpponentEmpty.classList.toggle("hidden", opponentRows.length > 0);
 
   const history = run.history || [];
+  // P2.0：Y 轴按 1%–99% 分位裁剪（只改视图）+ 胜局打点；胜率单独一条窗口曲线。
+  const chart = run.chart || {};
+  const winIndexes = (chart.winEpisodes || []).map((episode) => Number(episode) - 1);
   $("#data-run-chart").innerHTML = history.length
-    ? lineChart(history.map((item) => Number(item.totalReward) || 0), { labels: history.map((item) => `#${item.episode ?? ""}`) })
+    ? lineChart(history.map((item) => Number(item.totalReward) || 0), {
+      labels: history.map((item) => `#${item.episode ?? ""}`),
+      yClamp: chart.yRange || null,
+      winIndexes,
+    })
     : '<div class="chart-empty">该运行还没有 report.json 或 history</div>';
+  const winRateChart = $("#data-run-winrate-chart");
+  if (winRateChart) {
+    const windows = chart.winRate || [];
+    winRateChart.innerHTML = windows.length
+      ? lineChart(windows.map((item) => Number(item.winRate) * 100), {
+        labels: windows.map((item) => `#${item.startEpisode}`),
+        height: 150,
+        yClamp: [0, 100],
+      })
+      : '<div class="chart-empty">暂无胜率数据</div>';
+  }
+  // P2.1：熵曲线（独立刻度，不共用 reward 的 yClamp）+ 冻结告警。
+  const frozen = $("#data-run-frozen");
+  if (frozen) frozen.classList.toggle("hidden", !chart.frozen);
+  const entropyChart = $("#data-run-entropy-chart");
+  if (entropyChart) {
+    const entropy = Array.isArray(chart.entropy) ? chart.entropy : [];
+    const points = entropy.filter((value) => value != null);
+    entropyChart.innerHTML = points.length
+      ? lineChart(entropy.map((value) => (value == null ? 0 : Number(value))), {
+        labels: entropy.map((_value, index) => `#${index + 1}`),
+        height: 150,
+        yClamp: chart.entropyRange || null,
+      })
+      : '<div class="chart-empty">该运行没有 entropy 记录（reinforce 路径或旧数据）</div>';
+  }
+  // P2.0：PPO 诊断量（valueLoss 偏大通常意味着价值头发散）。
+  const ppo = run.ppo || {};
+  const lm = chart.lastMetrics || {};
+  const ppoWrap = $("#data-run-ppo");
+  if (ppoWrap) {
+    const fmt = (value) => (value == null ? "—" : num(value, 4));
+    const valueLoss = Number(ppo.valueLoss);
+    const warn = Number.isFinite(valueLoss) && valueLoss > 5;
+    // P2.2：解释方差（1 = 完美预测，0 = 只预测到均值，<0.3 说明价值头没拟合好）。
+    const ev = lm.explainedVariance == null ? null : Number(lm.explainedVariance);
+    const evWarn = ev != null && Number.isFinite(ev) && ev < 0.3;
+    ppoWrap.innerHTML = `<div class="kv">
+      ${kvItem("valueLoss", `${fmt(ppo.valueLoss)}${warn ? ' <span class="badge bad">价值头可能发散</span>' : ""}`)}
+      ${kvItem("解释方差", `${fmt(lm.explainedVariance)}${evWarn ? ' <span class="pill warn">价值头拟合差</span>' : ""}`)}
+      ${kvItem("approxKL", fmt(ppo.approxKL))}
+      ${kvItem("clipFraction", ppo.clipFraction == null ? "—" : `${(Number(ppo.clipFraction) * 100).toFixed(1)}%`)}
+      ${kvItem("policyLoss", fmt(ppo.policyLoss))}
+      ${kvItem("entropy", fmt(ppo.entropy))}
+      ${kvItem("entropyCoef", fmt(lm.entropyCoef))}
+      ${kvItem("lr", lm.lr == null ? "—" : Number(lm.lr).toExponential(2))}
+      ${kvItem("gradNorm", lm.gradNorm == null ? "—" : num(lm.gradNorm, 3))}
+    </div>`;
+  }
+  // P2.3：DAgger 每轮表（旧 run 没有该字段 → 空表 + 提示）。
+  const dagger = Array.isArray(run.dagger) ? run.dagger : [];
+  const daggerBody = $("#data-run-dagger");
+  if (daggerBody) {
+    const evalCell = (bucket) => {
+      if (!bucket || !bucket.episodes) return "—";
+      const rate = bucket.winRate == null ? null : Number(bucket.winRate);
+      const reward = bucket.meanReward == null ? "—" : num(bucket.meanReward, 1);
+      return `${num(bucket.wins)}/${num(bucket.episodes)}${rate == null ? "" : `（${(rate * 100).toFixed(0)}%）`} · ${reward}`;
+    };
+    daggerBody.innerHTML = dagger.map((item) => `<tr>
+      <td>${Number(item.round) === 0 ? "0（BC 基线）" : num(item.round)}</td>
+      <td>${num(item.samples)}</td>
+      <td>${item.agreement == null ? "—" : `${(Number(item.agreement) * 100).toFixed(1)}%`}</td>
+      <td>${item.loss == null ? "—" : num(item.loss, 4)}</td>
+      <td>${evalCell(item.sampling)}</td>
+      <td>${evalCell(item.greedy)}</td>
+    </tr>`).join("");
+  }
+  $("#data-run-dagger-wrap")?.classList.toggle("hidden", dagger.length === 0);
+  $("#data-run-dagger-empty")?.classList.toggle("hidden", dagger.length > 0);
+
   const runEpisodes = run.history || [];
   $("#data-run-episodes").innerHTML = runEpisodes.map((item, index) => `<tr class="clickable" data-episode-row="${index + 1}" data-run-id="${escapeHtml(run.id || run.name)}">
     <td>${index + 1}</td>
@@ -2334,6 +2434,13 @@ function lineChart(values, options = {}) {
   const nums = items.map((item) => item.value);
   let min = Math.min(...nums, 0);
   let max = Math.max(...nums, 0);
+  // P2.0：按 1%–99% 分位裁剪 Y 轴（只改视图，不改数据）：长回合里个别 ±200 的尖峰
+  // 会把整条曲线压成一条平线，裁剪后趋势才看得出来。
+  if (Array.isArray(options.yClamp) && options.yClamp.length === 2
+      && Number.isFinite(Number(options.yClamp[0])) && Number.isFinite(Number(options.yClamp[1]))) {
+    min = Number(options.yClamp[0]);
+    max = Number(options.yClamp[1]);
+  }
   if (max === min) max = min + 1;
   const span = max - min;
   min -= span * 0.06;
@@ -2341,12 +2448,22 @@ function lineChart(values, options = {}) {
   const innerW = width - pad.left - pad.right;
   const innerH = height - pad.top - pad.bottom;
   const x = (index) => pad.left + (nums.length === 1 ? innerW / 2 : (index / (nums.length - 1)) * innerW);
-  const y = (value) => pad.top + innerH - ((value - min) / (max - min)) * innerH;
-  const id = chartId();
+  // 裁剪后超界的点会被夹到边界上（仍然可见，只是不再拉伸坐标轴）。
+  const y = (value) => {
+    const clamped = Math.min(max, Math.max(min, value));
+    return pad.top + innerH - ((clamped - min) / (max - min)) * innerH;
+  };
+  const id = chartId();  // 图表唯一 id（渐变用）
 
   const points = nums.map((value, index) => `${x(index).toFixed(1)},${y(value).toFixed(1)}`);
   const path = `M${points.join(" L")}`;
   const area = `${path} L${x(nums.length - 1).toFixed(1)},${(pad.top + innerH).toFixed(1)} L${x(0).toFixed(1)},${(pad.top + innerH).toFixed(1)} Z`;
+
+  const winMarks = Array.isArray(options.winIndexes) ? options.winIndexes : [];
+  const winDots = winMarks
+    .filter((index) => Number.isInteger(index) && index >= 0 && index < nums.length)
+    .map((index) => `<circle class="win-dot" cx="${x(index).toFixed(1)}" cy="${y(nums[index]).toFixed(1)}" r="3.2" fill="#e5484d" stroke="#fff" stroke-width="1"><title>第 ${index + 1} 局：胜</title></circle>`)
+    .join("");
 
   const grid = [];
   for (let i = 0; i <= 4; i += 1) {
@@ -2392,6 +2509,7 @@ function lineChart(values, options = {}) {
     <path d="${area}" fill="url(#${id}fill)"/>
     <path class="line" d="${path}"/>
     ${dots}
+    ${winDots}
     ${hits}
     ${xLabels.join("")}
   </svg>`;

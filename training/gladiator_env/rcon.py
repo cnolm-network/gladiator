@@ -26,6 +26,11 @@ class RconError(RuntimeError):
     """RCON 连接、认证或命令失败。"""
 
 
+#: 建连重试的间隔（秒）：Paper 的 RCON 对短时间大量新建/断开很敏感，
+#: 首连失败多半是它还没准备好接受新连接，等一下再试即可。总耗时 < 1s。
+CONNECT_RETRY_DELAYS: tuple[float, ...] = (0.25, 0.5)
+
+
 class RconClient:
     def __init__(self, host: str = "127.0.0.1", port: int = 25575, password: str = "devpass",
                  timeout: float = 5.0) -> None:
@@ -35,6 +40,8 @@ class RconClient:
         self.timeout = timeout
         self._sock: socket.socket | None = None
         self._request_id = 0
+        #: 建连尝试次数（1 次首试 + len(CONNECT_RETRY_DELAYS) 次重试 = 3 次）。
+        self.connect_attempts = 1 + len(CONNECT_RETRY_DELAYS)
 
     # --- 连接 -----------------------------------------------------------
 
@@ -45,11 +52,31 @@ class RconClient:
         self.close()
 
     def connect(self) -> "RconClient":
-        sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
-        sock.settimeout(self.timeout)
-        self._sock = sock
-        self._authenticate()
-        return self
+        """建立并认证连接；失败自动重试（0.25s / 0.5s），第三次仍失败才抛原始异常。
+
+        保留最后一次的原始异常（含 "RCON 连接被对端关闭" 这类可读信息），
+        不让重试把真实原因吃掉。
+        """
+        last_error: Exception | None = None
+        for attempt in range(self.connect_attempts):
+            if attempt:
+                time.sleep(CONNECT_RETRY_DELAYS[attempt - 1])
+            self.close()  # 上一次可能留下半条连接，先清干净
+            try:
+                sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+                sock.settimeout(self.timeout)
+                self._sock = sock
+                self._authenticate()
+                return self
+            except (RconError, OSError) as exc:
+                last_error = exc
+                self.close()
+        assert last_error is not None
+        raise last_error
+
+    def is_connected(self) -> bool:
+        """是否已有连接（只看本地状态；真正的探活由 ``command`` 的重连兜底）。"""
+        return self._sock is not None
 
     def close(self) -> None:
         if self._sock is not None:
@@ -76,6 +103,24 @@ class RconClient:
     # --- 命令 -----------------------------------------------------------
 
     def command(self, command: str) -> str:
+        """执行一条命令；连接坏了就重连一次再重试（只重试一次，避免放大故障）。"""
+        try:
+            return self._command_once(command)
+        except RconError:
+            if not self._reconnect_for_retry():
+                raise
+            return self._command_once(command)
+
+    def _reconnect_for_retry(self) -> bool:
+        """为「命令重试」重建连接；失败返回 False（调用方抛出原始错误）。"""
+        self.close()
+        try:
+            self.connect()
+        except (RconError, OSError):
+            return False
+        return True
+
+    def _command_once(self, command: str) -> str:
         if self._sock is None:
             raise RconError("RCON 尚未连接")
         self._request_id += 1

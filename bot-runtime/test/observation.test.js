@@ -67,6 +67,18 @@ test('entities 排除自身并按距离升序', () => {
   assert.ok(observation.entities[0].distance <= observation.entities[1].distance);
 });
 
+test('entities 携带 velocity（缺失时填 0）', () => {
+  const bot = fakeBot();
+  bot.entities[1].velocity = new Vec3(0.2, -0.1, -0.3);
+  const observation = buildObservation(bot, {});
+
+  const foe = observation.entities.find((item) => item.name === 'Foe');
+  assert.deepEqual(foe.velocity, { x: 0.2, y: -0.1, z: -0.3 }, '玩家必须有速度');
+  // 没有 velocity 的实体不崩，三个分量都是 0
+  const zombie = observation.entities.find((item) => item.kind === 'mob');
+  assert.deepEqual(zombie.velocity, { x: 0, y: 0, z: 0 });
+});
+
 test('blockWindow 固定 7x4x7 且 palette/data 长度匹配', () => {
   const observation = buildObservation(fakeBot(), {});
   const window = observation.blockWindow;

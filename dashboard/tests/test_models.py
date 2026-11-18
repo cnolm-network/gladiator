@@ -114,11 +114,27 @@ class InspectPolicyTests(unittest.TestCase):
             inspect_policy(path)
         self.assertIn("W2", str(ctx.exception))
 
-    def test_wrong_obs_dim_rejected(self) -> None:
-        path = write_policy(self.root / "bad.npz", obs=self.obs + 3, actions=self.actions)
+    def test_wider_obs_dim_rejected(self) -> None:
+        """模型比环境宽：无法降维，必须拦在启动前。"""
+        path = write_policy(self.root / "bad.npz", obs=self.obs + 4, actions=self.actions)
         with self.assertRaises(BadRequest) as ctx:
             inspect_policy(path)
-        self.assertIn("obsDim", str(ctx.exception))
+        self.assertIn("无法降维", str(ctx.exception))
+
+    def test_narrower_obs_dim_is_adopted(self) -> None:
+        """旧模型（obsDim 更小）可续训：训练侧 Policy.load 会在 W1 右侧补零列。"""
+        path = write_policy(self.root / "old.npz", obs=self.obs - 4, actions=self.actions)
+        info = inspect_policy(path)
+        self.assertEqual(info["obsDim"], self.obs - 4)
+        self.assertTrue(info["adopted"])
+        self.assertEqual(info["obsDimPadded"], self.obs)
+
+    def test_same_obs_dim_not_adopted(self) -> None:
+        path = write_policy(self.root / "same.npz", obs=self.obs, actions=self.actions)
+        info = inspect_policy(path)
+        self.assertEqual(info["obsDim"], self.obs)
+        self.assertFalse(info["adopted"])
+        self.assertEqual(info["obsDimPadded"], self.obs)
 
     def test_wrong_actions_rejected(self) -> None:
         path = write_policy(self.root / "bad.npz", obs=self.obs, actions=self.actions + 2)
@@ -325,7 +341,8 @@ class ModelHttpTests(_HttpFixture):
     def test_invalid_import_400(self) -> None:
         write_run(self.root, "20261108-2231-train-Bot_I")
         good = self.root / "artifacts" / "runs" / "20261108-2231-train-Bot_I" / "policy.npz"
-        write_policy(good, obs=16)
+        # 用「更宽」的非法模型（更窄现在是合法的续训路径）
+        write_policy(good, obs=spaces_dimensions()[0] + 4)
         status, body = self._request("/api/models", "POST", {
             "name": "bad", "sourceRunId": "20261108-2231-train-Bot_I",
         })
@@ -487,11 +504,26 @@ class TrainingModelParamTests(unittest.TestCase):
         model = self.store.create({"name": "N", "sourceRunId": "20261108-2236-train-Bot_N"})
         path = self.store.root / model["id"] / "model.json"
         data = json.loads(path.read_text(encoding="utf-8"))
-        data["obsDim"] = 16
+        data["obsDim"] = spaces_dimensions()[0] + 4
         path.write_text(json.dumps(data), encoding="utf-8")
         with self.assertRaises(BadRequest) as ctx:
             self.runner._build_train(self._payload(modelId=model["id"]))
-        self.assertIn("obsDim", str(ctx.exception))
+        self.assertIn("无法降维", str(ctx.exception))
+
+    def test_narrower_registered_model_is_adopted(self) -> None:
+        """注册表里的旧模型（obsDim 更小）也能启动训练，并在 params 里标记 adopted。"""
+        write_run(self.root, "20261108-2238-train-Bot_O2")
+        model = self.store.create({"name": "O2", "sourceRunId": "20261108-2238-train-Bot_O2"})
+        path = self.store.root / model["id"] / "model.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["obsDim"] = spaces_dimensions()[0] - 4
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        argv, params, _total, _counts = self.runner._build_train(self._payload(modelId=model["id"]))
+        self.assertTrue(params["modelAdopted"])
+        self.assertEqual(params["modelObsDimPadded"], spaces_dimensions()[0])
+        self.assertEqual(argv[argv.index("--init-policy") + 1],
+                         str(self.store.policy_path(model["id"])))
 
     def test_multi_also_passes_init_policy(self) -> None:
         write_run(self.root, "20261108-2237-train-Bot_O")

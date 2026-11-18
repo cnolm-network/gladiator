@@ -114,6 +114,41 @@ class GymApiTest(unittest.TestCase):
         env.close()
 
 
+class P1ObservationEnvTest(unittest.TestCase):
+    """环境层：观测向量长度与策略输入一致，attack 会刷新 since_attack。"""
+
+    ATTACK = NUM_ACTIONS and 2  # ACTION_NAMES 里 index 2 = attack
+
+    def test_observation_length_matches_policy_input(self):
+        from gladiator_train.policy import Policy
+
+        env, _links = build_env()
+        observation, _info = env.reset()
+        self.assertEqual(observation["bot_0"].shape, (OBS_DIM,))
+        self.assertEqual(observation["bot_0"].shape[0],
+                         Policy(obs_dim=OBS_DIM, n_actions=NUM_ACTIONS, hidden=8).obs_dim)
+        env.close()
+
+    def test_attack_refreshes_since_attack(self):
+        env, _links = build_env()
+        observation, _ = env.reset()
+        # 未出手：默认已冷却（1.0）
+        self.assertAlmostEqual(float(observation["bot_0"][21]), 1.0)
+
+        observation, _r, _t, _tr, _i = env.step({"bot_0": self.ATTACK, "bot_1": 0})
+        self.assertIn("Glad_Bot_1", env._last_attack_at)
+        self.assertLess(float(observation["bot_0"][21]), 0.05)
+        env.close()
+
+    def test_reset_clears_attack_timer(self):
+        env, _links = build_env()
+        env.reset()
+        env.step({"bot_0": self.ATTACK, "bot_1": 0})
+        env.reset()
+        self.assertFalse(env._last_attack_at)
+        env.close()
+
+
 class PrepPhaseTest(unittest.TestCase):
     """开局准备期：压住双方、留出穿甲时间（观战里“没穿衣服就开打”的修复）。"""
 

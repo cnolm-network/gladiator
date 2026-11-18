@@ -52,13 +52,20 @@ BASE_FIELDS: dict[str, str] = {
     "waste": "waste",
     "closing": "closing",
     "attackAttempt": "attack_attempt",
+    "attackInReach": "attack_in_reach",
+    "victory": "victory",
+    "pbrsAlpha": "pbrs_alpha",
+    "pbrsBeta": "pbrs_beta",
+    "pbrsGamma": "pbrs_gamma",
+    "shapingCap": "shaping_cap",
     "counter": "counter",
     "inactive": "inactive",
 }
 
 DEFAULT_BASE: dict[str, float] = {
-    "kill": 20.0,
-    "death": -20.0,
+    "victory": 50.0,
+    "kill": 2.0,
+    "death": -2.0,
     "damageDealt": 2.5,
     "damageTaken": -1.2,
     "combo": 0.6,
@@ -70,9 +77,17 @@ DEFAULT_BASE: dict[str, float] = {
     "waste": -0.08,
     "closing": 0.02,
     "attackAttempt": 0.05,
+    "attackInReach": 0.05,
     "counter": 0.15,
     "inactive": 0.0,
+    "pbrsAlpha": 0.5,
+    "pbrsBeta": 0.5,
+    "pbrsGamma": 1.0,
+    "shapingCap": 5.0,
 }
+
+#: term 的 weight 可以写符号名（解析成常数权重），例如 ``"when":{"won":true}, "weight":"victory"``。
+SYMBOL_WEIGHTS: dict[str, str] = {"victory": "victory"}
 
 #: term 支持的条件（全部 AND）。
 CONDITION_KEYS = {
@@ -85,6 +100,9 @@ CONDITION_KEYS = {
     "afterHitSeconds",
     "comboMin",
     "attacked",
+    # P2：终局布尔，自定义 term 可以直接写 when:{won:true} / {lost:true}
+    "won",
+    "lost",
 }
 
 UNITS = {"second", "step"}
@@ -130,6 +148,12 @@ class Term:
             elif key == "comboMin":
                 if float(ctx.get("combo") or 0.0) < float(expected):
                     return False
+            elif key == "won":
+                if bool(ctx.get("won")) != bool(expected):
+                    return False
+            elif key == "lost":
+                if bool(ctx.get("lost")) != bool(expected):
+                    return False
             elif key == "attacked":
                 if bool(ctx.get("attacked")) is not bool(expected):
                     return False
@@ -152,6 +176,15 @@ def default_preset(name: str = "均衡（默认）") -> dict[str, Any]:
         "base": dict(DEFAULT_BASE),
         "terms": [],
     }
+
+
+def _weight_of(value: Any, label: str) -> float:
+    """term 权重：数字，或 ``"victory"`` 这类符号名（解析成对应的常数）。"""
+    if isinstance(value, str):
+        if value not in SYMBOL_WEIGHTS:
+            raise PresetError(f"{label} 不支持符号 {value!r}（可用: {sorted(SYMBOL_WEIGHTS)}）")
+        return float(DEFAULT_BASE[SYMBOL_WEIGHTS[value]])
+    return _number(value, label)
 
 
 def _number(value: Any, label: str) -> float:
@@ -214,6 +247,10 @@ def normalize_preset(raw: Any) -> dict[str, Any]:
             if key == "actionIn":
                 if not isinstance(value, list) or not value:
                     raise PresetError(f"terms[{index}].when.actionIn 必须是非空数组")
+            elif key in ("won", "lost"):
+                # 终局布尔：只接受 true/false，避免写成 0/1 后语义含糊。
+                if not isinstance(value, bool):
+                    raise PresetError(f"terms[{index}].when.{key} 必须是布尔")
             elif key == "attacked":
                 if not isinstance(value, bool):
                     raise PresetError(f"terms[{index}].when.attacked 必须是布尔")
@@ -222,7 +259,7 @@ def normalize_preset(raw: Any) -> dict[str, Any]:
         terms.append(
             {
                 "id": term_id,
-                "weight": _number(item.get("weight"), f"terms[{index}].weight"),
+                "weight": _weight_of(item.get("weight"), f"terms[{index}].weight"),
                 "unit": unit,
                 "when": dict(when),
             }

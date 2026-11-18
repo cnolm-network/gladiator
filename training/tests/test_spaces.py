@@ -19,6 +19,66 @@ from gladiator_env.spaces import (
 from gladiator_env.testing import make_observation, make_target
 
 
+class P1ObservationTest(unittest.TestCase):
+    """P1 新增的 4 个观测（indices 19..22）：速度、出手间隔、能否打中。"""
+
+    def _obs(self, distance: float, velocity: dict | None = None) -> dict:
+        raw = make_observation(
+            "Glad_Bot_1",
+            targets=[make_target(2, "Glad_Bot_2", x=distance, z=0.0, distance=distance)])
+        if velocity is not None:
+            raw["entities"][0]["velocity"] = velocity
+        return raw
+
+    def test_obs_dim_is_23(self):
+        self.assertEqual(OBS_DIM, 23)
+        self.assertEqual(len(__import__("gladiator_env.spaces", fromlist=["OBS_FIELDS"]).OBS_FIELDS), 23)
+
+    def test_opponent_speed_components(self):
+        vector = encode_observation(self._obs(2.0, {"x": 3.0, "y": -2.5, "z": 4.0}), "Glad_Bot_1")
+        self.assertAlmostEqual(float(vector[19]), 5.0 / 10.0, places=6)   # √(3²+4²)=5
+        self.assertAlmostEqual(float(vector[20]), -2.5 / 5.0, places=6)
+
+    def test_missing_velocity_does_not_crash(self):
+        vector = encode_observation(self._obs(2.0), "Glad_Bot_1")
+        self.assertEqual(float(vector[19]), 0.0)
+        self.assertEqual(float(vector[20]), 0.0)
+        self.assertTrue(np.all(np.isfinite(vector)))
+
+    def test_speed_is_clipped(self):
+        vector = encode_observation(self._obs(2.0, {"x": 40.0, "y": 40.0, "z": 40.0}), "Glad_Bot_1")
+        self.assertAlmostEqual(float(vector[19]), 1.0, places=6)
+        self.assertAlmostEqual(float(vector[20]), 1.0, places=6)
+
+    def test_in_reach_boundary(self):
+        inside = encode_observation(self._obs(3.99), "Glad_Bot_1", reach=3.99)
+        outside = encode_observation(self._obs(4.01), "Glad_Bot_1", reach=3.99)
+        self.assertEqual(float(inside[22]), 1.0)
+        self.assertEqual(float(outside[22]), 0.0)
+
+    def test_in_reach_follows_reach(self):
+        obs = self._obs(3.2)
+        self.assertEqual(float(encode_observation(obs, "Glad_Bot_1", reach=3.0)[22]), 0.0)
+        self.assertEqual(float(encode_observation(obs, "Glad_Bot_1", reach=3.99)[22]), 1.0)
+
+    def test_in_reach_is_horizontal(self):
+        """竖直差大但水平贴身：仍算「打得到」（3D 距离会误导）。"""
+        raw = make_observation(
+            "Glad_Bot_1",
+            targets=[make_target(2, "Glad_Bot_2", x=1.0, y=70.0, z=0.0, distance=6.0)])
+        self.assertEqual(float(encode_observation(raw, "Glad_Bot_1", reach=3.99)[22]), 1.0)
+
+    def test_since_attack_monotonic(self):
+        values = [float(encode_observation(self._obs(2.0), "Glad_Bot_1", since_attack=sec)[21])
+                  for sec in (0.0, 1.0, 2.5, 5.0, 9.0)]
+        self.assertEqual(values, sorted(values))
+        self.assertAlmostEqual(values[0], 0.0)
+        self.assertAlmostEqual(values[-1], 1.0)  # 超过 5s 被夹住
+
+    def test_since_attack_default_is_cooldown(self):
+        self.assertAlmostEqual(float(encode_observation(self._obs(2.0), "Glad_Bot_1")[21]), 1.0)
+
+
 class EncodeObservationTest(unittest.TestCase):
     def test_shape_and_dtype(self):
         vector = encode_observation(make_observation("Glad_Bot_1"), "Glad_Bot_1")

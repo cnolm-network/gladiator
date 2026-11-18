@@ -383,6 +383,7 @@
             <button class="btn tiny ghost" id="btn-run-close" type="button">收起</button>
           </div>
         </div>
+        <div class="notice warn hidden" id="data-run-frozen">策略熵过低（&lt;0.05），可能已停止学习：连续 3 局 entropy &lt; 0.05。</div>
         <div id="data-run-body"></div>
         <div class="card-head" style="margin-top:14px"><h3>分对手胜率</h3><span class="muted small">按训练计划段统计</span></div>
         <div class="table-wrap" id="data-run-byopponent-wrap">
@@ -390,6 +391,17 @@
         </div>
         <div class="empty hidden" id="data-run-byopponent-empty">暂无分对手数据（该运行没有记录 opponentMode）。</div>
         <div class="chart" id="data-run-chart"></div>
+        <div class="card-head" style="margin-top:14px"><h3>熵曲线</h3><span class="muted small">逐局 entropy（独立刻度）</span></div>
+        <div class="chart" id="data-run-entropy-chart"></div>
+        <div class="card-head" style="margin-top:14px"><h3>胜率曲线</h3><span class="muted small">每 10 局一个窗口</span></div>
+        <div class="chart" id="data-run-winrate-chart"></div>
+        <div class="card-head" style="margin-top:14px"><h3>PPO 诊断</h3><span class="muted small">history 均值；valueLoss &gt; 5 提示价值头发散，解释方差 &lt; 0.3 提示价值头拟合差</span></div>
+        <div id="data-run-ppo"></div>
+        <div class="card-head" style="margin-top:14px"><h3>DAgger 迭代模仿</h3><span class="muted small">每轮：当前策略跑局 → 老师打标签 → BC → 评估（第 0 轮是 BC 基线）</span></div>
+        <div class="table-wrap" id="data-run-dagger-wrap">
+          <table><thead><tr><th>轮</th><th>样本</th><th>一致率</th><th>loss</th><th>评估（采样）</th><th>评估（贪心）</th></tr></thead><tbody id="data-run-dagger"></tbody></table>
+        </div>
+        <div class="empty hidden" id="data-run-dagger-empty">该运行没有 DAgger 轮次（--dagger-rounds 0）。</div>
         <div class="card-head" style="margin-top:14px"><h3>该运行回合</h3><span class="muted small" id="data-run-episodes-meta"></span></div>
         <div class="table-wrap">
           <table><thead><tr><th>#</th><th>开始时间</th><th>耗时</th><th>步数</th><th>reward</th><th>winner</th><th></th></tr></thead><tbody id="data-run-episodes"></tbody></table>

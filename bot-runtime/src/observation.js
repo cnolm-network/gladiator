@@ -157,11 +157,20 @@ export function buildObservation(bot, {
     const holding = entity.heldItem && entity.heldItem.name && entity.heldItem.name !== 'air'
       ? { name: entity.heldItem.name, count: entity.heldItem.count || 1 }
       : null;
+    // 速度：训练方要用它判断「这一刀能不能打中」——对手正在拉开/贴身时，
+    // 同一距离下的命中率完全不同。mineflayer 的玩家与生物都带 velocity，
+    // 缺失（旧版本/静止实体）时填 0，保证字段恒存在。
+    const velocity = entity.velocity || { x: 0, y: 0, z: 0 };
     entities.push({
       id: entity.id,
       kind: entityKind(entity),
       name: entityName(entity),
       pos: { x: pos.x, y: pos.y, z: pos.z },
+      velocity: {
+        x: Number(velocity.x) || 0,
+        y: Number(velocity.y) || 0,
+        z: Number(velocity.z) || 0,
+      },
       distance: position.distanceTo(pos),
       heldItem: holding,
     });

@@ -139,6 +139,18 @@ main { padding: 20px 24px 48px; max-width: 1500px; margin: 0 auto; }
 .mono { font-family: var(--mono); }
 .hidden { display: none !important; }
 
+/* P2.1：策略冻结等黄色警示条 */
+.notice.warn {
+  margin: 10px 0;
+  padding: 9px 12px;
+  border: 1px solid #5b4a22;
+  border-radius: 8px;
+  background: #241f10;
+  color: var(--warn);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .pill {
   display: inline-flex; align-items: center; gap: 6px;
   border-radius: 999px; padding: 2px 9px;

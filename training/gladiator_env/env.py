@@ -162,6 +162,10 @@ class ArenaConfig:
     spacing: float = 6.0
     #: 开局准备期（秒）：发令前压住双方、再校验一次套装。0 表示不等待。
     prep_seconds: float = 3.0
+    #: 起始分布随机化（P1.6）：(中心偏移, 间距抖动)，单位格。每局用 np_random 采样一次，
+    #: 同一局内两只 Bot 共用同一组参数（只在 X 轴、Y 轴偏移中心，间距各自对称展开）。
+    #: ``(0.0, 0.0)`` = 完全确定（旧行为）。
+    jitter: tuple[float, float] = (2.0, 1.0)
     #: 每次 reset 是否清背包（空手训练必须为 True）。
     clear_inventory: bool = True
     #: 每次 reset 是否把血量回满（1.8 用 Instant Health IV）。
@@ -188,6 +192,29 @@ class ArenaConfig:
 
 
 MIN_SPACING = 4.0
+
+#: 对手池的每局随机化区间（P1.6）：模式 -> (attackProb 区间, approachThreshold 区间)。
+#: 固定节奏的对手会让策略过拟合，所以每局重采一次，评估分布也更宽。
+OPPONENT_PROFILES: dict[str, dict[str, tuple[float, float]]] = {
+    # P1.7：新增「起手延迟」与「出手间隔」两维。
+    # rusher 之前是 attackProb 0.96 + approachThreshold 4.0：几乎不给反应窗口，
+    # 训练里根本没有「被先手压制」的样本 → 该对手 0/8。给它 0.5–2s 起手延迟后，
+    # 学习方才有机会学到「开局先站住/先手」。
+    "rusher": {"attackProb": (0.80, 0.98), "approachThreshold": (3.0, 4.0),
+               "startDelayTicks": (10, 40), "attackCooldownTicks": (1, 3)},
+    "scripted": {"attackProb": (0.70, 0.90), "approachThreshold": (2.4, 3.2),
+                 "startDelayTicks": (20, 60), "attackCooldownTicks": (2, 5)},
+    "aimbot": {"attackProb": (0.90, 1.00), "approachThreshold": (3.4, 4.2),
+               "startDelayTicks": (0, 20), "attackCooldownTicks": (1, 2)},
+}
+#: 取整的区间键（用 np_random.integers 采样，结果是 int）。
+INT_PROFILE_KEYS = frozenset({"startDelayTicks", "attackCooldownTicks"})
+#: 所有模式共用的「对手 reach 折减」区间：对手不会用到满格 reach（给学习方留空间）。
+OPPONENT_REACH_OFFSET = (0.5, 1.0)
+#: 非池化模式（random/wander/idle）使用的固定折减，保持旧行为。
+DEFAULT_REACH_OFFSET = 0.75
+#: 对手有效 reach 的下限。
+MIN_OPPONENT_REACH = 1.5
 
 
 class GladiatorEnv(gym.Env):
@@ -223,6 +250,15 @@ class GladiatorEnv(gym.Env):
         if len(self.bots) < 1:
             raise ValueError("至少需要一个 Bot 才能建立训练环境")
         self.arena = arena or ArenaConfig()
+        #: 本局对手（index != 0）的行为参数（reset 按 opponent_mode 采样）。
+        self._opp_profile: dict[str, float] = {}
+        #: 起手延迟剩余 tick（P1.7）：>0 时该对手只 idle，不移动也不出手。
+        self._opp_hold_ticks: dict[str, int] = {}
+        #: 下一次允许出手的 step 号（P1.7 出手间隔）；未到点的 attack 退化为靠近。
+        self._opp_next_attack_tick: dict[str, int] = {}
+        #: 本局实际使用的中心/间距（reset 按 jitter 采样；默认等于配置值）。
+        self._arena_center: tuple[float, float, float] = tuple(self.arena.center)  # type: ignore[assignment]
+        self._arena_spacing: float = float(self.arena.spacing)
         # 两个 Bot 站在同一点会互相卡住：死亡后在原地复活、对手又贴着打，补给永远发不下去。
         # 这里兜底一个最小间距，避免表单里留空/填 0 直接把整个训练变成“出生点互砍”。
         if self.arena.spacing < MIN_SPACING:
@@ -257,8 +293,12 @@ class GladiatorEnv(gym.Env):
             self.reward_preset_name = "builtin" if shaping_weights is None else "custom-weights"
 
         self._last_events: dict[str, list[dict]] = {}
+        #: 最近一次 step 真正下发的协议动作（按用户名）：复盘/BC 诊断用。
+        self._last_dispatch: dict[str, list[dict]] = {}
         self._last_attacked: dict[str, bool] = {}
         self._last_distance: dict[str, float | None] = {}
+        #: 上次下发 attack 动作的时刻（P1：观测 self_since_attack 用，初始视为已冷却）。
+        self._last_attack_at: dict[str, float] = {}
         #: 重生后的「观察档」：这段时间内代码驱动的对手只观察不出手（旧坐标会被传送打飞）。
         self._respawn_grace: dict[str, int] = {}
         #: 对手「出手前先确认」：本 tick 判到 attack 但还没确认时记 1，下一 tick 复核后才真出手。
@@ -295,6 +335,14 @@ class GladiatorEnv(gym.Env):
         elif isinstance(rcon, dict):
             self._rcon = RconClient(**rcon)
             self._rcon_owned = True
+        # 连接复用：Paper 的 RCON 对「短时间大量新建/断开」很敏感（日志里每局好几行
+        # `Rcon connection from`），所以整局生命周期只连一次，reset 只在断线时重连。
+        # 初次连接失败不在构造期抛：留到 reset()，保持「失败发生在 reset」的既有语义。
+        if self._rcon_owned and self._rcon is not None and not self._rcon.is_connected():
+            try:
+                self._rcon.connect()
+            except Exception as exc:  # noqa: BLE001 - reset() 会重试并抛出
+                self._log(f"RCON 初次连接失败（reset 时重试）：{exc}")
 
         if self.single_agent:
             # 单智能体视角（Gymnasium 标准）：控制 bot_0，其余 Bot 作为对手由环境随机采样动作。
@@ -319,6 +367,15 @@ class GladiatorEnv(gym.Env):
         super().reset(seed=seed)
         self.shaping.reset()
         options = options or {}
+        # P1.6：起始分布随机化。同一局两只 Bot 共用一组中心/间距，保证对称。
+        self._sample_arena()
+        self._sample_opponent_profile()
+        # 起手延迟 / 出手间隔按「本局采样」重置，跨局不残留。
+        self._opp_hold_ticks = {
+            bot.username: int(self._opp_profile.get("startDelayTicks", 0) or 0)
+            for bot in self.bots
+        }
+        self._opp_next_attack_tick = {bot.username: 0 for bot in self.bots}
         self._steps = 0
         # 新回合：动作确认状态与补装确认都不该跨回合残留。
         self._opponent_hold.clear()
@@ -327,9 +384,11 @@ class GladiatorEnv(gym.Env):
         self._restock_logged.clear()
         self._restock_tick.clear()
         self._restock_rounds.clear()
+        self._last_attack_at.clear()
         self._ensure_connected()
 
-        if self._rcon_owned and self._rcon is not None:
+        if self._rcon is not None and not self._rcon.is_connected():
+            # 复用长连接；只有真的断了（或初次没连上）才新建。
             self._rcon.connect()
 
         if self.auto_spawn and options.get("spawn", True):
@@ -343,9 +402,11 @@ class GladiatorEnv(gym.Env):
 
         self._raw = [self._latest_raw(i) for i in range(len(self.bots))]
         observation = self._encode_all()
+        info = {"step": 0, "arena": self._arena_info(),
+                "opponentProfile": self._opponent_profile_info()}
         if self.single_agent:
-            return observation[self._key(0)], {"step": 0}
-        return observation, {"step": 0}
+            return observation[self._key(0)], info
+        return observation, info
 
     def step(self, action):
         self._steps += 1
@@ -367,7 +428,7 @@ class GladiatorEnv(gym.Env):
             raw = self._raw[i] if i < len(self._raw) else {}
             # 代码驱动的对手比学习方多留 0.75 格余量：它没有「奖励」纠偏，而观测到出手之间
             # 有 1 个 tick 的延迟（约 5 格/s × 0.2s ≈ 1.1 格），加上击退会让边界攻击吃 OUT_OF_REACH。
-            reach = bot.reach if i == 0 else max(1.5, float(bot.reach) - 0.75)
+            reach = float(bot.reach) if i == 0 else self._opponent_reach(i, float(bot.reach))
             actions = decode_action(index, raw, bot.username, opponents, reach=reach)
             if i != 0 and self._respawn_grace.get(bot.username, 0) > 0:
                 # 刚重生（可能被传送到出生点）：本 tick 只做观察，避免对旧坐标出手。
@@ -383,7 +444,13 @@ class GladiatorEnv(gym.Env):
                 # 重生补装确认中：背包可能还没同步，进攻动作直接不发
                 # （否则运行时回 ITEM_MISSING，日志刷屏且这一 tick 白费）。
                 actions = self._strip_combat_actions(actions)
+            if any(action.get("type") == "attack" for action in actions):
+                # 只要真的下发了 attack 就记时（含运行时把它改成追击的情况）。
+                # 必须在下发时记，而不是算奖励时：观测在这一 tick 末尾生成，
+                # 策略要能看到「我刚挥过一刀」（冷却/连击节奏靠这个）。
+                self._last_attack_at[bot.username] = time.monotonic()
             dispatch.append(actions)
+            self._last_dispatch[bot.username] = list(actions)
             self._handle_action_results(i, self._safe_send(i, actions))
 
         time.sleep(self.action_ticks / self._control_hz)
@@ -404,6 +471,7 @@ class GladiatorEnv(gym.Env):
         truncated = self._steps >= self.max_steps
         rewards = {}
         self._last_events = {}
+        self._last_dispatch = {}
         self._last_attacked = {}
         self._last_distance = {}
         now = time.monotonic()
@@ -415,6 +483,8 @@ class GladiatorEnv(gym.Env):
             wants_attack = any(action.get("type") == "attack" for action in dispatch[i])
             # 超出 reach 的 attack 根本挥不出去（运行时抛 OUT_OF_REACH），不能算空挥。
             in_reach = distance is None or distance <= float(bot.reach) + 0.2
+            # 观测口径的「这一刀打得到」：水平距离 ≤ 自己的 reach（与 spaces.in_reach 同源）。
+            in_reach_horizontal = self._in_reach_horizontal(i, opponent, float(bot.reach))
             self._last_attacked[bot.username] = wants_attack and in_reach
             action_name = ACTION_NAMES[index] if 0 <= index < len(ACTION_NAMES) else "idle"
             if self.reward_mode == "shaped":
@@ -426,6 +496,7 @@ class GladiatorEnv(gym.Env):
                     opponent_current=self._raw[opponent] if opponent is not None else None,
                     terminated=terminated,
                     attacked=self._last_attacked[bot.username],
+                    in_reach=in_reach_horizontal,
                     action=action_name,
                     distance=distance,
                     previous_distance=previous_distance,
@@ -450,6 +521,8 @@ class GladiatorEnv(gym.Env):
 
         info = {
             "step": self._steps,
+            "arena": self._arena_info(),
+            "opponentProfile": self._opponent_profile_info(),
             "health": {bot.username: self_health(self._raw[i]) for i, bot in enumerate(self.bots)},
             "states": {bot.username: str(self._raw[i].get("state", "Alive")) for i, bot in enumerate(self.bots)},
             "winner": self._winner(),
@@ -466,6 +539,27 @@ class GladiatorEnv(gym.Env):
     def last_events(self) -> dict[str, list[dict]]:
         """最近一次 step 的塑形事件（hit/whiff/combo/kill/death）。"""
         return {name: list(events) for name, events in self._last_events.items()}
+
+    def last_dispatch(self, username: str) -> list[dict]:
+        """最近一次 step 真正下发给某个 Bot 的协议动作（复盘口径核对用）。
+
+        注意与「策略选了哪个动作编号」不同：``decode_action`` 可能把越界的 attack
+        改成「靠近」，所以复盘要按实际下发的动作判断有没有真挥刀。
+        """
+        return list(self._last_dispatch.get(username, []))
+
+    def _in_reach_horizontal(self, index: int, opponent: int | None, reach: float) -> bool:
+        """水平距离是否在 reach 内（缺数据时返回 False，不白送奖励）。"""
+        if opponent is None or opponent >= len(self._raw) or index >= len(self._raw):
+            return False
+        a = (self._raw[index].get("self") or {}).get("pos") or {}
+        b = (self._raw[opponent].get("self") or {}).get("pos") or {}
+        try:
+            dx = float(a["x"]) - float(b["x"])
+            dz = float(a["z"]) - float(b["z"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return (dx * dx + dz * dz) ** 0.5 <= reach
 
     def idle_snapshot(self) -> dict:
         """G-405：空闲状态快照（不进 ``info``，避免破坏 Gymnasium 的确定性检查）。
@@ -497,6 +591,7 @@ class GladiatorEnv(gym.Env):
                 link.stop()
             except Exception:  # noqa: BLE001 - 关闭阶段不再抛错
                 pass
+        # 只有自己创建的连接才由自己断开（调用方传进来的连接归调用方管）。
         if self._rcon is not None and self._rcon_owned:
             self._rcon.close()
         self._rcon = None
@@ -554,42 +649,63 @@ class GladiatorEnv(gym.Env):
             "direction": "forward", "durationMs": MOVE_MS, "sprint": True}}
         return ([look] if look is not None else []) + [move]
 
+    def _profile(self) -> dict[str, float]:
+        """本局对手参数；未采样时给各模式的默认值（构造后未 reset 的调用方兜底）。"""
+        if self._opp_profile.get("attackProb") is not None and "attackProb" in self._opp_profile:
+            return self._opp_profile
+        mode = self.opponent_mode
+        defaults = {
+            "rusher": {"attackProb": 0.96, "approachThreshold": 3.4},
+            "scripted": {"attackProb": 0.85, "approachThreshold": 2.8},
+            "aimbot": {"attackProb": 1.0, "approachThreshold": 3.9},
+        }
+        base = {"mode": mode, "reachOffset": float(DEFAULT_REACH_OFFSET),
+                "startDelayTicks": 0, "attackCooldownTicks": 0}
+        base.update(defaults.get(mode, {"attackProb": 1.0, "approachThreshold": 2.8}))
+        return base
+
+    def _opponent_ready(self, index: int) -> bool:
+        """对手是否已过「起手延迟」（P1.7）。
+
+        未就绪时 ``_opponent_action`` 只回 idle——这样训练里才会出现
+        「对手还在起手、我先动手」的窗口，而不是开局就被 0.96 概率连打。
+        """
+        username = self.bots[index].username if 0 <= index < len(self.bots) else ""
+        return int(self._opp_hold_ticks.get(username, 0)) <= 0
+
+    def _opponent_cooldown(self) -> int:
+        return int(self._opp_profile.get("attackCooldownTicks", 0) or 0)
+
     def _opponent_action(self, index: int) -> int:
         """非受控 Bot 的动作：课程学习的不同难度。"""
+        username = self.bots[index].username if 0 <= index < len(self.bots) else ""
+        if not self._opponent_ready(index):
+            # 起手延迟：只观察，不动也不打。
+            self._opp_hold_ticks[username] = max(0, int(self._opp_hold_ticks.get(username, 0)) - 1)
+            return 0
         mode = self.opponent_mode
         if mode == "idle":
             return 0
         if mode == "wander":
             return int(self.np_random.choice([1, 3, 4, 6]))  # approach/strafe/jump，不打人
-        if mode == "rusher":
-            # 猛冲型：几乎不做拉扯，贴脸就砍（给学习方制造持续压力）。
+        if mode in ("rusher", "aimbot", "scripted"):
+            # 三种池化模式共用一套判定，参数来自本局采样的 profile（P1.6）：
+            # 阈值/出手概率每局不同，策略不能只记住一种节奏。
+            profile = self._profile()
             observation = self._raw[index] if index < len(self._raw) else {}
             target = nearest_player(observation, self.bots[index].username, self._opponent_names())
             if target is None:
-                return 1
+                return 1 if mode != "scripted" else int(self.np_random.choice([1, 6]))
             distance = float(target.get("distance", 99))
-            if distance > 3.4:
+            if distance > profile["approachThreshold"]:
                 return 1
-            return 2 if self.np_random.random() < 0.96 else 6
-        if mode == "aimbot":
-            # 100% 瞄准型：每一步都重新转向并攻击，几乎不空挥。
-            observation = self._raw[index] if index < len(self._raw) else {}
-            target = nearest_player(observation, self.bots[index].username, self._opponent_names())
-            if target is None:
-                return 1
-            distance = float(target.get("distance", 99))
-            # 贴到攻击距离内就一直砍，不再在 3.5 格外停下。
-            return 1 if distance > 3.9 else 2
-        if mode == "scripted":
-            # 简化脚本：远则靠近，近则攻击，偶尔跳。
-            observation = self._raw[index] if index < len(self._raw) else {}
-            target = nearest_player(observation, self.bots[index].username, self._opponent_names())
-            if target is None:
-                return int(self.np_random.choice([1, 6]))
-            distance = float(target.get("distance", 99))
-            if distance > 2.8:
-                return 1
-            return 2 if self.np_random.random() < 0.85 else 6
+            if self.np_random.random() < profile["attackProb"]:
+                # 出手间隔：没到点的攻击退化为靠近（保持"想打但打不了"的压迫感）。
+                if self._steps < int(self._opp_next_attack_tick.get(username, 0)):
+                    return 1
+                self._opp_next_attack_tick[username] = self._steps + self._opponent_cooldown()
+                return 2
+            return 6
         return int(self.np_random.integers(NUM_ACTIONS))
 
     @staticmethod
@@ -1027,9 +1143,83 @@ class GladiatorEnv(gym.Env):
             self._log(f"设置 {bot.username} 的头顶标签失败（{role}）：{exc}")
 
     def _spawn_point(self, index: int) -> tuple[float, float, float]:
-        cx, cy, cz = self.arena.center
-        offset = (index - (len(self.bots) - 1) / 2.0) * self.arena.spacing
+        cx, cy, cz = self._arena_center
+        offset = (index - (len(self.bots) - 1) / 2.0) * self._arena_spacing
         return cx + offset, cy, cz
+
+    def _sample_arena(self) -> None:
+        """按 ``ArenaConfig.jitter`` 采样本局的中心偏移与间距抖动。
+
+        ``jitter=(0, 0)`` 时**逐位等于**配置值（完全确定，旧行为）；
+        间距仍受 ``MIN_SPACING`` 夹取，避免抖出「贴脸开局」。
+        """
+        cx, cy, cz = (float(v) for v in self.arena.center)
+        spacing = float(self.arena.spacing)
+        try:
+            jitter_center, jitter_spacing = (float(self.arena.jitter[0]),
+                                             float(self.arena.jitter[1]))
+        except (TypeError, IndexError):
+            jitter_center, jitter_spacing = 0.0, 0.0
+        jitter_center = abs(jitter_center)
+        jitter_spacing = abs(jitter_spacing)
+        if jitter_center > 0.0:
+            # 只用 x/z 偏移：y 是地面高度，抖它会把 Bot 埋进方块里。
+            cx += float(self.np_random.uniform(-jitter_center, jitter_center))
+            cz += float(self.np_random.uniform(-jitter_center, jitter_center))
+        if jitter_spacing > 0.0:
+            spacing += float(self.np_random.uniform(-jitter_spacing, jitter_spacing))
+        spacing = max(MIN_SPACING, spacing)
+        self._arena_center = (cx, cy, cz)
+        self._arena_spacing = float(spacing)
+
+    def _sample_opponent_profile(self) -> None:
+        """按当前 ``opponent_mode`` 采样本局的对手参数（P1.6 对手池）。
+
+        - ``rusher``  : attackProb 0.80–0.98、approachThreshold 3.0–4.0
+        - ``scripted``: attackProb 0.70–0.90、approachThreshold 2.4–3.2
+        - ``aimbot``  : attackProb 0.90–1.00、approachThreshold 3.4–4.2
+        - 其它模式（random/wander/idle）保持旧行为，只带固定 reach 折减。
+
+        区间来自 ``OPPONENT_PROFILES``；同一局内固定，换局重采 → 训练/评估都不会只
+        见一种节奏。
+        """
+        spec = OPPONENT_PROFILES.get(self.opponent_mode)
+        if spec is None:
+            self._opp_profile = {
+                "mode": str(self.opponent_mode),
+                "reachOffset": float(DEFAULT_REACH_OFFSET),
+                # 非池化模式没有 profile：视为「无起手延迟、无出手间隔」，行为不变。
+                "startDelayTicks": 0,
+                "attackCooldownTicks": 0,
+            }
+            return
+        profile: dict[str, float] = {"mode": str(self.opponent_mode)}
+        for key, (low, high) in spec.items():
+            if key in INT_PROFILE_KEYS:
+                # 闭区间：integers 的上界是不含的，+1 才是 [low, high]。
+                profile[key] = int(self.np_random.integers(int(low), int(high) + 1))
+            else:
+                profile[key] = float(self.np_random.uniform(low, high))
+        profile["reachOffset"] = float(self.np_random.uniform(*OPPONENT_REACH_OFFSET))
+        self._opp_profile = profile
+
+    def _opponent_profile_info(self) -> dict:
+        """给 info / 复盘用的快照（不在池里的模式只返回 mode + reachOffset）。"""
+        return {
+            key: (round(value, 4) if isinstance(value, float) else value)
+            for key, value in self._opp_profile.items()
+        }
+
+    def _opponent_reach(self, index: int, reach: float) -> float:
+        """对手的有效 reach：``reach - reachOffset``，并夹到 ``MIN_OPPONENT_REACH``。"""
+        offset = float(self._opp_profile.get("reachOffset", DEFAULT_REACH_OFFSET))
+        return max(MIN_OPPONENT_REACH, float(reach) - offset)
+
+    def _arena_info(self) -> dict:
+        return {
+            "center": [round(v, 3) for v in self._arena_center],
+            "spacing": round(float(self._arena_spacing), 3),
+        }
 
     def _command(self, command: str) -> str:
         assert self._rcon is not None
@@ -1121,12 +1311,16 @@ class GladiatorEnv(gym.Env):
         for index, bot in enumerate(self.bots):
             opponent = self._opponent_index(index)
             opponent_health = self_health(self._raw[opponent]) if opponent is not None and opponent < len(self._raw) else None
+            last_attack = self._last_attack_at.get(bot.username)
+            since_attack = 5.0 if last_attack is None else (time.monotonic() - last_attack)
             encoded[self._key(index)] = encode_observation(
                 self._raw[index],
                 bot.username,
                 step_fraction=fraction,
                 opponent_health=opponent_health,
                 opponents=self._opponent_names(),
+                reach=float(bot.reach),
+                since_attack=since_attack,
             )
         return encoded
 

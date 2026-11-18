@@ -16,9 +16,16 @@ def obs(health: float, state: str = "Alive") -> dict:
 
 
 class ShapingRewardTest(unittest.TestCase):
+    """旧口径的数值断言：显式关掉 P2 的 PBRS 与 dense 封顶。
+
+    P2 默认开启 PBRS（每步加势能差）与 ±5 封顶，会让「纯伤害 = 2.5×HP」这类
+    单点断言随之改变；这里测的是**关掉新机制后的原语义**，新机制的断言见
+    ``P2ShapingTest``。
+    """
+
     def setUp(self) -> None:
-        self.reward = ShapingReward()
-        self.w = ShapingWeights()
+        self.w = ShapingWeights(shaping_cap=0.0)
+        self.reward = ShapingReward(self.w, use_pbrs=False)
 
     def compute(self, **kwargs):
         base = dict(
@@ -33,6 +40,31 @@ class ShapingRewardTest(unittest.TestCase):
         value, events = self.compute(opponent_current=obs(14), attacked=True)
         self.assertAlmostEqual(value, 2.5 * 6, places=6)
         self.assertEqual(events[0]["type"], "hit")
+
+    def test_attack_in_reach_pays_once_per_attack(self) -> None:
+        """P1.5：射程内真的挥刀给一次奖励（不是每 step 都给）。"""
+        self.reward.reset()  # 独立状态，避免上一次的 last_taken 等串味
+        value, events = self.compute(attacked=True, in_reach=True, distance=3.0)
+        self.assertIn("attackInReach", [e["type"] for e in events])
+        w = ShapingWeights()
+        # 没命中 → 还要吃空挥惩罚；射程内 3.0 格 → 压迫位 + pressure·dt
+        self.assertAlmostEqual(
+            value,
+            w.whiff + w.attack_attempt + w.attack_in_reach + w.pressure * 0.2,
+            places=6)
+
+        # 不在射程内挥刀：没有这一项
+        self.reward.reset()
+        _no_reach, far_events = self.compute(attacked=True, in_reach=False, distance=6.0)
+        self.assertNotIn("attackInReach", [e["type"] for e in far_events])
+        # 没有攻击动作：也没有这一项（哪怕站在原地贴着）
+        self.reward.reset()
+        _no_attack, idle_events = self.compute(attacked=False, in_reach=True, distance=3.0)
+        self.assertNotIn("attackInReach", [e["type"] for e in idle_events])
+
+    def test_attack_in_reach_default_weight(self) -> None:
+        self.assertEqual(ShapingWeights().attack_in_reach, 0.05)
+        self.assertEqual(ShapingWeights().as_dict()["attackInReachPerAttack"], 0.05)
 
     def test_damage_taken_is_minus_1_2_per_hp(self) -> None:
         value, _ = self.compute(current=obs(16))
@@ -129,6 +161,83 @@ class ShapingRewardTest(unittest.TestCase):
         self.compute(opponent_current=obs(14), attacked=True)
         summary = self.reward.summary("Bot_A")
         self.assertGreater(summary["totals"]["damageDealt"], 0)
+
+
+class P2ShapingTest(unittest.TestCase):
+    """P2：PBRS 势能、victory ±50、dense 每步封顶。"""
+
+    def setUp(self) -> None:
+        self.reward = ShapingReward()
+        self.w = ShapingWeights()
+
+    def compute(self, **kwargs):
+        base = dict(
+            previous=obs(20), current=obs(20), opponent_previous=obs(20),
+            opponent_current=obs(20), terminated=False, attacked=False,
+            distance=None, now=0.0, dt=0.2,
+        )
+        base.update(kwargs)
+        return self.reward.compute("Bot_A", **base)
+
+    def test_victory_is_fifty_and_kill_is_small(self):
+        self.assertEqual(self.w.victory, 50.0)
+        self.assertEqual(self.w.kill, 2.0)
+        self.assertEqual(self.w.death, -2.0)
+        won, events = self.compute(opponent_current=obs(0, "Dead"), terminated=True)
+        self.assertIn("victory", [e["type"] for e in events])
+        self.assertGreaterEqual(won, 50.0)
+        lost, events = self.compute(current=obs(0, "Dead"), terminated=True)
+        self.assertIn("victory", [e["type"] for e in events])
+        self.assertLessEqual(lost, -50.0)
+
+    def test_dense_is_capped_per_step(self):
+        # 6 点伤害 ×2.5 = 15 → 封顶到 5；裁剪量记进 capped
+        value, events = self.compute(opponent_current=obs(14), attacked=True)
+        self.assertLessEqual(value, self.w.shaping_cap + 1e-9)
+        self.assertIn("capped", [e["type"] for e in events])
+        totals = self.reward.summary("Bot_A")["totals"]
+        self.assertLess(totals.get("capped", 0.0), 0.0)
+
+    def test_victory_is_not_capped(self):
+        value, _ = self.compute(opponent_current=obs(0, "Dead"), terminated=True)
+        self.assertGreater(value, self.w.shaping_cap)
+
+    def test_pbrs_rewards_health_advantage(self):
+        """对手掉血 → Φ 上升 → 首步 F = γΦ(s') − Φ(s) > 0。"""
+        value, events = self.compute(opponent_current=obs(14), attacked=False, distance=None)
+        pbrs_events = [e for e in events if e["type"] == "pbrs"]
+        self.assertTrue(pbrs_events, events)
+        self.assertGreater(pbrs_events[0]["value"], 0.0)
+
+    def test_pbrs_uses_reset_state_for_first_step(self):
+        """首步的 Φ(s) 取 reset 状态：同状态 → F = 0。"""
+        _value, events = self.compute()
+        pbrs = [e for e in events if e["type"] == "pbrs"]
+        self.assertEqual(pbrs, [], "状态没变时势能差应为 0")
+
+    def test_pbrs_can_be_disabled(self):
+        reward = ShapingReward(use_pbrs=False)
+        _value, events = reward.compute(
+            "Bot_A", previous=obs(20), current=obs(20),
+            opponent_previous=obs(20), opponent_current=obs(14),
+            terminated=False, attacked=False, distance=None, now=0.0, dt=0.2,
+        )
+        self.assertNotIn("pbrs", [e["type"] for e in events])
+
+    def test_potential_distance_term(self):
+        # 相距 20 格 → phi_dist = 0；相距 0 格 → 1.0
+        far_prev = {"self": {"health": 20, "pos": {"x": 0, "y": 4, "z": 0}}, "state": "Alive"}
+        far_cur = {"self": {"health": 20, "pos": {"x": 20, "y": 4, "z": 0}}, "state": "Alive"}
+        near_cur = {"self": {"health": 20, "pos": {"x": 0, "y": 4, "z": 0}}, "state": "Alive"}
+        self.assertAlmostEqual(self.reward.potential(far_prev, far_cur), 0.0, places=6)
+        self.assertAlmostEqual(self.reward.potential(far_prev, near_cur),
+                               self.w.pbrs_beta, places=6)
+
+    def test_as_dict_has_pbrs_fields(self):
+        payload = self.w.as_dict()
+        for key in ("pbrsAlpha", "pbrsBeta", "pbrsGamma", "victory", "shapingCap"):
+            self.assertIn(key, payload)
+        self.assertEqual(payload["pbrsGamma"], 1.0)
 
 
 if __name__ == "__main__":

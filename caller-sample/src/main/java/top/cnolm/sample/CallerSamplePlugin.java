@@ -6,7 +6,10 @@ import org.bukkit.World;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
 import org.bukkit.event.HandlerList;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.Listener;
 import org.bukkit.plugin.java.JavaPlugin;
 import top.cnolm.gladiator.api.GladiatorAPI;
@@ -65,6 +68,8 @@ public final class CallerSamplePlugin extends JavaPlugin {
     /** A3 验收用的假领地插件（不依赖 WorldGuard）。 */
     private DenyZone denyZone;
     private String activeName;
+    /** /caller dmglog：把 Bot 受到的伤害连同 cause 打到控制台，用于区分「挥刀命中」与「环境伤害」。 */
+    private volatile boolean damageLog;
 
     @Override
     public void onEnable() {
@@ -77,6 +82,7 @@ public final class CallerSamplePlugin extends JavaPlugin {
         } else {
             getLogger().info("接入 Gladiator api=" + api.getApiVersion() + " ready=" + api.isReady());
         }
+        getServer().getPluginManager().registerEvents(new DamageLogger(), this);
     }
 
     @Override
@@ -109,6 +115,15 @@ public final class CallerSamplePlugin extends JavaPlugin {
         }
         if ("tagcolor".equals(sub)) {
             return handleTagColor(sender, label, args);
+        }
+        if ("dmglog".equals(sub)) {
+            if (args.length < 2) {
+                sender.sendMessage("用法: /" + label + " dmglog <on|off>（当前 " + (damageLog ? "on" : "off") + "）");
+                return true;
+            }
+            damageLog = "on".equalsIgnoreCase(args[1]) || "true".equalsIgnoreCase(args[1]);
+            sender.sendMessage("伤害日志：" + (damageLog ? "on" : "off"));
+            return true;
         }
         if ("reloadtags".equals(sub)) {
             reloadConfig();
@@ -442,5 +457,29 @@ public final class CallerSamplePlugin extends JavaPlugin {
 
     private static String fmt(Location loc) {
         return loc.getWorld().getName() + " " + loc.getX() + "," + loc.getY() + "," + loc.getZ();
+    }
+
+    /**
+     * 伤害来源探针：区分 {@link EntityDamageEvent.DamageCause}。
+     * <p>训练里「造成伤害但挥刀命中为 0」到底是被打还是摔伤/环境伤害，靠这个日志一眼可辨。</p>
+     */
+    private final class DamageLogger implements Listener {
+        @EventHandler(priority = org.bukkit.event.EventPriority.MONITOR, ignoreCancelled = false)
+        public void onDamage(EntityDamageEvent event) {
+            if (!damageLog || !(event.getEntity() instanceof Player)) {
+                return;
+            }
+            Player victim = (Player) event.getEntity();
+            String attacker = "-";
+            if (event instanceof EntityDamageByEntityEvent) {
+                EntityDamageByEntityEvent byEntity = (EntityDamageByEntityEvent) event;
+                attacker = String.valueOf(byEntity.getDamager().getType()) + ":"
+                        + (byEntity.getDamager() instanceof Player
+                        ? ((Player) byEntity.getDamager()).getName()
+                        : byEntity.getDamager().getType().name());
+            }
+            getLogger().info(String.format("[dmg] victim=%s cause=%s final=%.2f hp=%.1f cancelled=%s attacker=%s",
+                    victim.getName(), event.getCause(), event.getDamage(), victim.getHealth(), event.isCancelled(), attacker));
+        }
     }
 }

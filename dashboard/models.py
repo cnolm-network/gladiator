@@ -147,15 +147,27 @@ def inspect_policy(path: Path) -> dict:
         raise BadRequest(f"b2 长度 {b2[0]} 与 numActions {num_actions} 不一致")
 
     expected_obs, expected_actions = spaces_dimensions()
-    if obs_dim != expected_obs:
-        raise BadRequest(f"模型 obsDim={obs_dim} 与当前环境观察维度 {expected_obs} 不一致")
+    # 观测升维（19 → 23）之后，旧模型仍可续训：训练侧 Policy.load(obs_dim=新值)
+    # 会把旧 W1 的零列补在右侧，旧特征仍落在原下标，actor 权重逐位保留。
+    # 因此「模型更窄」放行并标记 adopted；只有「模型更宽」无法降维才拒绝。
+    #
+    # 动作数必须严格相等：动作语义变了（新增动作）就不能静默续训，
+    # 否则同一个动作编号在旧模型里代表另一件事。
+    if obs_dim > expected_obs:
+        raise BadRequest(
+            f"模型 obsDim={obs_dim} 大于当前环境观察维度 {expected_obs}（无法降维）")
     if num_actions != expected_actions:
         raise BadRequest(f"模型 numActions={num_actions} 与当前动作空间 {expected_actions} 不一致")
 
+    adopted = obs_dim < expected_obs
     return {
         "obsDim": int(obs_dim),
         "numActions": int(num_actions),
         "hidden": int(hidden),
+        # 与训练侧 Policy.load 的补零行为一致：把「会被补零到的维度」显式写出来，
+        # 前端/日志能看出这次是在旧模型上续训。
+        "adopted": adopted,
+        "obsDimPadded": int(expected_obs) if adopted else int(obs_dim),
         "sha256": _sha256(target),
         "sizeBytes": target.stat().st_size,
     }

@@ -37,6 +37,38 @@ class EpisodeTrackerTest(unittest.TestCase):
         self.assertEqual(review.attack_actions, 2)
         self.assertAlmostEqual(review.total_reward, 14.7)
 
+    def test_hits_split_attack_vs_environment(self) -> None:
+        """「attack=0 却有伤害」必须能解释：拆成挥刀命中与非攻击掉血。"""
+        tracker = EpisodeTracker(episode=1, username="Bot_A", opponent="Bot_B")
+        tracker.update(
+            action_index=1,  # approach
+            previous=obs(20), current=obs(20),
+            opponent_previous=obs(20), opponent_current=obs(14),
+            reward=0.0, attacked=False,
+        )
+        review = tracker.review
+        self.assertEqual(review.hits, 1)
+        self.assertEqual(review.attack_actions, 0)
+        self.assertEqual(review.attack_hits, 0)
+        self.assertEqual(review.environment_hits, 1)
+        payload = review.as_dict()
+        self.assertEqual(payload["attackHits"], 0)
+        self.assertEqual(payload["environmentHits"], 1)
+
+    def test_attack_hit_counts_as_attack_hit(self) -> None:
+        tracker = EpisodeTracker(episode=2, username="Bot_A", opponent="Bot_B")
+        tracker.update(
+            action_index=2,  # attack
+            previous=obs(20), current=obs(20),
+            opponent_previous=obs(20), opponent_current=obs(14),
+            reward=0.0, attacked=True,
+        )
+        self.assertEqual(tracker.review.attack_hits, 1)
+        self.assertEqual(tracker.review.environment_hits, 0)
+        # 不变量：hits == attack_hits + environment_hits
+        self.assertEqual(tracker.review.hits,
+                         tracker.review.attack_hits + tracker.review.environment_hits)
+
     def test_damage_taken_and_distance(self) -> None:
         tracker = self.make()
         tracker.update(

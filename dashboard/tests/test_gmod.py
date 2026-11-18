@@ -32,7 +32,14 @@ from models import ModelStore  # noqa: E402
 from processes import ProcessManager  # noqa: E402
 from training_runner import TrainingJob, TrainingRunner  # noqa: E402
 
-OBS, ACT, HIDDEN = 19, 11, 64
+# 维度跟随当前环境（观测升维后不再硬编码 19/11）。
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from models import spaces_dimensions as _spaces_dimensions  # noqa: E402
+
+OBS, ACT = _spaces_dimensions()
+HIDDEN = 64
 
 
 def _npy_bytes(shape: tuple[int, ...]) -> bytes:
@@ -175,11 +182,26 @@ class ScannerTests(unittest.TestCase):
         self.assertIn("policy.npz", item["error"])
 
     def test_meta_dimension_mismatch(self) -> None:
-        write_gmod(self.dir, "bad-dim.gmod", meta=default_meta(obsDim=16, actDim=7))
+        # 更宽的观测无法降维 → 无效
+        write_gmod(self.dir, "bad-dim.gmod", meta=default_meta(obsDim=OBS + 4, actDim=7))
         item = self._by_id("bad-dim")
         self.assertFalse(item["valid"])
-        self.assertIn("19", item["error"])
-        self.assertIn("11", item["error"])
+        self.assertIn("无法降维", item["error"])
+        # 动作数不一致单独拦（语义变了不能静默续训）
+        write_gmod(self.dir, "bad-act.gmod", meta=default_meta(obsDim=OBS, actDim=ACT + 2))
+        act_item = self._by_id("bad-act")
+        self.assertFalse(act_item["valid"])
+        self.assertIn(f"actDim={ACT + 2}", act_item["error"])
+
+    def test_narrower_obs_dim_is_adopted(self) -> None:
+        """旧包（obsDim 更小）仍可用，并标记会被补零续训。"""
+        write_gmod(self.dir, "old-dim.gmod", meta=default_meta(obsDim=OBS, actDim=ACT),
+                   policy=npz_bytes(obs=OBS))
+        item = self._by_id("old-dim")
+        self.assertTrue(item["valid"], item.get("error"))
+        self.assertEqual(item["obsDim"], OBS)
+        self.assertEqual(item["obsDimPadded"], OBS)
+        self.assertFalse(item["adopted"])
 
     def test_npz_shape_mismatch_with_meta(self) -> None:
         write_gmod(self.dir, "shape.gmod", policy=npz_bytes(obs=16))

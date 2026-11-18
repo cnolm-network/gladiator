@@ -33,7 +33,10 @@ class NormalizeTests(unittest.TestCase):
         preset = normalize_preset(default_preset())
         self.assertEqual(preset["format"], "gladiator.reward-preset/v1")
         self.assertEqual(preset["terms"], [])
-        self.assertAlmostEqual(preset["base"]["kill"], 20.0)
+        # P2：胜负由 victory 承担（±50），kill/death 只作小额补充
+        self.assertAlmostEqual(preset["base"]["kill"], 2.0)
+        self.assertAlmostEqual(preset["base"]["victory"], 50.0)
+        self.assertAlmostEqual(preset["base"]["pbrsAlpha"], 0.5)
 
     def test_unknown_base_key_rejected(self):
         preset = default_preset()
@@ -132,10 +135,62 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn("broken", ids)
 
 
+class P2PresetTest(unittest.TestCase):
+    """P2：victory 符号权重与 won/lost 条件。"""
+
+    def _preset(self, terms):
+        return {
+            "format": "gladiator.reward-preset/v1",
+            "name": "p2",
+            "base": {},
+            "terms": terms,
+        }
+
+    def test_victory_symbol_weight(self):
+        preset = normalize_preset(self._preset([
+            {"id": "win", "weight": "victory", "unit": "step", "when": {"won": True}},
+        ]))
+        self.assertEqual(preset["terms"][0]["weight"], 50.0)
+
+    def test_unknown_symbol_rejected(self):
+        with self.assertRaises(PresetError):
+            normalize_preset(self._preset([
+                {"id": "x", "weight": "nope", "unit": "step", "when": {}},
+            ]))
+
+    def test_won_lost_conditions(self):
+        kwargs, terms = preset_for_env(self._preset([
+            {"id": "win", "weight": 5, "unit": "step", "when": {"won": True}},
+            {"id": "lose", "weight": -5, "unit": "step", "when": {"lost": True}},
+        ]))
+        self.assertEqual(len(terms), 2)
+        self.assertEqual(terms[0].evaluate({"won": True, "lost": False}, 0.2), 5)
+        self.assertEqual(terms[0].evaluate({"won": False, "lost": True}, 0.2), 0)
+        self.assertEqual(terms[1].evaluate({"won": False, "lost": True}, 0.2), -5)
+
+    def test_won_must_be_bool(self):
+        with self.assertRaises(PresetError):
+            normalize_preset(self._preset([
+                {"id": "x", "weight": 1, "unit": "step", "when": {"won": 1}},
+            ]))
+
+    def test_old_preset_defaults_new_keys(self):
+        kwargs, _terms = preset_for_env({
+            "format": "gladiator.reward-preset/v1", "name": "old",
+            "base": {"kill": 20.0}, "terms": [],
+        })
+        self.assertEqual(kwargs["victory"], 50.0)
+        self.assertEqual(kwargs["pbrs_alpha"], 0.5)
+        self.assertEqual(kwargs["shaping_cap"], 5.0)
+        self.assertEqual(kwargs["kill"], 20.0, "旧预设显式给的值优先")
+
+
 class PresetForEnvTests(unittest.TestCase):
     def test_base_maps_to_shaping_fields(self):
         weights, terms = preset_for_env(default_preset())
-        self.assertAlmostEqual(weights["kill"], 20.0)
+        self.assertAlmostEqual(weights["kill"], 2.0)
+        self.assertAlmostEqual(weights["victory"], 50.0)
+        self.assertAlmostEqual(weights["pbrs_gamma"], 1.0)
         self.assertAlmostEqual(weights["damage_dealt"], 2.5)
         self.assertAlmostEqual(weights["still"], -0.1)
         self.assertEqual(terms, [])

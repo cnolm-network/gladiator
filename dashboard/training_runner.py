@@ -62,8 +62,10 @@ _RE_EPISODE = re.compile(
     r"^\[train\] episode (\d+)/(\d+) steps=(\d+) reward=(-?\d+(?:\.\d+)?) "
     r"winner=(\S+) terminated=(\w+) ([\d.]+)s"
 )
+# P1.7：训练后有两遍评估（采样 + 贪心），两遍都要算进度，否则面板会「卡在 20/20」。
 _RE_EVAL = re.compile(
-    r"^\[eval\] episode (\d+)/(\d+) steps=(\d+) reward=(-?\d+(?:\.\d+)?) winner=(\S+)"
+    r"^\[eval(?:/greedy)?\] episode (\d+)/(\d+) steps=(\d+) "
+    r"reward=(-?\d+(?:\.\d+)?) winner=(\S+)"
 )
 _RE_PAIR_DONE = re.compile(
     r"^\[pair(\d+)\] 完成：(\d+) episodes / (\d+) steps / mean reward (-?\d+(?:\.\d+)?)"
@@ -114,6 +116,14 @@ class TrainingJob:
     episodes: list[dict] = field(default_factory=list)
     last_episode: Optional[dict] = None
     evaluation: list[dict] = field(default_factory=list)
+    #: 当前阶段（P1.7）：train | eval | eval-greedy | done。
+    phase: str = "train"
+    #: 评估遍次（1=采样 / 2=贪心）与当前这一遍的进度。
+    eval_pass: int = 0
+    eval_completed: int = 0
+    eval_total: int = 0
+    #: 训练局完成数（= `[train] 完成：N episodes`），用于区分「训练跑完、正在评估」。
+    training_completed: int = 0
     error: Optional[str] = None
     report: Optional[dict] = None
     stop_requested: bool = False
@@ -165,6 +175,12 @@ class TrainingJob:
                 "episodes": list(self.episodes),
                 "lastEpisode": dict(self.last_episode) if self.last_episode else None,
                 "evaluation": list(self.evaluation),
+                # P1.7：评估阶段进度（旧键全部保留，这里只做增量）。
+                "phase": self.phase,
+                "evalPass": self.eval_pass,
+                "evalCompleted": self.eval_completed,
+                "evalTotal": self.eval_total,
+                "trainingCompleted": self.training_completed,
                 "error": self.error,
                 "report": self.report,
                 "reportPath": self.report_path,
@@ -295,9 +311,13 @@ class TrainingRunner:
         if model.get("kind") == "gmod" and not model.get("valid", True):
             raise BadRequest(f"文件模型 {ident} 不可用：{model.get('error')}")
         expected_obs, expected_actions = spaces_dimensions()
-        if model.get("obsDim") not in (None, expected_obs):
+        model_obs = model.get("obsDim")
+        # 观测升维（19 → 23）后旧模型仍可续训：训练侧 Policy.load(obs_dim=新值) 会给
+        # 旧 W1 在右侧补零列，旧特征索引不变。所以「更窄」放行并标记 adopted；
+        # 只有「更宽」无法降维才拦截（否则要等训练启动才崩）。
+        if model_obs is not None and int(model_obs) > expected_obs:
             raise BadRequest(
-                f"模型 {ident} 的 obsDim={model.get('obsDim')} 与当前观察维度 {expected_obs} 不一致"
+                f"模型 {ident} 的 obsDim={model_obs} 大于当前观察维度 {expected_obs}（无法降维）"
             )
         if model.get("numActions") not in (None, expected_actions):
             raise BadRequest(
@@ -307,7 +327,10 @@ class TrainingRunner:
         if path is not None and Path(path).is_file():
             return {"id": ident, "name": str(model.get("name") or ident),
                     "kind": str(model.get("kind") or "policy"), "path": str(path),
-                    "builtin": bool(model.get("builtin"))}
+                    "builtin": bool(model.get("builtin")),
+                    "obsDim": None if model_obs is None else int(model_obs),
+                    "adopted": model_obs is not None and int(model_obs) < expected_obs,
+                    "obsDimPadded": int(expected_obs)}
         if ident == DEFAULT_MODEL_ID:
             return {"id": ident, "name": str(model.get("name") or ident),
                     "kind": str(model.get("kind") or "policy"), "path": None,
@@ -628,6 +651,8 @@ class TrainingRunner:
             "modelId": model["id"],
             "modelName": model["name"],
             "modelKind": model["kind"],
+            "modelAdopted": bool(model.get("adopted")),
+            "modelObsDimPadded": model.get("obsDimPadded"),
             "initPolicy": model["path"],
             "persist": persist_opts["persist"],
             "persistModelId": persist_opts["persistModelId"],
@@ -1220,6 +1245,11 @@ class TrainingRunner:
                 return
             match = _RE_EPISODE.match(line)
             if match:
+                if job.phase != "train":
+                    # 回到训练（多场地/多回合时可能评估后再训练），进度显示切回训练态。
+                    job.phase = "train"
+                    job.eval_pass = 0
+                    job.eval_completed = 0
                 index = int(match.group(1))
                 job.stage_completed = index
                 # multi 的每个 pair 都从 1 开始编号且并发输出，不能按 pair 内序号推全局进度；
@@ -1250,6 +1280,18 @@ class TrainingRunner:
                 return
             match = _RE_EVAL.match(line)
             if match:
+                pass_no = 2 if line.startswith("[eval/greedy]") else 1
+                if job.eval_pass != pass_no:
+                    # 换了一遍：重置这一遍的计数，总数取「每遍评估局数」（旧 run 缺失时用行内 N）。
+                    job.eval_pass = pass_no
+                    job.eval_completed = 0
+                    try:
+                        job.eval_total = int(job.params.get("evalEpisodes") or 0)
+                    except (TypeError, ValueError):
+                        job.eval_total = 0
+                job.eval_completed += 1
+                job.eval_total = max(job.eval_total, int(match.group(2)))
+                job.phase = "eval" if pass_no == 1 else "eval-greedy"
                 job.evaluation.append({
                     "episode": int(match.group(1)),
                     "steps": int(match.group(3)),
@@ -1274,12 +1316,15 @@ class TrainingRunner:
             match = _RE_TRAIN_DONE.match(line)
             if match:
                 job.episodes_completed = int(match.group(1))
+                job.training_completed = int(match.group(1))
                 return
 
     def _handle_exit(self, job: TrainingJob, proc: ManagedProcess) -> None:
         with job.lock:
             job.exit_code = proc.exit_code
             job.finished_at = time.time()
+            # 进程结束：不管成功/失败/被停，都不再处于某个阶段（前端据此恢复训练口径显示）。
+            job.phase = "done"
             stopped = job.stop_requested
             code = proc.exit_code
         if stopped:

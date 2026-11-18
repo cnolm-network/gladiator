@@ -255,9 +255,13 @@ class GmodScanner:
         act = meta.get("actDim")
         if not isinstance(obs, int) or isinstance(obs, bool) or not isinstance(act, int) or isinstance(act, bool):
             return "meta.json 的 obsDim / actDim 必须是整数"
-        if obs != self.expected_obs or act != self.expected_actions:
-            return (f"meta.json 维度不符：obsDim={obs}（应为 {self.expected_obs}）、"
-                    f"actDim={act}（应为 {self.expected_actions}）")
+        # 与 models.inspect_policy 同一条规则：观测升维后，旧包 obsDim 更小仍可续训
+        # （训练侧 Policy.load 会在 W1 右侧补零列）；只有更宽无法降维才判无效。
+        if obs > self.expected_obs:
+            return (f"meta.json 维度不符：obsDim={obs} 大于当前观察维度 "
+                    f"{self.expected_obs}（无法降维）")
+        if act != self.expected_actions:
+            return (f"meta.json 维度不符：actDim={act}（应为 {self.expected_actions}）")
         color = meta.get("color")
         if color is not None and color != "":
             text = str(color).strip()
@@ -267,6 +271,8 @@ class GmodScanner:
         item["id"] = _slug(item["id"])  # 与文件名保持一致
         item["name"] = name
         item["obsDim"] = obs
+        item["obsDimPadded"] = self.expected_obs
+        item["adopted"] = int(obs) < int(self.expected_obs)
         item["numActions"] = act
         item["description"] = str(meta.get("description") or meta.get("notes") or "")[:200]
         item["version"] = str(meta.get("version") or "")[:40] or None

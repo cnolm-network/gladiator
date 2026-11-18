@@ -25,7 +25,7 @@ if str(DASHBOARD_DIR) not in sys.path:
 
 from app import DashboardApp, make_server  # noqa: E402
 from config import DashboardConfig  # noqa: E402
-from tests.test_gmod import npz_bytes  # noqa: E402
+from tests.test_gmod import ACT, OBS, npz_bytes  # noqa: E402
 
 
 class ExportGmodHttpTests(unittest.TestCase):
@@ -144,8 +144,9 @@ class ExportGmodHttpTests(unittest.TestCase):
                     "version", "createdAt", "exportedAt", "sha256", "training"):
             self.assertIn(key, meta, f"meta 缺少 {key}")
         self.assertEqual(meta["id"], "default")
-        self.assertEqual(meta["obsDim"], 19)
-        self.assertEqual(meta["actDim"], 11)
+        # 维度跟随当前环境（观测升维后不再硬编码 19/11）
+        self.assertEqual(meta["obsDim"], OBS)
+        self.assertEqual(meta["actDim"], ACT)
         self.assertEqual(meta["hidden"], 64)
         self.assertEqual(meta["version"], 1)
         self.assertRegex(meta["exportedAt"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
