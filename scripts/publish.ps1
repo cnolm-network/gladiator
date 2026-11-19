@@ -26,7 +26,7 @@ param(
     [string] $SourceDir = 'D:\cbot-gladiator',
     [string] $ExportDir = 'D:\cbot-gladiator-public',
     [string] $Remote = 'https://github.com/cnolm-network/gladiator.git',
-    [string] $Message = 'release: sync Gladiator public snapshot',
+    [string] $Message = '',
     [switch] $NoPush
 )
 
@@ -239,9 +239,41 @@ try {
         $email = (& git -C $SourceDir config user.email)
         if ([string]::IsNullOrWhiteSpace($name)) { $name = 'CnolmLab' }
         if ([string]::IsNullOrWhiteSpace($email)) { $email = 'noreply@github.com' }
-        & git -C $ExportDir -c "user.name=$name" -c "user.email=$email" commit -q -m $Message
+
+        # Subject + body describe what actually changed: per-area counts, the file
+        # list, and the diffstat, so each sync commit is reviewable on its own.
+        $added = @($changes | Where-Object { $_ -match '^\s*A' })
+        $modified = @($changes | Where-Object { $_ -match '^\s*M' })
+        $deleted = @($changes | Where-Object { $_ -match '^\s*D' })
+        $paths = @($changes | ForEach-Object { ($_ -replace '^\s*\S+\s+', '').Trim('"') })
+        $areas = @($paths | ForEach-Object {
+            if ($_ -match '^(src/main/java|src/test/java|src/main/resources)/') { 'plugin' }
+            elseif ($_ -match '^bot-runtime/') { 'bot-runtime' }
+            elseif ($_ -match '^training/') { 'training' }
+            elseif ($_ -match '^dashboard/') { 'dashboard' }
+            elseif ($_ -match '^docs/') { 'docs' }
+            elseif ($_ -match '^(gradle|build\.gradle|settings\.gradle|gradlew)') { 'build' }
+            else { 'meta' }
+        } | Group-Object | Sort-Object Name | ForEach-Object { "$($_.Name) $($_.Count)" })
+        $scope = ($areas -join ', ')
+        $counts = "+$($added.Count) ~$($modified.Count) -$($deleted.Count)"
+
+        if ([string]::IsNullOrWhiteSpace($Message)) {
+            $subject = "chore(release): sync public snapshot ($scope; $counts)"
+        } else {
+            $subject = $Message
+        }
+        $bodyLines = @("Changed files ($($changes.Count)):", '')
+        foreach ($line in ($changes | Sort-Object)) { $bodyLines += "  $line" }
+        $stat = @(& git -C $ExportDir diff --cached --stat | Select-Object -Last 1)
+        if ($stat.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($stat[0])) {
+            $bodyLines += @('', "Diffstat: $($stat[0].Trim())")
+        }
+        $body = $bodyLines -join "`n"
+
+        & git -C $ExportDir -c "user.name=$name" -c "user.email=$email" commit -q -m $subject -m $body
         if ($LASTEXITCODE -ne 0) { throw 'git commit failed' }
-        Write-Output "Committed $($changes.Count) change(s) to the public snapshot."
+        Write-Output "Committed $($changes.Count) change(s): $subject"
     } else {
         Write-Output 'No file changes in the public snapshot.'
     }
