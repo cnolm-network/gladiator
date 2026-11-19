@@ -14,6 +14,7 @@
  *          MC_HOST / MC_PORT / BOT_USERNAME / MC_VERSION / OBSERVATION_HZ
  */
 import path from 'node:path';
+import { loadItemTable, matchingMask } from './action-mask.js';
 import { ActionDispatcher } from './actions.js';
 import {
   DEFAULT_ATTACK_COOLDOWN_MS,
@@ -22,6 +23,7 @@ import {
 } from './attack-guard.js';
 import { LinkClient } from './connection.js';
 import { decodeAction, encodeObservation, entityHealth, nearestPlayer } from './features.js';
+import { applyIntent, describeIntent, resetIntentState } from './intent.js';
 import { EnvLinkServer } from './link-server.js';
 import { describeLoginFailure, launchBot } from './minecraft.js';
 import { buildObservation } from './observation.js';
@@ -115,6 +117,20 @@ if (!brainEnabled && softSpec) {
     + '本进程仍只执行通道 B 下发的动作，约束不会生效');
 }
 
+// --- 动作空间 v2：物品能力表 ------------------------------------------------
+// 环境只发 {type:"intent"}，**怎么按**（点一下 / 按住多少 tick）由这份表决定。
+// 默认 ../training/gladiator_env/items.json；文件缺失/写错直接退出并打印绝对路径，
+// 否则会变成「intent 到了但 use 永远不生效」这种很难查的静默故障。
+const itemsJsonArg = String(arg('items-json', process.env.GLADIATOR_ITEMS_JSON ?? '') || '').trim();
+let itemTable = null;
+try {
+  itemTable = loadItemTable(itemsJsonArg || null);
+} catch (error) {
+  console.error(`[intent] ${error.message}`);
+  process.exit(3);
+}
+console.log(`[intent] 物品能力表 ${itemTable.path}（${itemTable.size} 条）`);
+
 // 每个 Bot 独立的“手感”配置（G-507）：CLI/env 给基线，SPAWN 里的 profile 可整体覆盖。
 const cliProfile = normalizeProfile({
   cps: arg('cps', DEFAULT_PROFILE.cps),
@@ -169,19 +185,64 @@ const envServer = new EnvLinkServer({
 let activeProfile = cliProfile;
 
 function makeSession(currentBot) {
+  const dispatcher = new ActionDispatcher({
+    bot: currentBot, restrictionCache, profile: activeProfile,
+  });
   return {
     bot: currentBot,
     restrictionCache,
-    dispatcher: new ActionDispatcher({ bot: currentBot, restrictionCache, profile: activeProfile }),
+    dispatcher,
     navigator,
     state: () => gameState,
     gameId: () => gameId,
     chatLines: () => chatLines,
     notices: () => notices,
+    // 动作空间 v2：意图帧走这里（v1 的宏动作仍走 dispatcher.dispatch，两条路互不影响）。
+    applyIntent: async (intent) => {
+      const result = await applyIntent(currentBot, intent, {
+        dispatcher,
+        itemTable,
+        // 软约束的 cps 上限同样作用于意图路径：1.8 的受击无敌就是 500ms，多按没收益。
+        attackCooldownMs: softAttackCooldownMs,
+      });
+      logIntent(currentBot, intent, result);
+      return result;
+    },
     onRuleDenied: (action, reason) => {
       console.warn(`[gladiator] 动作被规则拒绝 ${action.type}: ${reason}`);
     },
   };
+}
+
+// --- 意图回显 -------------------------------------------------------------
+// 训练侧排查「策略发了什么、运行时执行成什么」时只认这行日志：前 5 条全打，
+// 之后每 20 条打一条（5Hz 下节奏刚好，quota 也不会被日志吃掉）。
+const intentEcho = { received: 0 };
+
+function logIntent(currentBot, intent, result) {
+  intentEcho.received += 1;
+  const count = intentEcho.received;
+  if (count > 5 && count % 20 !== 0) {
+    return;
+  }
+  const applied = (result && result.applied) || {};
+  const detail = Object.keys(applied).length ? JSON.stringify(applied) : '-';
+  console.log(`[intent] #${count} ${describeIntent(intent)} → ${detail}`);
+  if (itemTable && (count === 1 || count % 100 === 0)) {
+    // 运行时侧的 mask（实时背包）与训练侧（观测 200ms 一帧）偶发不一致，
+    // 打出来是为了让「策略明明选了 use 却没反应」这类问题一眼可见。
+    const mask = matchingMask(currentBot, itemTable);
+    const bits = (list) => list.map((value) => (value ? '1' : '0')).join('');
+    console.log(`[intent] mask slot=${bits(mask.slot)} use=${bits(mask.use)}`
+      + ` 手持=${describeHeld(currentBot)}`);
+  }
+}
+
+function describeHeld(currentBot) {
+  const held = currentBot && currentBot.heldItem;
+  return held && typeof held.name === 'string' && held.name !== 'air'
+    ? `${held.name}x${held.count || 1}`
+    : '空手';
 }
 
 // --- 本地大脑（块 A）------------------------------------------------------
@@ -729,6 +790,8 @@ async function handleSpawn(spawn) {
       if (bot === current) {
         stopBrain();
         printMatchSummary(`disconnect:${reason ?? 'unknown'}`);
+        // 意图执行状态（按住的方向键/右键计时器）随连接一起丢弃，重连后从干净状态开始。
+        resetIntentState(current);
         bot = null;
         session = null;
         restrictionCache.clear();

@@ -13,6 +13,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from .items import default_table
+
 # --- 观测 ---------------------------------------------------------------
 
 OBS_DIM = 23
@@ -300,3 +302,197 @@ def decode_action(
 
 def describe_actions() -> Iterable[str]:
     return ACTION_NAMES
+
+
+# --- 动作空间 v2（物品无关 + 可掩码） ---------------------------------------
+#
+# 背景见 ``docs/identity-and-action-space.md`` §2.2–2.3：v1 的 11 个宏动作把
+# 「选槽 + 右键 + 按住 + 切回剑」写死在 ``decode_action`` 里，于是每加一个物品就要
+# 加动作、改 ``NUM_ACTIONS``、重训。v2 把动作拆成**正交意图**：
+#
+#   移动 / 转视角 / 左键 / 右键 / 跳 / 蹲 / 疾跑 / 选槽
+#
+# 物品身份只进观测（category one-hot），不进动作；「这个物品怎么用」由
+# ``items.json`` 的能力表回答（:mod:`gladiator_env.items`），因此新增物品零改代码。
+#
+# v1 原样保留：它是 stage 0 的冷启动基线，也是回归对照（规格 §2.5）。
+
+#: ``move`` 头的取值 → 语义。0 是待机（松键），其余与 v1 的移动方向同名。
+MOVE_VALUES_V2: tuple[str, ...] = ("idle", "forward", "back", "left", "right")
+#: ``look_yaw`` 头：每 tick 的偏航增量（度）。粗调 ±30°、细调 ±3°。
+LOOK_YAW_V2: tuple[float, ...] = (-30.0, -10.0, -3.0, 0.0, 3.0, 10.0, 30.0)
+#: ``look_pitch`` 头：每 tick 的俯仰增量（度）。mineflayer 正值向下。
+LOOK_PITCH_V2: tuple[float, ...] = (-15.0, -5.0, 0.0, 5.0, 15.0)
+#: ``use`` 头：0=不按 / 1=单击 / 2=按住至松开（怎么按由能力表决定）。
+USE_VALUES_V2: tuple[str | None, ...] = (None, "click", "hold")
+#: ``attack`` / ``jump`` / ``sneak`` / ``sprint``：0/1。
+BINARY_VALUES_V2: tuple[bool, ...] = (False, True)
+#: 热键栏槽位数（``slot`` 头的取值个数）。
+HOTBAR_SLOTS = 9
+#: 协议观测里热键栏第一个槽位的原始槽号（36..44）；``slot`` 头的取值是 ``槽号 - 36``。
+HOTBAR_SLOT_BASE = 36
+
+#: 九个头的取值个数。顺序即 ``head_offsets`` 的拼接顺序，**改动会作废旧模型**。
+ACTION_HEADS_V2: dict[str, int] = {
+    "move": len(MOVE_VALUES_V2),          # 5
+    "look_yaw": len(LOOK_YAW_V2),         # 7
+    "look_pitch": len(LOOK_PITCH_V2),     # 5
+    "attack": 2,                          # 2
+    "use": len(USE_VALUES_V2),            # 3
+    "jump": 2,                            # 2
+    "sneak": 2,                           # 2
+    "sprint": 2,                          # 2
+    "slot": HOTBAR_SLOTS,                 # 9
+}
+
+#: v2 动作向量总维度（各头取值个数之和）。
+ACTION_DIM_V2: int = sum(ACTION_HEADS_V2.values())
+
+#: 直接可喂给 ``gymnasium.spaces.MultiDiscrete`` 的 nvec。
+MULTI_DISCRETE_V2: tuple[int, ...] = tuple(ACTION_HEADS_V2.values())
+
+
+def head_offsets() -> dict[str, int]:
+    """每个头在 37 维 one-hot / 扁平编号里的起始下标（按声明顺序累加）。
+
+    ``{"move": 0, "look_yaw": 5, "look_pitch": 12, ...}``，最后一项 ``slot`` 是 28。
+    """
+    offsets: dict[str, int] = {}
+    cursor = 0
+    for head, size in ACTION_HEADS_V2.items():
+        offsets[head] = cursor
+        cursor += size
+    return offsets
+
+
+def _head_value(head: str, flat_value: object) -> int:
+    """取出一个头的取值并校验范围（越界立刻报错，别让错误索引悄悄变成 idle）。"""
+    try:
+        value = int(flat_value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"intent 的 {head} 必须是整数，收到 {flat_value!r}") from exc
+    size = ACTION_HEADS_V2[head]
+    if value < 0 or value >= size:
+        raise ValueError(f"intent 的 {head} 越界: {value}（合法范围 0..{size - 1}）")
+    return value
+
+
+def decode_intent(flat: "int | Iterable[int] | np.ndarray") -> dict:
+    """把 v2 的离散动作翻译成意图字典。
+
+    三种输入都接受（都是「同一件事的三种写法」）：
+
+    - 长度 9 的序列：``MultiDiscrete`` 每个头一个数（**训练主路径**）；
+    - 长度 37 的序列：每个头一段的 one-hot / 二值展开（``ACTION_DIM_V2`` 就是它）；
+    - ``int``：37 维展开里唯一那个 1 的下标（日志/BC 里压缩成一个数的写法）。
+
+    返回形态固定（键顺序也固定，方便直接序列化成 JSON）::
+
+        {"move": str, "look": {"dyaw": float, "dpitch": float},
+         "attack": bool, "use": str|None, "slot": int,
+         "jump": bool, "sneak": bool, "sprint": bool}
+
+    注意 ``look`` 给的是**增量**（度），不是绝对朝向：v1 里「内部算朝向」的做法
+    让策略学不到瞄准，v2 把瞄准交回给策略（规格 §2.2）。
+    """
+    heads = list(ACTION_HEADS_V2)
+    offsets = head_offsets()
+    if isinstance(flat, (int, np.integer)):
+        index = int(flat)
+        if index < 0 or index >= ACTION_DIM_V2:
+            raise ValueError(
+                f"intent 扁平编号越界: {index}（合法范围 0..{ACTION_DIM_V2 - 1}）")
+        one_hot = np.zeros(ACTION_DIM_V2, dtype=np.int64)
+        one_hot[index] = 1
+        ordered = _split_one_hot(one_hot, heads, offsets)
+    else:
+        values = [int(value) for value in flat]  # type: ignore[union-attr]
+        if len(values) == len(heads):
+            ordered = values
+        elif len(values) == ACTION_DIM_V2:
+            ordered = _split_one_hot(values, heads, offsets)
+        else:
+            raise ValueError(
+                f"intent 需要 {len(heads)} 个头或 {ACTION_DIM_V2} 维展开，收到 {len(values)} 个")
+
+    picked = {head: _head_value(head, ordered[index]) for index, head in enumerate(heads)}
+    return {
+        "move": MOVE_VALUES_V2[picked["move"]],
+        "look": {
+            "dyaw": LOOK_YAW_V2[picked["look_yaw"]],
+            "dpitch": LOOK_PITCH_V2[picked["look_pitch"]],
+        },
+        "attack": BINARY_VALUES_V2[picked["attack"]],
+        "use": USE_VALUES_V2[picked["use"]],
+        "slot": picked["slot"],
+        "jump": BINARY_VALUES_V2[picked["jump"]],
+        "sneak": BINARY_VALUES_V2[picked["sneak"]],
+        "sprint": BINARY_VALUES_V2[picked["sprint"]],
+    }
+
+
+def _split_one_hot(values: "Iterable[int]", heads: list[str], offsets: dict[str, int]) -> list[int]:
+    """把 37 维展开按头切段，取每段的 argmax（全 0 段视为 0）。
+
+    二值头（attack/jump/…）的展开段只有两个元素，argmax 与「1 在不在」等价；
+    多值头必须是 one-hot，否则取第一个最大值的下标——训练里由策略采样保证合法。
+    """
+    flat = [int(value) for value in values]
+    picked: list[int] = []
+    for head in heads:
+        start = offsets[head]
+        size = ACTION_HEADS_V2[head]
+        segment = flat[start:start + size]
+        best = 0
+        best_value = None
+        for index, value in enumerate(segment):
+            if best_value is None or value > best_value:
+                best, best_value = index, value
+        picked.append(best if best_value else 0)
+    return picked
+
+
+
+def action_mask(observation: dict, item_table: "Any | None" = None) -> dict[str, list[bool]]:
+    """按当前观测/背包算 v2 的 action mask（``dict head -> list[bool]``）。
+
+    规则（规格 §2.3「动作合法性由该表 + 背包状态算 action mask」）：
+
+    - ``slot[i]``：热键栏第 i 格有物品才可用（空槽给策略点没意义，白占容量）；
+    - ``use``：``0``（不按）恒可用；``1/2`` 需要**手持物品**在能力表里
+      ``mode != none``——空手、材料、未知物品都会把这两档屏蔽掉；
+    - 其余头（move / look / attack / jump / sneak / sprint）恒可用：v2 不做
+      reach 屏蔽（那是运行时 attack-guard 的职责，环境侧不改 reward/termination）。
+
+    「手持物品」而不是「任意槽里的物品」是刻意的：意图里同时改槽与按右键时，
+    运行时先选槽再按右键，但**本帧观测**只能看到旧手持物。保守一点不会让策略
+    学到非法动作，代价只是「换槽那一帧不能同时按右键」。
+    """
+    table = item_table if item_table is not None else default_table()
+    mask: dict[str, list[bool]] = {
+        head: [True] * size for head, size in ACTION_HEADS_V2.items()
+    }
+
+    # --- slot：只看热键栏（36..44），背包里的东西要先挪过来 ---
+    occupied: set[int] = set()
+    self_payload = (observation or {}).get("self") or {}
+    for item in self_payload.get("inventory") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            slot = int(item.get("slot"))
+        except (TypeError, ValueError):
+            continue
+        if HOTBAR_SLOT_BASE <= slot < HOTBAR_SLOT_BASE + HOTBAR_SLOTS:
+            occupied.add(slot - HOTBAR_SLOT_BASE)
+    for index in range(HOTBAR_SLOTS):
+        mask["slot"][index] = index in occupied
+
+    # --- use：手持物品必须「能用右键」 ---
+    held = (self_payload.get("heldItem") or {}).get("name")
+    held_name = str(held or "").strip()
+    usable = bool(held_name) and held_name.lower() != "air" and table.is_usable(held_name)
+    mask["use"][0] = True
+    mask["use"][1] = usable
+    mask["use"][2] = usable
+    return mask

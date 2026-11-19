@@ -162,6 +162,7 @@ test('同一 seq 重复发送只执行一次（幂等）', async () => {
 });
 
 test('HELLO 后按 controlHz 推送 OBSERVATION', async () => {
+
   const bot = fakeBot();
   const session = {
     bot,
@@ -181,3 +182,76 @@ test('HELLO 后按 controlHz 推送 OBSERVATION', async () => {
   assert.deepEqual(observation.payload.blockWindow.size, [7, 4, 7]);
   server.stop();
 });
+
+test('intent 帧交给 applyIntent（v1 宏动作仍走 dispatcher）', async () => {
+  const seen = [];
+  const session = {
+    bot: fakeBot(),
+    dispatcher: new ActionDispatcher({ bot: fakeBot() }),
+    applyIntent: async (intent) => {
+      seen.push(intent);
+      return { ok: true, type: 'intent', applied: { move: intent.move } };
+    },
+    state: () => 'Alive',
+    gameId: () => '',
+  };
+  const server = startServer({ resolveSession: () => session });
+  await new Promise((resolve) => server.server.once('listening', resolve));
+  const { socket, inbox } = await connect(server.address.port);
+  send(socket, 'HELLO', { v: 1, botId: 'glad-a' }, 1);
+  await waitFor(inbox, 'WELCOME');
+
+  send(socket, 'ACTION', { type: 'intent', intent: { move: 'forward', attack: true } }, 2);
+  const result = await waitFor(inbox, 'ACTION_RESULT');
+  assert.equal(result.replyTo, 2);
+  assert.equal(result.payload.ok, true);
+  assert.equal(result.payload.type, 'intent');
+  assert.deepEqual(seen, [{ move: 'forward', attack: true }]);
+
+  // 缺 intent 对象 → 明确错误，不进 applyIntent
+  socket.send(JSON.stringify({
+    v: 1, type: 'ACTION', seq: 3, ts: Date.now(),
+    payload: { type: 'intent', params: {} },
+  }));
+  const deadline = Date.now() + 2000;
+  let failed;
+  while (Date.now() < deadline) {
+    failed = inbox.find((frame) => frame.type === 'ACTION_RESULT' && frame.replyTo === 3);
+    if (failed) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(failed.payload.code, 'INTENT_INVALID');
+  assert.equal(seen.length, 1);
+  server.stop();
+});
+
+test('新连接的 seq 从 1 重来：去重缓存不跨连接', async () => {
+  let executed = 0;
+  const bot = fakeBot();
+  bot.chat = () => { executed += 1; };
+  const session = {
+    bot,
+    dispatcher: new ActionDispatcher({ bot }),
+    state: () => 'Alive',
+    gameId: () => '',
+  };
+  const server = startServer({ resolveSession: () => session });
+  await new Promise((resolve) => server.server.once('listening', resolve));
+
+  const first = await connect(server.address.port);
+  send(first.socket, 'HELLO', { v: 1, botId: 'glad-a' }, 1);
+  await waitFor(first.inbox, 'WELCOME');
+  send(first.socket, 'ACTION', { type: 'talk', params: { message: 'a' } }, 1);
+  await waitFor(first.inbox, 'ACTION_RESULT');
+  first.socket.terminate();
+
+  // 第二个连接（= 训练侧重开一个进程）seq 又从 1 开始，必须真的执行
+  const second = await connect(server.address.port);
+  send(second.socket, 'HELLO', { v: 1, botId: 'glad-a' }, 1);
+  await waitFor(second.inbox, 'WELCOME');
+  send(second.socket, 'ACTION', { type: 'talk', params: { message: 'b' } }, 1);
+  await waitFor(second.inbox, 'ACTION_RESULT');
+  assert.equal(executed, 2);
+  server.stop();
+});
+

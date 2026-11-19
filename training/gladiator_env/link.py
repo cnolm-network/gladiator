@@ -226,11 +226,12 @@ class LinkClient:
         ws = self._ws
         if ws is None:
             raise LinkError(f"{self.bot_id}: 通道 B 尚未连接")
-        await ws.send(json.dumps({
-            "type": "ACTION",
-            "seq": seq,
-            "payload": {"type": action["type"], "params": action.get("params") or {}},
-        }))
+        payload: dict[str, Any] = {"type": action["type"], "params": action.get("params") or {}}
+        # 动作空间 v2：意图帧是 `{type:"intent", intent:{...}}`（协议 §4.3 的 ACTION 载荷
+        # 的一种变体，v1 的宏动作没有这个字段）。放在 payload 顶层，不改协议版本。
+        if action.get("intent") is not None:
+            payload["intent"] = action["intent"]
+        await ws.send(json.dumps({"type": "ACTION", "seq": seq, "payload": payload}))
 
     def send_actions(self, actions: list[dict], timeout: float = 2.0) -> list[dict]:
         """按顺序发送一组协议动作，返回对应的 ACTION_RESULT（可能为空）。"""

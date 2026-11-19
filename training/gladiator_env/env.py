@@ -30,13 +30,17 @@ from . import reward_presets
 from .shaping import ShapingReward, ShapingWeights
 from .spaces import (
     ACTION_NAMES,
+    MULTI_DISCRETE_V2,
     MOVE_MS,
     NUM_ACTIONS,
     OBS_DIM,
+    action_mask,
     decode_action,
+    decode_intent,
     encode_observation,
     nearest_player,
 )
+from .items import default_table
 
 #: 背包/护甲校验必需项（剑、金苹果、鱼竿）；护甲另外按 4 个槽位统计。
 KIT_MUST_HAVE: tuple[tuple[str, int], ...] = (
@@ -69,6 +73,10 @@ _COMBAT_ACTIONS = frozenset({"attack", "dig", "place"})
 _KEEP_USE_ITEMS = frozenset({"armor", "sword"})
 #: 补装最多重试几轮（每轮 ``_RESTOCK_TICKS`` 帧）；用完才放弃。
 _RESTOCK_MAX_ROUNDS = 3
+#: 单个物品 ``give`` 之后至少等几帧才复核（1.8 的 ``give`` 没有回执，背包同步要 1–2 tick）。
+_GIVE_SETTLE_TICKS = 2
+#: 单个物品整轮最多重发几次（用完就等下一轮，别再往 RCON 灌命令）。
+_RESTOCK_MAX_GIVES = 3
 #: 主动体检周期（步）：每 N 步查一次套装，缺件就触发补装。
 _RESTOCK_CHECK_EVERY = 10
 #: 这些运行时失败码说明「手上有动作但没东西」，直接当作补装触发源。
@@ -270,6 +278,7 @@ class GladiatorEnv(gym.Env):
         reward_mode: str = "shaped",
         shaping_weights: ShapingWeights | None = None,
         reward_preset: dict | None = None,
+        action_space: str = "v1",
         logger: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__()
@@ -292,6 +301,14 @@ class GladiatorEnv(gym.Env):
             self.arena = replace(self.arena, spacing=MIN_SPACING)
         self.action_ticks = max(1, int(action_ticks))
         self.max_steps = max(1, int(max_steps))
+        # 动作空间版本（规格 §2.5）：v1 = 11 个宏动作（保留作冷启动基线/回归对照）；
+        # v2 = 9 个正交意图头 + action mask（物品无关，加物品不用重训）。
+        self.action_space_name = str(action_space or "v1").strip().lower()
+        if self.action_space_name not in ("v1", "v2"):
+            raise ValueError(f"未知动作空间: {action_space}（允许 v1 / v2）")
+        self._action_v2 = self.action_space_name == "v2"
+        #: v2 的物品能力表（算 action mask 用）；测试可替换成自定义 ItemTable。
+        self.items = default_table()
         self.reward_fn: RewardFn = reward_fn or default_reward
         self.single_agent = bool(single_agent)
         self.auto_spawn = auto_spawn
@@ -365,6 +382,9 @@ class GladiatorEnv(gym.Env):
         self._restock_tick: dict[str, int] = {}
         #: 已用完的补装轮数（到期仍缺件就再来一轮，最多 ``_RESTOCK_MAX_ROUNDS`` 轮）。
         self._restock_rounds: dict[str, int] = {}
+        #: 逐物品补发记账：``{用户名: {物品名: {"attempts": n, "wait": k}}}``。
+        #: ``wait`` 是「还要等几帧才复核」，避免 give 完立刻判失败（金苹果补装时序 bug）。
+        self._restock_gives: dict[str, dict[str, dict[str, int]]] = {}
         self._log = logger or (lambda message: print(f"[env] {message}", flush=True))
 
         self._control_hz = float(control_hz or 0.0)
@@ -399,14 +419,21 @@ class GladiatorEnv(gym.Env):
         if self.single_agent:
             # 单智能体视角（Gymnasium 标准）：控制 bot_0，其余 Bot 作为对手由环境随机采样动作。
             self.observation_space = spaces.Box(low=-5.0, high=5.0, shape=(OBS_DIM,), dtype=np.float32)
-            self.action_space = spaces.Discrete(NUM_ACTIONS)
+            self.action_space = (
+                spaces.MultiDiscrete(MULTI_DISCRETE_V2) if self._action_v2
+                else spaces.Discrete(NUM_ACTIONS)
+            )
         else:
             self.observation_space = spaces.Dict({
                 self._key(i): spaces.Box(low=-5.0, high=5.0, shape=(OBS_DIM,), dtype=np.float32)
                 for i in range(len(self.bots))
             })
             self.action_space = spaces.Dict({
-                self._key(i): spaces.Discrete(NUM_ACTIONS) for i in range(len(self.bots))
+                self._key(i): (
+                    spaces.MultiDiscrete(MULTI_DISCRETE_V2) if self._action_v2
+                    else spaces.Discrete(NUM_ACTIONS)
+                )
+                for i in range(len(self.bots))
             })
 
         self._connected = False
@@ -436,6 +463,7 @@ class GladiatorEnv(gym.Env):
         self._restock_logged.clear()
         self._restock_tick.clear()
         self._restock_rounds.clear()
+        self._restock_gives.clear()
         self._last_attack_at.clear()
         self._opponent_last_attack_at.clear()
         self._ensure_connected()
@@ -457,6 +485,9 @@ class GladiatorEnv(gym.Env):
         observation = self._encode_all()
         info = {"step": 0, "arena": self._arena_info(),
                 "opponentProfile": self._opponent_profile_info()}
+        if self._action_v2:
+            # 第一帧就要给掩码：策略在 reset 之后立刻采样，缺 mask 等于开局先撞一次墙。
+            info["actionMask"] = self._action_masks()
         if self.single_agent:
             return observation[self._key(0)], info
         return observation, info
@@ -464,19 +495,36 @@ class GladiatorEnv(gym.Env):
     def step(self, action):
         self._steps += 1
         if self.single_agent:
-            action_map = {self._key(0): int(action)}
+            # 单智能体：只把 bot_0 的决策交给调用方；对手仍用 v1 宏动作（手写控制器）。
+            action_map = {self._key(0): action}
             for index in range(1, len(self.bots)):
                 action_map[self._key(index)] = int(self._opponent_action(index))
         else:
             action_map = action
 
         dispatch: list[list[dict]] = []
+        labels: list[str] = []
         if len(self._last_active_at) != len(self.bots):
             self._last_active_at = [time.monotonic() for _ in self.bots]
         opponents = self._opponent_names()
         for i, bot in enumerate(self.bots):
-            index = int(action_map.get(self._key(i), 0))
-            if index != 0:  # 0 = idle，只有真正下发动作才算“活跃”
+            value = action_map.get(self._key(i), 0)
+            # 多智能体 v2：所有 Bot 都走意图；单智能体 v2：只有学习方走意图。
+            use_intent = self._action_v2 and (not self.single_agent or i == 0)
+            intent: dict | None = None
+            if use_intent:
+                intent = decode_intent(value)
+                label = self._intent_label(intent)
+                # 只转视角也算“活跃”：否则空闲判定会把「原地瞄准」误计成挂机。
+                active = (label != "idle"
+                          or intent["look"]["dyaw"] != 0.0
+                          or intent["look"]["dpitch"] != 0.0)
+            else:
+                index = int(value)
+                label = ACTION_NAMES[index] if 0 <= index < len(ACTION_NAMES) else "idle"
+                active = index != 0
+            labels.append(label)
+            if active:  # 只有真正下发动作才算“活跃”
                 self._last_active_at[i] = time.monotonic()
             raw = self._raw[i] if i < len(self._raw) else {}
             # 代码驱动的对手比学习方多留 0.75 格余量：它没有「奖励」纠偏，而观测到出手之间
@@ -487,7 +535,12 @@ class GladiatorEnv(gym.Env):
                 reach = float(bot.reach)
             else:
                 reach = self._opponent_reach(i, float(bot.reach))
-            actions = decode_action(index, raw, bot.username, opponents, reach=reach)
+            if intent is not None:
+                # v2：一帧意图就是一条载荷（{type:"intent", intent:{...}}），
+                # 选槽/右键/按住全部由运行时的能力表执行，环境不再拼宏动作。
+                actions = [{"type": "intent", "intent": intent}]
+            else:
+                actions = decode_action(index, raw, bot.username, opponents, reach=reach)
             if i != 0 and self._respawn_grace.get(bot.username, 0) > 0:
                 # 刚重生（可能被传送到出生点）：本 tick 只做观察，避免对旧坐标出手。
                 self._respawn_grace[bot.username] -= 1
@@ -508,9 +561,12 @@ class GladiatorEnv(gym.Env):
                     # 运行时常常只执行后者 → 护甲一直 0/4（真机 2026-11-19 01:0x 实测：
                     # 4 个 B 侧 Bot 全裸，A 侧全有甲，且每 tick 补发把 steps/s 打到 1.8）。
                     actions = self._equip_actions()
+                elif use_intent:
+                    # v2 没有「宏动作」可剥，只能把意图里的进攻位清掉（保留移动/视角/蹲跳）。
+                    actions = self._strip_intent_actions(actions)
                 else:
                     actions = self._strip_combat_actions(actions)
-            if any(action.get("type") == "attack" for action in actions):
+            if self._has_attack(actions):
                 # 只要真的下发了 attack 就记时（含运行时把它改成追击的情况）。
                 # 必须在下发时记，而不是算奖励时：观测在这一 tick 末尾生成，
                 # 策略要能看到「我刚挥过一刀」（冷却/连击节奏靠这个）。
@@ -553,13 +609,13 @@ class GladiatorEnv(gym.Env):
             distance = self._distance(i, opponent)
             previous_distance = self._last_distance.get(bot.username)
             self._last_distance[bot.username] = distance
-            wants_attack = any(action.get("type") == "attack" for action in dispatch[i])
+            wants_attack = self._has_attack(dispatch[i])
             # 超出 reach 的 attack 根本挥不出去（运行时抛 OUT_OF_REACH），不能算空挥。
             in_reach = distance is None or distance <= float(bot.reach) + 0.2
             # 观测口径的「这一刀打得到」：水平距离 ≤ 自己的 reach（与 spaces.in_reach 同源）。
             in_reach_horizontal = self._in_reach_horizontal(i, opponent, float(bot.reach))
             self._last_attacked[bot.username] = wants_attack and in_reach
-            action_name = ACTION_NAMES[index] if 0 <= index < len(ACTION_NAMES) else "idle"
+            action_name = labels[i] if i < len(labels) else "idle"
             if self.reward_mode == "shaped":
                 value, events = self.shaping.compute(
                     bot.username,
@@ -600,6 +656,10 @@ class GladiatorEnv(gym.Env):
             "states": {bot.username: str(self._raw[i].get("state", "Alive")) for i, bot in enumerate(self.bots)},
             "winner": self._winner(),
         }
+        if self._action_v2:
+            # dict head -> list[bool]（单智能体）/ {bot_key: dict head -> list[bool]}（多智能体）。
+            # 只加 info，不改 reward/termination，也不改观测维度。
+            info["actionMask"] = self._action_masks()
         if self.single_agent:
             return observation[self._key(0)], rewards[self._key(0)], terminated, truncated, info
         return observation, rewards, terminated, truncated, info
@@ -633,6 +693,57 @@ class GladiatorEnv(gym.Env):
         改成「靠近」，所以复盘要按实际下发的动作判断有没有真挥刀。
         """
         return list(self._last_dispatch.get(username, []))
+
+    # --- 动作空间 v2 辅助 -----------------------------------------------
+
+    @staticmethod
+    def _intent_label(intent: dict) -> str:
+        """意图 → 一个短标签（奖励塑形/日志用）。
+
+        ``action`` 这一维在塑形里只用来识别「block / use_rod 这类无效消耗」，
+        v2 没有宏动作名，这里按「进攻 > 用物品 > 移动」的优先级给个近似标签。
+        """
+        if intent.get("attack"):
+            return "attack"
+        if intent.get("use"):
+            return "use"
+        return str(intent.get("move") or "idle")
+
+    @staticmethod
+    def _has_attack(actions: list[dict]) -> bool:
+        """这组动作里有没有「真会挥刀」的意图（兼容 v1 的 attack 与 v2 的 intent）。"""
+        for action in actions or []:
+            if action.get("type") == "attack":
+                return True
+            if action.get("type") == "intent" and (action.get("intent") or {}).get("attack"):
+                return True
+        return False
+
+    @classmethod
+    def _strip_intent_actions(cls, actions: list[dict]) -> list[dict]:
+        """补装确认期间清掉意图里的进攻位（``attack`` / ``use``），保留移动与视角。
+
+        与 v1 的 :meth:`_strip_combat_actions` 同义：背包还没同步时按右键只会拿到
+        ``ITEM_MISSING``，而移动/转向不会受伤。
+        """
+        stripped: list[dict] = []
+        for action in actions or []:
+            if action.get("type") != "intent":
+                stripped.append(action)
+                continue
+            intent = dict(action.get("intent") or {})
+            intent["attack"] = False
+            intent["use"] = None
+            stripped.append({"type": "intent", "intent": intent})
+        return stripped or [{"type": "idle", "params": {"durationMs": MOVE_MS}}]
+
+    def _action_masks(self) -> dict:
+        """当前每个 Bot 的 v2 action mask（单智能体只返回学习方那一份）。"""
+        masks = {
+            self._key(i): action_mask(self._raw[i] if i < len(self._raw) else {}, self.items)
+            for i in range(len(self.bots))
+        }
+        return masks[self._key(0)] if self.single_agent else masks
 
     def _in_reach_horizontal(self, index: int, opponent: int | None, reach: float) -> bool:
         """水平距离是否在 reach 内（缺数据时返回 False，不白送奖励）。"""
@@ -1105,6 +1216,8 @@ class GladiatorEnv(gym.Env):
         self._restock_tick[user] = 0
         self._restock_rounds[user] = 0
         self._restock_logged.discard(user)
+        # 新的一轮补装：逐物品的重发预算重新记（上一轮用掉的 3 次不带到这一轮）。
+        self._restock_gives.pop(user, None)
         # 观察档与补装窗口同步：补装没确认完之前，代码驱动对手只观察不出手。
         self._respawn_grace[user] = max(
             self._respawn_grace.get(user, 0), _RESTOCK_TICKS)
@@ -1118,17 +1231,54 @@ class GladiatorEnv(gym.Env):
     def _give_missing(self, index: int, bot: BotConfig, report: dict) -> None:
         """按 ``loadout_report`` 的结果补件：缺什么 ``give`` 什么 + 重穿护甲 + 切剑。
 
+        **逐物品记账**（golden_apple 补装时序 bug 的修复）：``give`` 是控制台命令，
+        没有回执，1.8 的背包同步还要 1–2 tick。旧实现每 tick 把「仍缺」全量重发、
+        并在同一 tick 之后就判失败，4 场地的日志里因此反复出现
+        ``[kit] 补装失败（缺 [('golden_apple', 5)]，护甲 4/4）``——东西其实发下来了，
+        只是还没同步到观测里。现在的规则：
+
+        1. **逐物品**：每个缺失项单独记账（``self._restock_gives``）；
+        2. ``give`` 之后至少等 ``_GIVE_SETTLE_TICKS`` 帧才复核该项；
+        3. 复核时只重发**仍然缺**的项（``report["missing"]`` 每帧重算）；
+        4. 单个物品整轮最多 ``_RESTOCK_MAX_GIVES`` 次，用完就交给下一轮，不再刷 RCON。
+
         ``give`` 依赖 RCON 与 ``give_kit``；两者都不具备时至少把剑切到手上
         （可能是「有剑但没选中」，运行时能自己挪进快捷栏）。
         """
+        user = bot.username
         if self.arena.give_kit and self._rcon is not None:
+            state = self._restock_gives.setdefault(user, {})
             for name, need in report["missing"]:
+                entry = state.get(name)
+                if entry is None:
+                    entry = {"attempts": 0, "wait": 0}
+                    state[name] = entry
+                if entry["attempts"] >= _RESTOCK_MAX_GIVES:
+                    # 这个物品已经重发够次数：留给下一轮（或直接放弃），别再灌命令。
+                    continue
+                if entry["wait"] > 0:
+                    # 刚 give 过，背包还没同步：这一帧只观察，不重复下发。
+                    continue
                 try:
-                    self._command(f"give {bot.username} {name} {max(1, int(need))}")
+                    self._command(f"give {user} {name} {max(1, int(need))}")
                 except LinkError:
-                    pass
+                    continue  # RCON 没通不算一次尝试
+                entry["attempts"] += 1
+                entry["wait"] = _GIVE_SETTLE_TICKS
             self._give_armor(index, bot, report)
         self._select_sword(index)
+
+    def _settle_gives(self, user: str) -> None:
+        """把某个 Bot 每个物品的「等待帧数」减一（``give`` 之后的观察窗口）。
+
+        只做记账：减到 0 之后，下一次 :meth:`_give_missing` 才会复核并（仍缺时）重发。
+        """
+        state = self._restock_gives.get(user)
+        if not state:
+            return
+        for entry in state.values():
+            if int(entry.get("wait", 0)) > 0:
+                entry["wait"] = int(entry["wait"]) - 1
 
     def _give_armor(self, index: int, bot: BotConfig, report: dict) -> None:
         """按缺失**槽位**补发护甲，再请运行时穿上。
@@ -1190,14 +1340,16 @@ class GladiatorEnv(gym.Env):
                 self._restock_logged.discard(bot.username)
                 self._restock_tick.pop(bot.username, None)
                 self._restock_rounds.pop(bot.username, None)
+                self._restock_gives.pop(bot.username, None)
                 self._respawn_grace.pop(bot.username, None)
                 suffix = f"，第 {rounds + 1} 轮" if rounds else ""
                 self._log(f"[restock] {bot.username} 已补齐（第 {tick} tick{suffix}）")
                 continue
-            # 隔 tick 才补发一次：给/穿都是 RCON 或动作往返，每 tick 都发会把
-            # 4 场地的 steps/s 打到 1.8（真机 2026-11-19 01:0x 实测）。
-            if tick % 2 == 1:
-                self._give_missing(index, bot, report)
+            # 逐物品复核：先把每个缺失项的「等待帧数」减一，再补发**仍然缺**的项。
+            # 旧实现是「隔 tick 全量重发」：give 完当帧就判缺，金苹果因此反复报补装失败。
+            # 现在每个物品 give 后至少等 ``_GIVE_SETTLE_TICKS`` 帧，天然限流，不需要再隔 tick。
+            self._settle_gives(bot.username)
+            self._give_missing(index, bot, report)
             if bot.username not in self._restock_logged:
                 self._restock_logged.add(bot.username)
                 self._log(
@@ -1229,6 +1381,7 @@ class GladiatorEnv(gym.Env):
                 self._restock_pending.pop(bot.username, None)
                 self._restock_tick.pop(bot.username, None)
                 self._restock_rounds.pop(bot.username, None)
+                self._restock_gives.pop(bot.username, None)
                 self._restock_logged.discard(bot.username)
                 self._respawn_grace.pop(bot.username, None)
                 self._log(

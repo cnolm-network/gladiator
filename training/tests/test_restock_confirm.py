@@ -63,6 +63,7 @@ def set_bot2(env: GladiatorEnv, raw: dict) -> None:
 
 
 class RestockConfirmTest(unittest.TestCase):
+
     def test_first_check_issues_give_for_missing_items(self):
         env, _links, logs, rcon = build_env()
         env._raw = [observation("Glad_Bot_1", inventory=[], held="air"),
@@ -157,6 +158,89 @@ class RestockConfirmTest(unittest.TestCase):
 
         self.assertEqual(env._restock_pending.get("Glad_Bot_2"), 3)
         self.assertNotIn("Glad_Bot_2", env._restock_logged)
+
+
+class GiveSettleTimingTest(unittest.TestCase):
+    """金苹果补装时序（4 场地日志反复出现「补装失败（缺 golden_apple）」的修复）。
+
+    旧实现同一 tick 里 give 完就在下一帧判「仍缺 → 重发」，于是 1.8 的背包还没同步
+    就已经被记成失败。新规则：逐物品记账、give 后至少等 2 tick 复核、只重发仍缺的项、
+    单个物品整轮最多 3 次。
+    """
+
+    def _env(self):
+        env, _links, logs, rcon = build_env()
+        env._raw = [observation("Glad_Bot_1", inventory=[], held="air"),
+                    observation("Glad_Bot_2", inventory=[], held="air")]
+        return env, logs, rcon
+
+    @staticmethod
+    def _gives(rcon, item="golden_apple"):
+        return [cmd for cmd in rcon.commands if cmd.startswith("give") and f" {item} " in cmd]
+
+    def test_give_is_not_repeated_within_settle_window(self):
+        env, _logs, rcon = self._env()
+        env._request_restock(0, reason="code=ITEM_MISSING")
+        self.assertEqual(len(self._gives(rcon)), 1)
+
+        # 第 1 帧：等同步，不重发
+        env._confirm_restock()
+        self.assertEqual(len(self._gives(rcon)), 1)
+        # 第 2 帧：等待窗口结束，仍缺 → 重发一次（第 2 次）
+        env._confirm_restock()
+        self.assertEqual(len(self._gives(rcon)), 2)
+
+    def test_only_missing_items_are_resent(self):
+        env, _logs, rcon = self._env()
+        env._request_restock(0, reason="code=ITEM_MISSING")
+        rcon.commands.clear()
+
+        # 剑和鱼竿已经到位，只有金苹果没同步
+        env._raw[0] = observation("Glad_Bot_1", inventory=[
+            {"slot": 36, "name": "diamond_sword", "count": 1},
+            {"slot": 38, "name": "fishing_rod", "count": 1},
+        ], held="diamond_sword")
+        env._confirm_restock()
+        env._confirm_restock()
+
+        gives = [cmd for cmd in rcon.commands if cmd.startswith("give")]
+        self.assertTrue(gives, "仍缺金苹果，应该重发")
+        self.assertTrue(all("golden_apple" in cmd for cmd in gives), gives)
+
+    def test_at_most_three_gives_per_item_per_cycle(self):
+        env, _logs, rcon = self._env()
+        env._request_restock(0, reason="code=ITEM_MISSING")
+        for _ in range(9):
+            env._confirm_restock()
+
+        self.assertEqual(len(self._gives(rcon)), 3)
+        self.assertNotIn("Glad_Bot_1", env._restock_pending)
+        self.assertNotIn("Glad_Bot_1", env._restock_gives)
+
+    def test_new_cycle_resets_item_budget(self):
+        env, _logs, rcon = self._env()
+        env._request_restock(0, reason="code=ITEM_MISSING")
+        for _ in range(9):
+            env._confirm_restock()
+        self.assertEqual(len(self._gives(rcon)), 3)
+
+        # 新一轮补装：逐物品的重发预算重新记
+        env._request_restock(0, reason="periodic")
+        self.assertEqual(len(self._gives(rcon)), 4)
+
+    def test_give_settle_state_cleared_on_success(self):
+        env, _logs, rcon = self._env()
+        env._request_restock(0, reason="code=ITEM_MISSING")
+        env._raw[0] = observation("Glad_Bot_1", inventory=[
+            {"slot": 36, "name": "diamond_sword", "count": 1},
+            {"slot": 37, "name": "golden_apple", "count": 5},
+            {"slot": 38, "name": "fishing_rod", "count": 1},
+        ], held="diamond_sword")
+        env._confirm_restock()
+
+        self.assertNotIn("Glad_Bot_1", env._restock_pending)
+        self.assertNotIn("Glad_Bot_1", env._restock_gives)
+        self.assertEqual(len(self._gives(rcon)), 1)
 
 
 if __name__ == "__main__":

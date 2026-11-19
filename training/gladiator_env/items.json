@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "_comment": "物品能力表（动作空间 v2）。训练环境与 bot-runtime 共用这一份；新增物品只改这里，不改代码。键名支持通配（*_sword）与 re: 前缀的正则；未匹配到的物品一律落到 misc/none。",
+  "items": {
+    "minecraft:diamond_sword": {
+      "category": "sword",
+      "use": { "mode": "hold_block", "ticks": 5 },
+      "cooldownTicks": 10,
+      "reach": 3.99,
+      "stackGoal": 1
+    },
+    "*_sword": {
+      "category": "sword",
+      "use": { "mode": "hold_block", "ticks": 5 },
+      "cooldownTicks": 10,
+      "reach": 3.99,
+      "stackGoal": 1
+    },
+    "minecraft:golden_apple": {
+      "category": "food",
+      "use": { "mode": "hold", "ticks": 32 },
+      "cooldownTicks": 0,
+      "stackGoal": 5
+    },
+    "minecraft:fishing_rod": {
+      "category": "tool",
+      "use": { "mode": "click", "ticks": 2 },
+      "cooldownTicks": 10,
+      "reach": 6.0,
+      "projectile": true,
+      "stackGoal": 1
+    },
+    "minecraft:bow": {
+      "category": "bow",
+      "use": { "mode": "charge", "ticks": 20 },
+      "cooldownTicks": 0,
+      "reach": 32.0,
+      "projectile": true,
+      "stackGoal": 1
+    },
+    "*_potion": {
+      "category": "potion",
+      "use": { "mode": "click", "ticks": 2 },
+      "cooldownTicks": 0,
+      "stackGoal": 1
+    },
+    "minecraft:cobblestone": {
+      "category": "block",
+      "use": { "mode": "click", "ticks": 1 },
+      "cooldownTicks": 0,
+      "reach": 4.5,
+      "stackGoal": 64
+    },
+    "*_block": {
+      "category": "block",
+      "use": { "mode": "click", "ticks": 1 },
+      "cooldownTicks": 0,
+      "reach": 4.5,
+      "stackGoal": 64
+    }
+  }
+}

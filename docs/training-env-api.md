@@ -202,6 +202,31 @@ GladiatorEnv(
 因此 `distance > reach - 0.15` 时动作退化为 `look` + `move(forward, sprint)`，
 而不是发一次注定失败的 `attack`。`use_rod` 只在 2.0–6.0 格内才真的抛竿。
 
+#### 动作空间 v2（物品无关，`G-631`）
+
+`GladiatorEnv(..., action_space="v2")` 换成**多离散意图**：物品身份不再进动作，能力表放在
+`training/gladiator_env/items.json`（正则匹配，未知物品落 `misc`，不报错）。
+
+| 头 | 取值数 | 语义 |
+|---|---|---|
+| `move` | 5 | idle / forward / back / left / right |
+| `look_yaw` | 7 | 每 tick ±3 / ±10 / ±30 度 |
+| `look_pitch` | 5 | 每 tick ±5 / ±15 度 |
+| `attack` | 2 | 左键（切剑、reach、500ms 节流仍在执行层） |
+| `use` | 3 | 不按 / 单击 / 按住（怎么按由能力表的 `mode` 决定） |
+| `jump` / `sneak` / `sprint` | 2 各 | 与移动正交 |
+| `slot` | 9 | 热键栏槽位，**唯一的物品切换入口** |
+
+合计 `ACTION_DIM_V2 = 37`（`spaces.ACTION_HEADS_V2`）。`reset()`/`step()` 的 `info["actionMask"]`
+给出每个头的可用性（空槽、手持物品 `use.mode=none` 时相应位置为 `False`），策略应只在掩码内采样。
+
+协议不变：v2 的意图作为 `{"type": "intent", "intent": {...}}` 放在 ACTION 载荷里下发，
+运行时 `src/intent.js` 负责翻译成原始控制（`setControlState` / 转头增量 / 右键时长 / 选槽），
+`--items-json` 可指定另一份能力表。v1 的 11 个宏动作原样保留（冷启动基线 + 回归对照）。
+
+新增物品零改代码的判据：往 `items.json` 加一条能力项（例如 `minecraft:potion`），
+`ItemTable` 与运行时掩码立刻认识它，无需动 Python/JS。
+
 #### 奖励（可插拔，`G-404`）
 
 `reward_fn(ctx: RewardContext) -> float`，默认 `default_reward`：

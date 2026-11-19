@@ -50,18 +50,24 @@ export class EnvLinkServer {
     this.server = null;
     this.clients = new Set();
     this.tick = 0;
-    this.scheds = new Map();
   }
 
   get address() {
     return this.server && this.server.address ? this.server.address() : null;
   }
 
-  sched(botId) {
-    if (!this.scheds.has(botId)) {
-      this.scheds.set(botId, new ActionScheduler({ maxPerSecond: this.maxActionsPerSecond }));
+  /**
+   * 为一条**连接**新建 scheduler（seq 去重/限流的缓存必须随连接生命周期）。
+   *
+   * <p>协议 §4.3 的 seq 是「每连接单调」，新连接会从 1 重新开始；如果沿用按 botId
+   * 缓存的去重表，新连接的 seq=1..N 会被当成「重放」直接回放旧结果——动作一条都不执行，
+   * 现象是「观测在动、Bot 不动」。训练侧每次新起一个环境进程都会踩到这一点。
+   */
+  schedForClient(client) {
+    if (!client.sched) {
+      client.sched = new ActionScheduler({ maxPerSecond: this.maxActionsPerSecond });
     }
-    return this.scheds.get(botId);
+    return client.sched;
   }
 
   start() {
@@ -189,11 +195,47 @@ export class EnvLinkServer {
       return;
     }
     const action = { type: payload.type, params: payload.params || {} };
-    const result = await this.sched(client.botId).run(seq, () => session.dispatcher.dispatch(action));
+    // 动作空间 v2：载荷是 `{type:"intent", intent:{...}}`（v1 的宏动作没有这个字段）。
+    if (payload.intent !== undefined) {
+      action.intent = payload.intent;
+    }
+    if (action.type === 'intent') {
+      await this.onIntent(client, frame, session, action);
+      return;
+    }
+    const result = await this.schedForClient(client).run(seq, () => session.dispatcher.dispatch(action));
     this.send(client, 'ACTION_RESULT', result, seq);
     if (!result.ok && result.code === 'RULE_DENIED' && typeof session.onRuleDenied === 'function') {
       session.onRuleDenied(action, result.reason);
     }
+  }
+
+  /**
+   * 意图帧（动作空间 v2）：交给运行时的 `applyIntent`，与 v1 共用同一套 scheduler
+   * （限流 + seq 去重 + 结构化 ACTION_RESULT）。
+   *
+   * <p>不写进 `ACTION_TYPES`：它是 ACTION 载荷的一种变体，不是新消息类型，
+   * 因此协议版本与 WELCOME 的 actionSpec 都不变（见 docs/identity-and-action-space.md §2.5）。
+   */
+  async onIntent(client, frame, session, action) {
+    const seq = frame.seq;
+    const intent = action.intent !== undefined
+      ? action.intent
+      : (action.params && action.params.intent);
+    if (!intent || typeof intent !== 'object') {
+      this.send(client, 'ACTION_RESULT', {
+        ok: false, code: 'INTENT_INVALID', reason: 'intent 帧缺少 intent 对象',
+      }, seq);
+      return;
+    }
+    if (typeof session.applyIntent !== 'function') {
+      this.send(client, 'ACTION_RESULT', {
+        ok: false, code: 'ACTION_UNSUPPORTED', reason: '运行时未启用意图执行器（applyIntent）',
+      }, seq);
+      return;
+    }
+    const result = await this.schedForClient(client).run(seq, () => session.applyIntent(intent));
+    this.send(client, 'ACTION_RESULT', result, seq);
   }
 
   startObservation(client) {
@@ -272,7 +314,6 @@ export class EnvLinkServer {
       }
     }
     this.clients.clear();
-    this.scheds.clear();
     if (this.server) {
       for (const socket of this.server.clients || []) {
         try {
