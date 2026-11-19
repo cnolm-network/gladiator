@@ -137,27 +137,224 @@ export async function selectItem(bot, logicalName) {
   throw new ItemError('ITEM_MISSING', `背包里没有${label}`);
 }
 
-/** 把护甲穿上（调用方通过 RCON 发过套件后调用；缺哪件就跳过哪件）。 */
-export async function equipArmor(bot) {
-  // mineflayer 的护甲目的地：head / torso / legs / feet。
-  const wanted = [['helmet', 'head'], ['chestplate', 'torso'], ['leggings', 'legs'], ['boots', 'feet']];
-  const equipped = [];
-  for (const [kind, destination] of wanted) {
-    const slot = findAnySlot(bot, new RegExp(`_${kind}$`));
-    if (slot === null) {
-      continue;
+/**
+ * 护甲穿戴的时序参数（导出便于运行时调参与测试缩短等待）。
+ *
+ * <p>背景（真机）：1.8 的服务端在客户端点击背包时回一个窗口事务确认，mineflayer 等不到就
+ * 报 `Server didn't respond to transaction for clicking on slot N`。此时客户端本地库存已被
+ * 改写（所以运行时日志说「已穿戴护甲」），服务端却是空的——护甲实际没穿上。
+ * 因此每次 equip 必须有超时兜底、失败后复位窗口再重试，并对同一 bot 做冷却限流。
+ */
+export const ARMOR_TIMING = Object.freeze({
+  timeoutMs: 3000,
+  retryDelayMs: 300,
+  cooldownMs: 2000,
+});
+
+/** mineflayer 的护甲目的地：head / torso / legs / feet。 */
+const ARMOR_SLOTS = Object.freeze([
+  ['helmet', 'head'],
+  ['chestplate', 'torso'],
+  ['leggings', 'legs'],
+  ['boots', 'feet'],
+]);
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function resolveArmorTiming(options) {
+  const opts = options || {};
+  const pick = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+  return {
+    timeoutMs: Math.max(1, pick(opts.timeoutMs, ARMOR_TIMING.timeoutMs)),
+    retryDelayMs: Math.max(0, pick(opts.retryDelayMs, ARMOR_TIMING.retryDelayMs)),
+    cooldownMs: Math.max(0, pick(opts.cooldownMs, ARMOR_TIMING.cooldownMs)),
+  };
+}
+
+/** 每 bot 一份的「已警告过的失败原因」集合，用来去重刷屏。 */
+function armorWarnedSet(bot) {
+  if (!(bot.__armorWarned instanceof Set)) {
+    bot.__armorWarned = new Set();
+  }
+  return bot.__armorWarned;
+}
+
+function warnArmorOnce(bot, key, message) {
+  const warned = armorWarnedSet(bot);
+  if (warned.has(key)) {
+    return false;
+  }
+  warned.add(key);
+  console.warn(message);
+  return true;
+}
+
+/**
+ * 失败归类：日志去重按「件 + 类别」做键。
+ * 不能直接用原始 message——事务错误里带槽位号（`slot 11`），换个槽位就会被当成新原因刷屏。
+ */
+function classifyEquipFailure(error) {
+  if (error && error.code === 'EQUIP_TIMEOUT') {
+    return 'timeout';
+  }
+  const message = String(error?.message ?? error ?? '');
+  if (/respond to transaction/i.test(message)) {
+    return 'transaction';
+  }
+  return 'error';
+}
+
+/**
+ * 单次 equip，带硬超时。
+ *
+ * <p>超时后不抛到调用方外面（由调用方捕获），且迟到 settle 的 equip 也已挂空 catch，
+ * 不会以 unhandled rejection 的形式打崩进程。
+ */
+async function equipWithTimeout(bot, item, destination, timeoutMs) {
+  let timer = null;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`服务端 ${timeoutMs}ms 内未确认穿 ${item.name}`);
+      error.code = 'EQUIP_TIMEOUT';
+      reject(error);
+    }, timeoutMs);
+  });
+  // 谁先 settle 谁说话：equip 迟到 reject 时 race 已结束，这里必须自己吞掉。
+  const attempt = Promise.resolve().then(() => bot.equip(item, destination));
+  attempt.catch(() => {});
+  try {
+    await Promise.race([attempt, guard]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
     }
-    const item = bot.inventory.items().find((it) => it.slot === slot);
-    if (!item) {
-      continue;
-    }
+  }
+}
+
+/**
+ * 尽力复位窗口状态。
+ *
+ * <p>1.8 的窗口点击带「事务确认」，服务端不回确认后两侧状态就不一致；仅靠重试会一直踩同一个
+ * 不一致状态。复位手段有两个：
+ * 1. `closeWindow(currentWindow)`——有打开的容器窗口时把它关掉，让 mineflayer 重建 inventory；
+ * 2. `clickWindow(-999, 0, 0)`——mineflayer 自己关窗后也这么干，用途是清光标栈并同步 state id。
+ *
+ * <p>两种调用都可能抛（`closeWindow(undefined)` 会读 `window.id` 直接 TypeError；对自家背包
+ * 窗口调 closeWindow 在 1.8 下也会抛），这里全部忽略——复位是尽力而为，失败不算穿戴失败。
+ */
+function closeWindowQuietly(bot) {
+  if (typeof bot.closeWindow === 'function') {
     try {
-      await bot.equip(item, destination);
-      equipped.push(item.name);
+      const result = bot.closeWindow(bot.currentWindow || undefined);
+      // 有的封装把 closeWindow 写成 async：失败形式是 rejected promise 而非同步抛，
+      // 同样不能漏成 unhandled rejection 打崩进程。
+      if (result && typeof result.catch === 'function') {
+        result.catch(() => {});
+      }
     } catch (error) {
-      // 装备失败不阻断训练（例如物品还在背包而不是快捷栏）。
-      equipped.push(`!${item.name}:${error?.message ?? error}`);
+      // 忽略：见上。
     }
+  }
+  if (typeof bot.clickWindow === 'function') {
+    try {
+      const result = bot.clickWindow(-999, 0, 0);
+      if (result && typeof result.catch === 'function') {
+        result.catch(() => {});
+      }
+    } catch (error) {
+      // 忽略：复位尽力而为。
+    }
+  }
+}
+
+/**
+ * 穿一件护甲：失败后复位窗口、等 retryDelayMs、重试一次。
+ * @returns {Promise<{ok: boolean, error?: Error, attempts: number}>}
+ */
+async function equipOne(bot, item, destination, timing) {
+  let attempts = 0;
+  let lastError = null;
+  for (let round = 0; round < 2; round += 1) {
+    if (round > 0) {
+      // 窗口事务超时意味着两侧状态已经不一致：先关窗口让 mineflayer 重建 inventory，
+      // 等一下再试，否则重试必然踩同一个不一致状态。
+      closeWindowQuietly(bot);
+      await delay(timing.retryDelayMs);
+    }
+    attempts += 1;
+    try {
+      // 每轮都按名字重新解析槽位：关闭窗口后槽位可能变化，旧引用可能已失效。
+      const current = bot.inventory && bot.inventory.items
+        ? bot.inventory.items().find((it) => it.name === item.name)
+        : null;
+      await equipWithTimeout(bot, current || item, destination, timing.timeoutMs);
+      return { ok: true, attempts };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  return { ok: false, error: lastError, attempts };
+}
+
+/**
+ * 把护甲穿上（调用方通过 RCON 发过套件后调用；缺哪件就跳过哪件）。
+ *
+ * <p>永不抛异常：单件的失败一律折算成返回值里的 `!物品名:原因` 条目，避免穿戴失败
+ * 冒泡打断 ActionDispatcher 的动作循环。
+ *
+ * <p>同一 bot 两次穿甲尝试至少间隔 `cooldownMs`（默认 2000ms），冷却期内直接返回空数组
+ * （空操作、不报错）——训练里每 800ms 轮询一次，不节流会持续撞事务超时。
+ *
+ * @returns {Promise<string[]>} 已穿上的物品名；失败项形如 `!diamond_boots:原因`
+ */
+export async function equipArmor(bot, options = {}) {
+  const timing = resolveArmorTiming(options);
+  const equipped = [];
+  if (!bot || !bot.inventory || typeof bot.inventory.items !== 'function') {
+    return equipped;
+  }
+
+  // 先算出这轮要穿哪几件：没有可穿物品时不该消耗冷却窗口（否则 RCON give 后的
+  // 第一次有效尝试会被前一次空轮询挡掉最多 cooldownMs）。
+  const pending = [];
+  for (const [kind, destination] of ARMOR_SLOTS) {
+    let item = null;
+    try {
+      const slot = findAnySlot(bot, new RegExp(`_${kind}$`));
+      item = slot === null ? null : bot.inventory.items().find((it) => it.slot === slot) || null;
+    } catch (error) {
+      item = null;
+    }
+    if (item) {
+      pending.push({ item, destination });
+    }
+  }
+  if (pending.length === 0) {
+    return equipped;
+  }
+
+  const now = Date.now();
+  const lastAttemptAt = Number(bot.__armorAttemptAt) || 0;
+  if (lastAttemptAt > 0 && now - lastAttemptAt < timing.cooldownMs) {
+    return equipped;
+  }
+  bot.__armorAttemptAt = now;
+
+  for (const { item, destination } of pending) {
+    const result = await equipOne(bot, item, destination, timing);
+    if (result.ok) {
+      equipped.push(item.name);
+      continue;
+    }
+    const reason = String(result.error?.message ?? result.error ?? '未知原因');
+    equipped.push(`!${item.name}:${reason}`);
+    warnArmorOnce(
+      bot,
+      `${item.name}:${classifyEquipFailure(result.error)}`,
+      `[armor] 穿戴 ${item.name} 失败（已重试 ${result.attempts} 次，本轮跳过）：${reason}`,
+    );
   }
   return equipped;
 }

@@ -106,6 +106,195 @@ def parse_ports(value: Any, field: str, reserved: Iterable[int] = ()) -> list[in
     return ports
 
 
+# ---------------------------------------------------------------------------
+# 训练「实验参数（高级）」
+#
+# 这些字段原先只能从命令行传给 gladiator_train.train；Dashboard 把它们提升为
+# 训练计划的正式字段。全部可选、全部有默认值；缺省时其余参数（users / ports /
+# seed / epochs / plan 等）生成的命令行与改造前完全一致。
+#
+# 有两处默认值刻意与 train.py 的 CLI 缺省不同（网页默认更保守，表单里可改回）：
+#   - ``bcEpisodes`` 默认 0（CLI 4）：网页默认不做行为克隆；
+#   - ``entropyCoef`` 默认 0.01（CLI 0.02）。
+# ---------------------------------------------------------------------------
+
+#: 更新算法（train.py ``--algo``）。
+TRAINING_ALGOS = ("ppo", "reinforce")
+#: 动作空间（train.py ``--action-space``）：v1 = 11 个宏动作单头，v2 = 9 头因子化。
+ACTION_SPACES = ("v1", "v2")
+
+#: 实验参数缺省值：与 ``/api/training/options`` 的 ``defaults`` 同源，前端直接用。
+EXPERIMENT_DEFAULTS: dict[str, Any] = {
+    "algo": "ppo",
+    "actionSpace": "v1",
+    "initPolicy": "",
+    "bcEpisodes": 0,
+    "evalBeforeTrain": False,
+    "seed": 7,
+    "victory": 50.0,
+    "lr": 3e-4,
+    "targetEntropy": 0.3,
+    "entropyCoef": 0.01,
+    "resetPolicyHead": False,
+    "users": ["Bot_T1", "Bot_T2"],
+    "ports": [8770, 8771],
+}
+
+#: 单场地训练支持 2..16 个 Bot（学习方 + 至少一个对手）。
+MIN_TRAIN_BOTS = 2
+MAX_TRAIN_BOTS = 16
+
+
+def parse_choice(value: Any, field: str, label: str, choices: tuple[str, ...],
+                 default: str) -> str:
+    """枚举字段：去空白 + 小写归一化后比对，非法值报 400 并列出合法取值。"""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    text = str(value).strip().lower()
+    if text not in choices:
+        raise BadRequest(f"{label}（{field}）只支持 {' | '.join(choices)}，收到 {value!r}")
+    return text
+
+
+def _bounded_int(value: Any, field: str, label: str, minimum: int, maximum: int,
+                 default: int) -> int:
+    """整数 + 区间；越界时把字段名与合法范围一起写进错误信息。"""
+    number = parse_int(value, field, default=default)
+    if not minimum <= number <= maximum:
+        raise BadRequest(f"{label}（{field}）需要在 {minimum} ~ {maximum} 之间，收到 {number}")
+    return number
+
+
+def _bounded_float(value: Any, field: str, label: str, minimum: float, maximum: float,
+                   default: float) -> float:
+    """浮点 + 区间；越界时把字段名与合法范围一起写进错误信息。"""
+    number = parse_float(value, field, default=default)
+    if not minimum <= number <= maximum:
+        raise BadRequest(
+            f"{label}（{field}）需要在 {minimum:g} ~ {maximum:g} 之间，收到 {number:g}"
+        )
+    return number
+
+
+def parse_experiment_ports(value: Any, field: str = "端口（ports）",
+                           reserved: Iterable[int] = ()) -> list[int]:
+    """训练端口：1..65535、互不重复、至少 2 个、不能占用保留端口。"""
+    raw_items = split_list(value, field)
+    if not raw_items:
+        raise BadRequest(f"{field} 不能为空：每个 Bot 需要一个通道 B 端口")
+    reserved_set = {int(item) for item in reserved}
+    ports: list[int] = []
+    for index, item in enumerate(raw_items):
+        port = parse_int(item, f"{field}[{index}]", minimum=1, maximum=65535)
+        if port in reserved_set:
+            occupied = "、".join(str(item) for item in sorted(reserved_set))
+            raise BadRequest(
+                f"{field}[{index}] 不能使用保留端口 {port}（Dashboard / 服务器已占用: {occupied}）"
+            )
+        ports.append(port)
+    duplicates = sorted({port for port in ports if ports.count(port) > 1})
+    if duplicates:
+        raise BadRequest(
+            f"{field} 不能重复：{'、'.join(str(port) for port in duplicates)}"
+            "（每个 Bot 必须独占一个端口）"
+        )
+    if len(ports) < MIN_TRAIN_BOTS:
+        raise BadRequest(
+            f"{field} 至少需要 {MIN_TRAIN_BOTS} 个（每个 Bot 一个），当前 {len(ports)} 个"
+        )
+    return ports
+
+
+def parse_experiment(payload: dict, *, defaults: dict | None = None,
+                     reserved_ports: Iterable[int] = ()) -> dict:
+    """解析训练计划的「实验参数（高级）」，返回规范化后的完整字段字典。
+
+    所有字段可选：缺省取 ``EXPERIMENT_DEFAULTS``（可被 ``defaults`` 覆盖，便于
+    后续在 options 里调整默认值）。交叉规则在这里统一处理，避免遗漏：
+
+    - ``users`` / ``ports`` 一对一，且至少 2 个；
+    - ``ports`` 1..65535、互不重复、不占用保留端口；
+    - ``actionSpace=v2`` 时 ``bcEpisodes`` 必须为 0（BC 老师只会 v1 宏动作）。
+
+    ``initPolicy`` 只做「字符串 + 空串 = 不用」这一层校验，模型 id / 路径的
+    解析交给 ``TrainingRunner._resolve_init_policy``（那里才知道 var/models）。
+    """
+    base = dict(EXPERIMENT_DEFAULTS)
+    if defaults:
+        base.update({key: value for key, value in defaults.items() if key in base})
+
+    users = [
+        validate_username(item, f"用户名[{index}]")
+        for index, item in enumerate(split_list(pick(payload, "users", default=base["users"]),
+                                                "用户（users）"))
+    ]
+    if not users:
+        raise BadRequest("用户（users）不能为空：至少需要 2 个 Bot（学习方 + 对手）")
+    if not MIN_TRAIN_BOTS <= len(users) <= MAX_TRAIN_BOTS:
+        raise BadRequest(
+            f"用户（users）需要 {MIN_TRAIN_BOTS}~{MAX_TRAIN_BOTS} 个 Bot，当前 {len(users)} 个"
+            "（顺序对应端口，第 1 个是被训练方）"
+        )
+
+    ports = parse_experiment_ports(pick(payload, "ports", default=base["ports"]),
+                                   "端口（ports）", reserved_ports)
+    if len(ports) != len(users):
+        raise BadRequest(
+            f"端口（ports）数量必须与用户（users）一致：users {len(users)} 个、ports {len(ports)} 个"
+        )
+
+    algo = parse_choice(pick(payload, "algo", default=base["algo"]), "algo", "算法",
+                        TRAINING_ALGOS, base["algo"])
+    action_space = parse_choice(pick(payload, "actionSpace", default=base["actionSpace"]),
+                                "actionSpace", "动作空间", ACTION_SPACES, base["actionSpace"])
+
+    raw_init = pick(payload, "initPolicy", default=base["initPolicy"])
+    if raw_init is None:
+        raw_init = ""
+    if not isinstance(raw_init, str):
+        raise BadRequest("初始模型（initPolicy）需要字符串：模型 id 或 policy.npz 路径")
+    init_policy = raw_init.strip()
+
+    bc_episodes = _bounded_int(pick(payload, "bcEpisodes", default=base["bcEpisodes"]),
+                               "bcEpisodes", "BC 局数", 0, 100, base["bcEpisodes"])
+    if action_space == "v2" and bc_episodes > 0:
+        raise BadRequest(
+            "动作空间（actionSpace）v2 不支持 BC 预训练：BC 老师输出的是 v1 宏动作，"
+            "v2 没有对应标签；请把 BC 局数设为 0，或改用 v1"
+        )
+
+    return {
+        "algo": algo,
+        "actionSpace": action_space,
+        "initPolicy": init_policy,
+        "bcEpisodes": bc_episodes,
+        "evalBeforeTrain": parse_bool(
+            pick(payload, "evalBeforeTrain", default=base["evalBeforeTrain"]),
+            "训练前评估（evalBeforeTrain）",
+        ),
+        "seed": _bounded_int(pick(payload, "seed", default=base["seed"]),
+                             "seed", "随机种子", 0, 2**31 - 1, base["seed"]),
+        "victory": _bounded_float(pick(payload, "victory", default=base["victory"]),
+                                  "victory", "胜利权重", 0.0, 1000.0, base["victory"]),
+        "lr": _bounded_float(pick(payload, "lr", default=base["lr"]),
+                             "lr", "学习率", 1e-6, 1e-1, base["lr"]),
+        "targetEntropy": _bounded_float(
+            pick(payload, "targetEntropy", default=base["targetEntropy"]),
+            "targetEntropy", "目标熵", 0.0, 5.0, base["targetEntropy"],
+        ),
+        "entropyCoef": _bounded_float(
+            pick(payload, "entropyCoef", default=base["entropyCoef"]),
+            "entropyCoef", "熵系数", 0.0, 10.0, base["entropyCoef"],
+        ),
+        "resetPolicyHead": parse_bool(
+            pick(payload, "resetPolicyHead", default=base["resetPolicyHead"]),
+            "重置策略头（resetPolicyHead）",
+        ),
+        "users": users,
+        "ports": ports,
+    }
+
+
 def parse_center(value: Any, field: str = "场地中心") -> tuple[float, float, float]:
     if isinstance(value, (list, tuple)):
         parts = list(value)

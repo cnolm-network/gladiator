@@ -220,6 +220,43 @@ input:focus, select:focus { border-color: #3b7b5a; box-shadow: 0 0 0 3px rgba(87
 .check { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; margin: 4px 0 10px; }
 .check input { width: auto; }
 
+/* 训练「实验参数（高级）」折叠区：默认收起，样式沿用卡片内嵌面板 */
+details.exp-block {
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: #101922;
+  padding: 0 12px 4px;
+  margin: 12px 0 8px;
+}
+details.exp-block > summary {
+  cursor: pointer;
+  padding: 9px 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--text);
+  list-style: none;             /* flex 下原生三角不渲染，这里自己画一个 */
+}
+details.exp-block > summary::-webkit-details-marker { display: none; }
+/* flex 布局会吃掉 summary 的默认标记：用一个可旋转的小三角补回可点提示 */
+details.exp-block > summary::before {
+  content: "▸";
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  transition: transform .15s ease;
+}
+details.exp-block[open] > summary::before { transform: rotate(90deg); }
+details.exp-block > summary:hover { color: var(--accent); }
+details.exp-block[open] > summary {
+  border-bottom: 1px dashed var(--line-soft);
+  margin-bottom: 8px;
+}
+details.exp-block .exp-title { font-size: 13px; font-weight: 600; }
+details.exp-block .form-grid { margin-top: 2px; }
+details.exp-block input[aria-invalid="true"] { border-color: #5c2a2a; box-shadow: 0 0 0 3px rgba(255, 107, 107, .08); }
+
 .inline-form { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
 .inline-form input { flex: 1; min-width: 160px; }
 form.inline-form { margin: 0; }

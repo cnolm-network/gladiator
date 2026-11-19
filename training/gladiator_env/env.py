@@ -1145,6 +1145,15 @@ class GladiatorEnv(gym.Env):
                     f"金苹果 {report['counts'].get('golden_apple', 0)}，护甲 {report['armor']}/4"
                 )
                 return
+            if report["missing"] == [] and report["holding_sword"]:
+                # 缺件列表为空说明物品都在背包里；护甲没穿上属于运行时 equip 的问题
+                # （1.8 偶发 "Server didn't respond to transaction"），再 give 也没用。
+                # 这里直接放行，避免每局开头刷 3 轮 give + 6 秒等待。
+                self._log(
+                    f"[kit] {bot.username} 物品齐全但护甲只穿上 {report['armor']}/4，"
+                    "按现状开打（运行时 equip 超时，已记录）"
+                )
+                return
             self._log(
                 f"[kit] {bot.username} 套装不完整（第 {attempt + 1} 次）："
                 f"缺 {report['missing']}，护甲 {report['armor']}/4，手持 {report['held'] or '空手'}"

@@ -188,6 +188,54 @@
             <label class="check"><input id="tr-auto-spawn" type="checkbox" checked> 自动 spawn 并放置 Bot</label>
             <label class="check"><input id="tr-auto-cleanup" type="checkbox" checked> 训练结束后自动停止本次拉起的运行时</label>
             <p class="muted small">训练前请先确保对应通道 B 端口已有 bot-runtime 在监听；否则会拒绝启动并提示缺失端口。训练开始前已存在的运行时不会被自动清理。</p>
+
+            <!-- 实验参数（高级）：对照实验用，默认折叠；不改动上面的必填项与布局 -->
+            <details class="exp-block" id="tr-exp-block" data-kind="train">
+              <summary>
+                <span class="exp-title">实验参数（高级）</span>
+                <span class="muted small">算法 / 动作空间 / 初始模型 / BC / 学习率 / 熵 / 胜利权重</span>
+              </summary>
+              <p class="muted small">这些参数以前只能在命令行传；不展开就沿用默认值。随机种子、用户、端口仍在上方字段里填，这里不重复。</p>
+              <div class="form-grid">
+                <label class="field"><span>算法</span>
+                  <select id="tr-algo" aria-label="算法">
+                    <option value="ppo">ppo（clip + GAE）</option>
+                    <option value="reinforce">reinforce（旧行为）</option>
+                  </select>
+                </label>
+                <label class="field"><span>动作空间</span>
+                  <select id="tr-action-space" aria-label="动作空间">
+                    <option value="v1">v1（11 个宏动作，单头）</option>
+                    <option value="v2">v2（9 头因子化）</option>
+                  </select>
+                </label>
+                <label class="field"><span>初始模型（覆盖上方「训练模型」的权重起点）</span>
+                  <select id="tr-init-policy-model" aria-label="初始模型"></select>
+                </label>
+                <label class="field"><span>或填 policy.npz 路径（优先于下拉）</span>
+                  <input id="tr-init-policy-path" placeholder="留空 = 用上方训练模型；填了以路径为准">
+                </label>
+                <label class="field"><span>BC 局数（行为克隆热启动，0 = 不做）</span>
+                  <input id="tr-bc-episodes" type="number" min="0" max="100" step="1" value="0">
+                </label>
+                <label class="field"><span>胜利权重（奖励里的胜负常数）</span>
+                  <input id="tr-victory" type="number" min="0" max="1000" step="1" value="50">
+                </label>
+                <label class="field"><span>学习率</span>
+                  <input id="tr-lr" type="number" min="0.000001" max="0.1" step="any" value="0.0003">
+                </label>
+                <label class="field"><span>目标熵（0 = 关闭目标熵控制器）</span>
+                  <input id="tr-target-entropy" type="number" min="0" max="5" step="0.05" value="0.3">
+                </label>
+                <label class="field"><span>熵系数</span>
+                  <input id="tr-entropy-coef" type="number" min="0" max="10" step="0.005" value="0.01">
+                </label>
+              </div>
+              <label class="check"><input id="tr-eval-before-train" type="checkbox"> 训练前先评估一遍（采样 + 贪心）</label>
+              <label class="check"><input id="tr-reset-policy-head" type="checkbox"> 重置策略头（Xavier 重设 W2/b2，保留 W1 与价值头）</label>
+              <p class="muted small hidden" id="tr-exp-warn-v2bc">动作空间 v2 没有 BC 标签（BC 老师只会 v1 宏动作）：BC 局数必须为 0。</p>
+              <p class="muted small" id="tr-exp-effective">生效值：启动训练后回显。</p>
+            </details>
           </form>
           <div class="card">
             <div class="card-head"><h3>脚本 / 模型</h3>

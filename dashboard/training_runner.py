@@ -26,22 +26,22 @@ from eval_semantics import eval_rounds_from_payload, normalize_eval
 from ports import is_port_open
 from processes import ManagedProcess, ProcessManager
 from rcon_client import run_command
-from models import DEFAULT_ID as DEFAULT_MODEL_ID, spaces_dimensions
+from models import DEFAULT_ID as DEFAULT_MODEL_ID, ID_RE as MODEL_ID_RE, spaces_dimensions
 from model_locks import ModelLock
 from reward_presets import DEFAULT_ID as DEFAULT_REWARD_PRESET_ID
 from reward_presets import schema_document
 from validation import (
+    EXPERIMENT_DEFAULTS,
     STAGE_MODES,
     format_plan,
     parse_bool,
     parse_center,
+    parse_experiment,
     parse_float,
     parse_int,
     parse_plan,
-    parse_ports,
     parse_stages,
     pick,
-    split_list,
     validate_username,
 )
 
@@ -54,6 +54,14 @@ MULTI_PERSIST_WARNING = (
     "若融合为 none 或融合失败，将自动降级为不写回模型"
 )
 GMOD_PERSIST_WARNING = "文件模型（.gmod）只读，可先「导入为策略模型」再开启持久化训练"
+
+#: 只能用于单场地 train 的实验参数：multi_train 的 CLI 没有这些选项，
+#: 多场地请求里改了默认值就明确 400，而不是静默忽略（与 evalRounds 的处理一致）。
+#: 注意 ``initPolicy`` 不在列表里：multi_train 也有 ``--init-policy``，两边一致支持。
+TRAIN_ONLY_EXPERIMENT_KEYS = (
+    "algo", "actionSpace", "bcEpisodes", "evalBeforeTrain",
+    "victory", "lr", "targetEntropy", "entropyCoef", "resetPolicyHead",
+)
 
 _RE_EPOCH = re.compile(r"^\[train\] === 回合 (\d+)/(\d+) ===")
 # 新格式：--- 阶段 rusher：5 轮次 ---；同时兼容旧格式 === 阶段 idle：2 回合 ===
@@ -75,6 +83,28 @@ _RE_MULTI_DONE = re.compile(r"^\[multi\] (\d+)/(\d+) 场地完成")
 _RE_TRAIN_DONE = re.compile(
     r"^\[train\] 完成：(\d+) episodes / (\d+) steps / mean reward (-?\d+(?:\.\d+)?)"
 )
+
+
+def _experiment_override(value, key: str) -> bool:
+    """判断某个实验参数是否**偏离默认值**（用于 multi 的「不支持」提示）。
+
+    照抄默认值（前端会把默认值一起发上来）不算覆盖，避免正常请求被误拒。
+    """
+    base = EXPERIMENT_DEFAULTS[key]
+    if isinstance(base, bool):
+        try:
+            return parse_bool(value, key) is not base
+        except BadRequest:
+            return True
+    if isinstance(base, (int, float)):
+        try:
+            return float(value) != float(base)
+        except (TypeError, ValueError):
+            return True
+    text = str(value).strip()
+    if not text:
+        return False
+    return text.lower() != str(base).strip().lower()
 
 
 def with_eval_counts(params: dict) -> dict:
@@ -288,6 +318,55 @@ class TrainingRunner:
             for item in items
         ]
 
+    def _resolve_init_policy(self, raw: str) -> str | None:
+        """把「初始模型」解析成 ``--init-policy`` 的绝对路径。
+
+        空串 = 不覆盖（沿用 ``modelId`` 选中的模型）。两种写法：
+        - 模型 id → ``dashboard/var/models/<id>/policy.npz``（没有权重就 400，
+          而不是等到训练进程启动才崩）；
+        - 文件路径 → 必须存在，否则 400。
+
+        路径统一 ``resolve()``，让 run.log 里的命令行可直接粘到终端复现。
+        """
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        models_root = self.cfg.var_dir / "models"
+        # 只对「像 id 且确实注册过」的串走注册表分支，避免把相对路径误判成 id。
+        if MODEL_ID_RE.match(text) and (models_root / text / "model.json").is_file():
+            policy = models_root / text / "policy.npz"
+            if not policy.is_file():
+                raise BadRequest(
+                    f"模型 {text} 没有策略文件（policy.npz），无法作为初始模型；"
+                    "请先训练写回或导入一份权重"
+                )
+            return str(policy.resolve())
+        path = Path(text).expanduser()
+        if path.is_file():
+            return str(path.resolve())
+        raise BadRequest(
+            f"初始模型（initPolicy）无法解析: {text}；"
+            "可填模型 id（解析为 dashboard/var/models/<id>/policy.npz）或已存在的 policy.npz 路径"
+        )
+
+    @staticmethod
+    def _experiment_argv(exp: dict) -> list[str]:
+        """实验参数 → CLI 片段（布尔只在为 True 时追加，False 完全不出现）。"""
+        argv = [
+            "--algo", str(exp["algo"]),
+            "--action-space", str(exp["actionSpace"]),
+            "--bc-episodes", str(exp["bcEpisodes"]),
+            "--lr", str(exp["lr"]),
+            "--target-entropy", str(exp["targetEntropy"]),
+            "--entropy-coef", str(exp["entropyCoef"]),
+            "--victory", str(exp["victory"]),
+        ]
+        if exp["evalBeforeTrain"]:
+            argv += ["--eval-before-train"]
+        if exp["resetPolicyHead"]:
+            argv += ["--reset-policy-head"]
+        return argv
+
     def _model_from_payload(self, payload: dict) -> dict:
         """解析 ``modelId`` → ``{id, name, kind, path, builtin}``。
 
@@ -295,7 +374,18 @@ class TrainingRunner:
         G-624 起 default 是**可持久化**模型：写回过一次后 ``policy_path("default")``
         就指向 ``var/models/default/policy.npz``，下次选它会自动接着练。
         """
-        raw = pick(payload, "modelId", "initPolicy", default=None)
+        raw = pick(payload, "modelId", default=None)
+        if raw is None:
+            # 兼容旧别名：``initPolicy`` 曾经等价于 ``modelId``。现在它有了正式含义
+            # （模型 id 或 policy.npz 路径），所以只有当它确实是注册表里存在的 id
+            # 时才继续当 modelId 用；路径交给 _resolve_init_policy 处理。
+            candidate = pick(payload, "initPolicy", default=None)
+            if candidate is not None and self.models is not None:
+                try:
+                    self.models.get(str(candidate).strip())
+                    raw = candidate
+                except (NotFound, BadRequest):
+                    raw = None
         ident = str(raw).strip() if raw is not None else ""
         if not ident or ident == DEFAULT_MODEL_ID:
             ident = DEFAULT_MODEL_ID
@@ -446,6 +536,9 @@ class TrainingRunner:
                 "pairs": 2,
                 "usersPrefix": "Bot_P",
                 "portsBase": 8770,
+                # 实验参数（高级）：与 validation.EXPERIMENT_DEFAULTS 同源，
+                # 前端不再自己写一份默认值，避免两边漂移。
+                **EXPERIMENT_DEFAULTS,
             },
             "game": {"host": self.cfg.mc_host, "port": self.cfg.mc_port},
         }
@@ -534,16 +627,12 @@ class TrainingRunner:
 
     def _build_train(self, payload: dict) -> tuple[list[str], dict, int, list[int]]:
         defaults = self.options()["defaults"]
-        raw_users = pick(payload, "users", default=defaults["users"])
-        users = [
-            validate_username(item, f"用户名[{index}]")
-            for index, item in enumerate(split_list(raw_users, "users"))
-        ]
-        ports = parse_ports(pick(payload, "ports", default=defaults["ports"]), "ports", self._reserved_ports())
-        if len(users) != len(ports):
-            raise BadRequest("users 与 ports 数量必须一致")
-        if not 2 <= len(users) <= 16:
-            raise BadRequest("训练至少需要 2 个 Bot（学习方 + 对手）")
+        # 实验参数（含 users / ports / seed）统一在 validation 里解析：
+        # 端口范围、重复、与用户数一对一、v2+BC 冲突都在那里拦成 400。
+        exp = parse_experiment(payload, defaults=defaults, reserved_ports=self._reserved_ports())
+        users = exp["users"]
+        ports = exp["ports"]
+        seed = exp["seed"]
 
         episodes = parse_int(
             pick(payload, "episodes", default=defaults["episodes"]), "episodes", minimum=1, maximum=500
@@ -561,9 +650,6 @@ class TrainingRunner:
         plan = parse_plan(raw_plan, fallback_mode=mode, fallback_episodes=episodes)
         plan_text = format_plan(plan)
         total_episodes = sum(count for _mode, count in plan)
-        seed = parse_int(
-            pick(payload, "seed", default=defaults["seed"]), "seed", minimum=0, maximum=2**31 - 1
-        )
         epochs = parse_int(
             pick(payload, "epochs", default=defaults.get("epochs", 1)),
             "epochs", minimum=1, maximum=200,
@@ -582,6 +668,9 @@ class TrainingRunner:
         if reward_preset:
             reward_preset = {**reward_preset, "applied": True}
         model = self._model_from_payload(payload)
+        # 起点权重：显式填了「初始模型」就以它为准（对照实验常见用法），
+        # 否则沿用 modelId 解析出的 policy.npz（改造前的唯一来源）。
+        init_policy = self._resolve_init_policy(exp["initPolicy"]) or model["path"]
         persist_opts = self._persist_options(payload, model, kind="train")
         auto_spawn = parse_bool(pick(payload, "autoSpawn", default=defaults["autoSpawn"]), "autoSpawn")
         center = parse_center(pick(payload, "center", default=defaults["center"]))
@@ -622,9 +711,12 @@ class TrainingRunner:
         argv += ["--stages", plan_text]
         if reward_preset:
             argv += ["--reward-preset", reward_preset["path"]]
+        # 实验参数（高级）：算法 / 动作空间 / BC 局数 / 学习率 / 熵 / 胜利权重。
+        # 显式落进命令行，run.log 里能完整复现这次对照实验。
+        argv += self._experiment_argv(exp)
         # model-id / model-name 只写进 report.config；init-policy 才决定权重起点。
-        if model["path"]:
-            argv += ["--init-policy", model["path"]]
+        if init_policy:
+            argv += ["--init-policy", init_policy]
         argv += ["--model-id", model["id"], "--model-name", model["name"]]
         if persist_opts["persist"]:
             # 写回统一由 Dashboard 负责；训练侧只把这个 id 记进 report.config。
@@ -653,7 +745,11 @@ class TrainingRunner:
             "modelKind": model["kind"],
             "modelAdopted": bool(model.get("adopted")),
             "modelObsDimPadded": model.get("obsDimPadded"),
-            "initPolicy": model["path"],
+            "initPolicy": init_policy,
+            # 「实验参数（高级）」快照：前端发起后回显生效值，数据页也据此区分对照实验。
+            # initPolicy 是本次**生效**的起点（可能来自 modelId），
+            # initPolicyField 才是用户在高级区里填的原值（空 = 未覆盖）。
+            "experiment": {**exp, "initPolicyField": exp["initPolicy"], "initPolicy": init_policy},
             "persist": persist_opts["persist"],
             "persistModelId": persist_opts["persistModelId"],
             "persistModelKind": persist_opts["persistModelKind"],
@@ -682,6 +778,7 @@ class TrainingRunner:
             "modelId": params["modelId"],
             "modelName": params["modelName"],
             "initPolicy": params["initPolicy"],
+            "experiment": params["experiment"],
             "persist": {"enabled": params["persist"], "modelId": params["persistModelId"],
                         "ok": None, "error": None},
             "persistWarning": params["persistWarning"],
@@ -690,6 +787,20 @@ class TrainingRunner:
 
     def _build_multi(self, payload: dict) -> tuple[list[str], dict, int, list[int]]:
         defaults = self.options()["defaults"]
+        # multi_train 的 CLI 没有 --algo / --action-space / --bc-episodes 等选项：
+        # 只有真正改动过默认值时才拒绝，避免「表单里填了但一点没生效」
+        # （与 evalRounds 的处理一致）；照抄默认值的请求照常放行。
+        unsupported = [
+            key for key in TRAIN_ONLY_EXPERIMENT_KEYS
+            if key in payload and payload[key] is not None
+            and _experiment_override(payload[key], key)
+        ]
+        if unsupported:
+            raise BadRequest(
+                "多场地训练（multi_train）不支持实验参数："
+                + "、".join(unsupported)
+                + "；这些参数只在单场地 train 中生效"
+            )
         pairs = parse_int(
             pick(payload, "pairs", default=defaults["pairs"]), "pairs", minimum=1, maximum=8
         )
@@ -736,6 +847,11 @@ class TrainingRunner:
         if reward_preset:
             reward_preset = {**reward_preset, "applied": True}
         model = self._model_from_payload(payload)
+        # multi_train 同样支持 --init-policy：显式路径优先，否则用 modelId 解析出的起点。
+        # 旧别名（initPolicy = 模型 id）仍走 modelId 分支，解析结果与这里一致。
+        init_policy = self._resolve_init_policy(
+            pick(payload, "initPolicy", default="")
+        ) or model["path"]
         merge = str(pick(payload, "merge", default="mean") or "mean").strip().lower()
         if merge not in ("mean", "weighted", "none"):
             merge = "mean"
@@ -793,8 +909,8 @@ class TrainingRunner:
         if reward_preset:
             argv += ["--reward-preset", reward_preset["path"]]
         argv += ["--merge", merge]
-        if model["path"]:
-            argv += ["--init-policy", model["path"]]
+        if init_policy:
+            argv += ["--init-policy", init_policy]
         argv += ["--model-id", model["id"], "--model-name", model["name"]]
         if persist_opts["persist"]:
             argv += ["--persist-to", persist_opts["persistModelId"]]
@@ -822,7 +938,7 @@ class TrainingRunner:
             "modelId": model["id"],
             "modelName": model["name"],
             "modelKind": model["kind"],
-            "initPolicy": model["path"],
+            "initPolicy": init_policy,
             "persist": persist_opts["persist"],
             "persistModelId": persist_opts["persistModelId"],
             "persistModelKind": persist_opts["persistModelKind"],

@@ -575,6 +575,129 @@ function applyScripts(scripts) {
   renderScriptOptions();
 }
 
+/* ---- 实验参数（高级）：选项、收集、回显 ---- */
+
+/* 初始模型下拉：空 = 沿用「训练模型」；只列有 policy.npz 的策略模型（.gmod 与空壳模型
+   后端解析不到 var/models/<id>/policy.npz，选它只会拿到 400）。 */
+function renderInitPolicyOptions() {
+  const select = $("#tr-init-policy-model");
+  if (!select) return;
+  const current = select.value;
+  const models = (state.models || []).filter((model) => model.kind !== "gmod");
+  const options = models.map((model) => {
+    const ready = Boolean(model.hasPolicy);
+    const label = ready ? model.name : `${model.name} · 无 policy.npz`;
+    return `<option value="${escapeHtml(model.id)}"${ready ? "" : " disabled"}>${escapeHtml(label)}</option>`;
+  }).join("");
+  select.innerHTML = '<option value="">（空：沿用上方训练模型）</option>' + options;
+  select.value = models.some((model) => model.id === current && model.hasPolicy) ? current : "";
+}
+
+/* 下拉与路径二选一：都填会让「用哪个」变得含糊，后端只吃一个 initPolicy。 */
+function syncInitPolicyInputs(source) {
+  const select = $("#tr-init-policy-model");
+  const path = $("#tr-init-policy-path");
+  if (!select || !path) return;
+  if (source === "path" && path.value.trim()) {
+    select.value = "";
+    select.dataset.touched = "1";
+  } else if (source === "select" && select.value) {
+    path.value = "";
+    path.dataset.touched = "1";
+  }
+}
+
+/* v2 没有 BC 标签：本地先拦住，省一次 400 往返。 */
+function syncExperimentHints() {
+  const space = $("#tr-action-space");
+  const bc = $("#tr-bc-episodes");
+  const warn = $("#tr-exp-warn-v2bc");
+  if (!space || !bc || !warn) return;
+  const conflict = space.value === "v2" && Number(bc.value || 0) > 0;
+  warn.classList.toggle("hidden", !conflict);
+  bc.setAttribute("aria-invalid", conflict ? "true" : "false");
+}
+
+/* 表单 → 请求体：空数字回落到默认值，NaN 交给后端当缺省处理。 */
+function collectExperimentPayload() {
+  const text = (selector) => {
+    const el = $(selector);
+    return el ? String(el.value ?? "").trim() : "";
+  };
+  const numberOr = (selector, fallback) => {
+    const raw = text(selector);
+    return raw === "" ? fallback : Number(raw);
+  };
+  const path = text("#tr-init-policy-path");
+  const modelId = $("#tr-init-policy-model") ? $("#tr-init-policy-model").value : "";
+  const payload = {
+    algo: $("#tr-algo") ? $("#tr-algo").value : "ppo",
+    actionSpace: $("#tr-action-space") ? $("#tr-action-space").value : "v1",
+    bcEpisodes: numberOr("#tr-bc-episodes", 0),
+    evalBeforeTrain: Boolean($("#tr-eval-before-train") && $("#tr-eval-before-train").checked),
+    victory: numberOr("#tr-victory", 50),
+    lr: numberOr("#tr-lr", 0.0003),
+    targetEntropy: numberOr("#tr-target-entropy", 0.3),
+    entropyCoef: numberOr("#tr-entropy-coef", 0.01),
+    resetPolicyHead: Boolean($("#tr-reset-policy-head") && $("#tr-reset-policy-head").checked),
+  };
+  // 路径优先于下拉（UI 上互斥，这里再兜一层）
+  const initPolicy = path || modelId;
+  if (initPolicy) payload.initPolicy = initPolicy;
+  return payload;
+}
+
+/* 发起后回显生效值：以 params.experiment 为准（后端已做归一化与校验）。 */
+function applyExperimentEcho(params) {
+  const exp = params && params.experiment;
+  if (!exp) return;
+  const force = (selector, value) => {
+    const el = $(selector);
+    if (!el) return;
+    el.value = value;
+    el.dataset.touched = "1";
+  };
+  const forceCheck = (selector, value) => {
+    const el = $(selector);
+    if (!el) return;
+    el.checked = Boolean(value);
+    el.dataset.touched = "1";
+  };
+  force("#tr-algo", exp.algo || "ppo");
+  force("#tr-action-space", exp.actionSpace || "v1");
+  force("#tr-bc-episodes", exp.bcEpisodes ?? 0);
+  force("#tr-victory", exp.victory ?? 50);
+  force("#tr-lr", exp.lr ?? 0.0003);
+  force("#tr-target-entropy", exp.targetEntropy ?? 0.3);
+  force("#tr-entropy-coef", exp.entropyCoef ?? 0.01);
+  forceCheck("#tr-eval-before-train", exp.evalBeforeTrain);
+  forceCheck("#tr-reset-policy-head", exp.resetPolicyHead);
+  // 用户 / 端口 / 种子属于主表单的既有字段：回显后端归一化后的生效值。
+  if (Array.isArray(exp.users)) force("#tr-users", exp.users.join(", "));
+  if (Array.isArray(exp.ports)) force("#tr-ports", exp.ports.join(", "));
+  if (exp.seed !== undefined && exp.seed !== null) force("#tr-seed", exp.seed);
+  // 初始模型：原值回填输入框；生效路径单独写一行说明（可能来自「训练模型」）。
+  force("#tr-init-policy-path", exp.initPolicyField || "");
+  const select = $("#tr-init-policy-model");
+  if (select) {
+    const byId = (state.models || []).some((model) => model.id === exp.initPolicyField);
+    select.value = byId ? exp.initPolicyField : "";
+  }
+  syncExperimentHints();
+  const note = $("#tr-exp-effective");
+  if (note) {
+    const parts = [
+      `算法 ${exp.algo}`, `动作空间 ${exp.actionSpace}`, `BC ${exp.bcEpisodes} 局`,
+      `seed ${exp.seed}`, `lr ${exp.lr}`, `目标熵 ${exp.targetEntropy}`, `熵系数 ${exp.entropyCoef}`,
+      `胜利权重 ${exp.victory}`,
+      `训练前评估 ${exp.evalBeforeTrain ? "开" : "关"}`,
+      `重置策略头 ${exp.resetPolicyHead ? "开" : "关"}`,
+      `起点 ${exp.initPolicy ? exp.initPolicy : "随机初始化"}`,
+    ];
+    note.textContent = `本次生效：${parts.join(" · ")}`;
+  }
+}
+
 function fillTrainingForm(options) {
   const d = options.defaults || {};
   const game = options.game || {};
@@ -601,6 +724,19 @@ function fillTrainingForm(options) {
   const cleanup = $("#tr-auto-cleanup");
   if (cleanup && !cleanup.dataset.touched) cleanup.checked = d.autoCleanup !== false;
 
+  // 实验参数（高级）：默认值全部来自后端 defaults，前端不另写一套。
+  set("#tr-algo", d.algo ?? "ppo");
+  set("#tr-action-space", d.actionSpace ?? "v1");
+  set("#tr-bc-episodes", d.bcEpisodes ?? 0);
+  set("#tr-victory", d.victory ?? 50);
+  set("#tr-lr", d.lr ?? 0.0003);
+  set("#tr-target-entropy", d.targetEntropy ?? 0.3);
+  set("#tr-entropy-coef", d.entropyCoef ?? 0.01);
+  const evalBefore = $("#tr-eval-before-train");
+  if (evalBefore && !evalBefore.dataset.touched) evalBefore.checked = Boolean(d.evalBeforeTrain);
+  const resetHead = $("#tr-reset-policy-head");
+  if (resetHead && !resetHead.dataset.touched) resetHead.checked = Boolean(d.resetPolicyHead);
+
   state.models = Array.isArray(options.models) ? options.models : [];
   state.modelSupport = Boolean(options.modelSupport);
   if (options.rewardPresetSchema) state.rewardSchema = options.rewardPresetSchema;
@@ -609,6 +745,8 @@ function fillTrainingForm(options) {
   renderScripts();
   renderRewardPresetOptions();
   renderModelOptions();
+  renderInitPolicyOptions();
+  syncExperimentHints();
   const modelSelect = $("#tr-model");
   if (modelSelect && !modelSelect.dataset.touched) {
     const wanted = d.modelId || "default";
@@ -3363,6 +3501,29 @@ function bindTraining() {
   $("#tr-auto-spawn").addEventListener("change", (event) => { event.target.dataset.touched = "1"; });
   $("#tr-auto-cleanup").addEventListener("change", (event) => { event.target.dataset.touched = "1"; });
 
+  // 实验参数（高级）：输入即视为用户已接管，轮询不再覆盖。
+  ["#tr-bc-episodes", "#tr-victory", "#tr-lr", "#tr-target-entropy",
+    "#tr-entropy-coef", "#tr-init-policy-path"].forEach((selector) => {
+    const el = $(selector);
+    if (el) el.addEventListener("input", () => { el.dataset.touched = "1"; });
+  });
+  ["#tr-algo", "#tr-action-space", "#tr-init-policy-model"].forEach((selector) => {
+    const el = $(selector);
+    if (el) el.addEventListener("change", () => { el.dataset.touched = "1"; });
+  });
+  ["#tr-eval-before-train", "#tr-reset-policy-head"].forEach((selector) => {
+    const el = $(selector);
+    if (el) el.addEventListener("change", () => { el.dataset.touched = "1"; });
+  });
+  const initSelect = $("#tr-init-policy-model");
+  if (initSelect) initSelect.addEventListener("change", () => syncInitPolicyInputs("select"));
+  const initPath = $("#tr-init-policy-path");
+  if (initPath) initPath.addEventListener("input", () => syncInitPolicyInputs("path"));
+  const spaceSelect = $("#tr-action-space");
+  if (spaceSelect) spaceSelect.addEventListener("change", syncExperimentHints);
+  const bcInput = $("#tr-bc-episodes");
+  if (bcInput) bcInput.addEventListener("input", syncExperimentHints);
+
   // 计划列表：行内轮次编辑（不重渲染，避免打断输入）
   const planList = $("#tr-plan-list");
   planList.addEventListener("input", (event) => {
@@ -3534,6 +3695,8 @@ function bindTraining() {
       // 多场地没有评估阶段：不发送 evalRounds（后端也会拒绝 >0）。
       // B1：字段名统一为 evalRounds（每阶段评估回合数），后端派生 evalEpisodes = evalRounds × 阶段数。
       if (kind !== "multi") payload.evalRounds = Number($("#tr-eval").value);
+      // 实验参数只对单场地 train 有意义（multi_train 的 CLI 没有这些开关）。
+      if (kind !== "multi") Object.assign(payload, collectExperimentPayload());
       const rewardId = currentRewardPresetId();
       if (rewardId) payload.rewardPreset = rewardId;
       const modelId = $("#tr-model") ? $("#tr-model").value : "";
@@ -3543,6 +3706,7 @@ function bindTraining() {
       const data = await api("/api/training/start", { method: "POST", body: payload });
       toast("训练已启动", "ok");
       state.training = data;
+      applyExperimentEcho(data.job && data.job.params);
       renderTraining();
       renderTop();
     });

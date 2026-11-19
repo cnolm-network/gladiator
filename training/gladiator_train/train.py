@@ -105,6 +105,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="BC 监督训练轮数；0 = 完全跳过（旧行为）")
     p.add_argument("--bc-max-steps", type=int, default=120,
                    help="BC 每局最多步数")
+    # --- 老师 v2 + BC 软目标（P2.3 后续：别再让 BC 把策略压死） ---
+    p.add_argument("--bc-teacher", default="v1", choices=["v1", "v2"],
+                   help="BC/DAgger 的老师版本：v1 = 静态四规则（默认）；"
+                        "v2 = v1 + 间距/鱼竿/金苹果/暴击跳/w-tap/低血格挡")
+    p.add_argument("--bc-temperature", type=float, default=1.0,
+                   help="BC 软目标温度 T：q = softmax(log p_teacher / T)。"
+                        "T>1 更平（熵更大、PPO 推得动），T<1 更尖；1.0 = 旧行为")
+    p.add_argument("--bc-label-smoothing", type=float, default=0.0,
+                   help="BC 标签平滑 eps：q 与均匀分布按 eps 混合（0 = 关闭）")
     # --- P2.3 块 C：DAgger 式迭代模仿 ---
     p.add_argument("--dagger-rounds", type=int, default=0,
                    help="DAgger 轮数（0 = 关闭）；每轮用当前策略跑局、老师打标签、再做 BC + 评估")
@@ -415,14 +424,21 @@ def main(argv: List[str] | None = None) -> int:
         print("[p23] 策略头已重设（W2/b2 Xavier，W1/b1 与价值头保留）")
     # --- P1.5：行为克隆热启动（必须在 init-policy 载入之后、正式训练之前） ---
     bc_info = {"episodes": 0, "epochs": 0, "samples": 0, "accuracy": None,
-               "agreementBefore": None, "agreementAfter": None, "loss": None}
+               "agreementBefore": None, "agreementAfter": None, "loss": None,
+               "teacher": args.bc_teacher, "temperature": float(args.bc_temperature),
+               "labelSmoothing": float(args.bc_label_smoothing),
+               "teacherEntropy": None}
     if args.bc_epochs > 0 and args.bc_episodes > 0:
         from .demos import behavior_clone, collect_demos, teacher_agreement
 
-        print(f"[bc] 采集老师对局：{args.bc_episodes} 局 × 最多 {args.bc_max_steps} 步")
-        samples = collect_demos(env, episodes=args.bc_episodes, max_steps=args.bc_max_steps)
+        print(f"[bc] 采集老师对局：{args.bc_episodes} 局 × 最多 {args.bc_max_steps} 步"
+              f"（teacher={args.bc_teacher}）")
+        samples = collect_demos(env, episodes=args.bc_episodes, max_steps=args.bc_max_steps,
+                                teacher_version=args.bc_teacher)
         before = teacher_agreement(policy, samples)
-        bc_result = behavior_clone(policy, samples, epochs=args.bc_epochs)
+        bc_result = behavior_clone(policy, samples, epochs=args.bc_epochs,
+                                   temperature=args.bc_temperature,
+                                   label_smoothing=args.bc_label_smoothing)
         # BC 后再量一次一致率：与 accuracy 同口径（argmax 命中老师动作），
         # 单独存一份是为了让「BC 前 / BC 后」在 report 里成对可比（P2.2）。
         after = teacher_agreement(policy, samples)
@@ -434,10 +450,16 @@ def main(argv: List[str] | None = None) -> int:
             "agreementBefore": before,
             "agreementAfter": after,
             "loss": bc_result["loss"][-1] if bc_result["loss"] else None,
+            "teacher": args.bc_teacher,
+            "temperature": float(bc_result["temperature"]),
+            "labelSmoothing": float(bc_result["labelSmoothing"]),
+            "teacherEntropy": bc_result["teacherEntropy"],
         }
         print(
             f"[bc] teacher 一致率 {before:.3f} → {after:.3f}（BC 后）"
             f" / loss {bc_info['loss']} / 样本 {len(samples)} / {bc_result['epochs']} 轮"
+            f" / T={bc_info['temperature']:g} eps={bc_info['labelSmoothing']:g}"
+            f" / 老师熵 {bc_info['teacherEntropy']}"
         )
     elif args.bc_epochs <= 0:
         print("[bc] 跳过（--bc-epochs 0）")
@@ -558,9 +580,12 @@ def main(argv: List[str] | None = None) -> int:
                 episodes=args.dagger_episodes,
                 max_steps=dagger_steps,
                 rng=np.random.default_rng(args.seed + round_no),
+                teacher_version=args.bc_teacher,
             )
             before = teacher_agreement(policy, samples)
-            bc_result = behavior_clone(policy, samples, epochs=args.dagger_epochs)
+            bc_result = behavior_clone(policy, samples, epochs=args.dagger_epochs,
+                                       temperature=args.bc_temperature,
+                                       label_smoothing=args.bc_label_smoothing)
             after = teacher_agreement(policy, samples)
             entry = {
                 "round": round_no,
@@ -701,6 +726,11 @@ def main(argv: List[str] | None = None) -> int:
                 "agreementAfter": bc_info.get("agreementAfter"),
                 "loss": bc_info.get("loss"),
                 "maxSteps": int(args.bc_max_steps),
+                # 老师版本与软目标参数（T>1 / eps>0 时 BC 不再把 softmax 压死）
+                "teacher": bc_info.get("teacher", args.bc_teacher),
+                "temperature": bc_info.get("temperature", float(args.bc_temperature)),
+                "labelSmoothing": bc_info.get("labelSmoothing", float(args.bc_label_smoothing)),
+                "teacherEntropy": bc_info.get("teacherEntropy"),
             },
             "gamma": args.gamma,
             "lr": args.lr,
@@ -736,6 +766,11 @@ def main(argv: List[str] | None = None) -> int:
             "agreementAfter": bc_info.get("agreementAfter"),
             "accuracy": bc_info["accuracy"],
             "skipped": bc_info["episodes"] == 0 or bc_info["epochs"] == 0,
+            # 块 B：老师版本与软目标参数（便于「同一批数据、不同 T」的对照）
+            "teacher": bc_info.get("teacher", args.bc_teacher),
+            "temperature": bc_info.get("temperature", float(args.bc_temperature)),
+            "labelSmoothing": bc_info.get("labelSmoothing", float(args.bc_label_smoothing)),
+            "teacherEntropy": bc_info.get("teacherEntropy"),
         },
         # P2.2 块 B：训练前评估（--eval-before-train 时非 null）。
         "evaluationBefore": eval_before,
