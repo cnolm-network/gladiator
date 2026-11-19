@@ -95,6 +95,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="评估时用贪心 argmax（反选 --eval-sampling）")
     p.add_argument("--eval-seed", type=int, default=7,
                    help="评估固定种子（写入 report.config.evalSeed，跨轮可比）")
+    # --- 动作空间（v1 单头 / v2 九头 factorized） ---
+    p.add_argument("--action-space", default="v1", choices=["v1", "v2"],
+                   help="v1 = 11 个宏动作的单头 softmax（默认）；v2 = 9 头 MultiDiscrete")
     # --- P1.5：行为克隆热启动 ---
     p.add_argument("--bc-episodes", type=int, default=4,
                    help="BC 老师的对局数（0 表示不采集）")
@@ -276,6 +279,12 @@ def sliding_windows(records: list[dict], username: str, size: int = 10) -> list[
 
 def main(argv: List[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # 参数组合校验放在建目录之前：拒绝时不该留下空 run 目录。
+    if args.action_space == "v2" and args.bc_episodes > 0:
+        print("[train] --action-space v2 下 --bc-episodes 必须为 0："
+              "BC 老师是 v1 宏动作脚本，没有 v2 的 9 头标签。"
+              "请加 --bc-episodes 0（或先用 v1 训好再用 v2 续训）。", file=sys.stderr)
+        return 2
     run_dir = args.run_dir or new_run_dir("train", "-".join(args.users[:2]))
     paths = run_paths(run_dir, "train")
     args.save = args.save or paths["policy"]
@@ -309,7 +318,8 @@ def main(argv: List[str] | None = None) -> int:
     # 初始策略在创建任何环境之前校验：无效直接 exit 2，不产生目录/进程。
     init_path = args.init_policy or args.init_model
     loaded, init_error = validate_init_policy(
-        init_path, obs_dim=OBS_DIM, n_actions=NUM_ACTIONS, hidden=args.hidden)
+        init_path, obs_dim=OBS_DIM, n_actions=NUM_ACTIONS, hidden=args.hidden,
+        action_space=args.action_space)
     if init_error:
         print(f"[train] {init_error}", file=sys.stderr)
         return 2
@@ -362,6 +372,7 @@ def main(argv: List[str] | None = None) -> int:
         auto_spawn=args.auto_spawn and not args.no_spawn,
         opponent_mode=stages[0][0] if stages else args.opponent_mode,
         reward_preset=load_preset(args.reward_preset) if args.reward_preset else None,
+        action_space=args.action_space,
     )
 
     # P3：--victory 覆盖（优先级高于 reward-preset 里的 base.victory）。
@@ -370,7 +381,13 @@ def main(argv: List[str] | None = None) -> int:
         print(f"[train] 胜负常数 victory={args.victory}（覆盖预设默认）")
 
     obs_dim = int(env.observation_space.shape[0])
-    n_actions = int(env.action_space.n)
+    if args.action_space == "v2":
+        # MultiDiscrete 没有 .n：动作维度 = 各头大小之和（37），策略按头重建。
+        n_actions = int(sum(int(v) for v in env.action_space.nvec))
+        print(f"[train] 动作空间 v2：{len(env.action_space.nvec)} 个头，"
+              f"nvec={list(int(v) for v in env.action_space.nvec)}")
+    else:
+        n_actions = int(env.action_space.n)
     policy = Policy(
         obs_dim=obs_dim,
         n_actions=n_actions,
@@ -380,6 +397,7 @@ def main(argv: List[str] | None = None) -> int:
         beta=args.beta,
         temperature=(args.logit_temp if args.logit_temp else 1.0),
         weight_decay=args.weight_decay,
+        action_space=args.action_space,
     )
     if loaded is not None:
         # 只接管权重（不接管 optimizer/updates 状态），lr/beta 仍用本次参数。
@@ -445,6 +463,7 @@ def main(argv: List[str] | None = None) -> int:
         minibatch=args.minibatch,
         max_grad_norm=args.max_grad_norm,
         value_clip=args.value_clip,
+        action_space=args.action_space,
     )
 
     started = time.time()
@@ -456,7 +475,8 @@ def main(argv: List[str] | None = None) -> int:
     per_epoch = sum(count for _mode, count in plan)
     print(
         f"[train] bots={args.users} ports={args.ports} plan={plan} "
-        f"max_steps={args.max_steps} obs={env.observation_space.shape} actions={env.action_space.n}"
+        f"max_steps={args.max_steps} obs={env.observation_space.shape} "
+        f"actions={n_actions} space={args.action_space}"
     )
     if args.algo == "ppo":
         print(
@@ -631,6 +651,8 @@ def main(argv: List[str] | None = None) -> int:
             "persistTo": args.persist_to or None,
             "maxSteps": args.max_steps,
             "algo": args.algo,
+            # v1 = 单头 11 宏动作；v2 = 9 头 MultiDiscrete（factorized）
+            "actionSpace": args.action_space,
             "ppoEpochs": max(1, int(args.ppo_epochs)),
             "clip": args.clip,
             "gaeLambda": args.gae_lambda,

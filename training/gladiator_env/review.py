@@ -148,6 +148,7 @@ class EpisodeTracker:
         reward: float,
         events: list[dict[str, Any]] | None = None,
         attacked: bool | None = None,
+        action_label: str | None = None,
     ) -> None:
         """累计一步统计。
 
@@ -155,12 +156,19 @@ class EpisodeTracker:
         「策略选的动作编号是不是 attack」推断（旧调用方兼容）。
         这样 ``hits`` 能拆成「真挥刀命中」与「非攻击来源掉血」，
         避免出现「attack=0 却有 6 点伤害」这种对不上的读数。
+
+        ``action_label`` 给 v2（多离散头）用：动作不是单个下标，调用方传一个粗粒度
+        标签（如 ``v2:attack``），``action_counts`` 才有可读的键。
         """
         r = self.review
         r.steps += 1
         r.total_reward += float(reward)
         # 下标与动作名同源：都来自 spaces.ACTION_NAMES（策略输出的就是它的下标）。
-        name = ACTION_NAMES[action_index] if 0 <= action_index < len(ACTION_NAMES) else str(action_index)
+        if action_label is not None:
+            name = str(action_label)
+        else:
+            name = (ACTION_NAMES[action_index] if 0 <= action_index < len(ACTION_NAMES)
+                    else str(action_index))
         r.action_counts[name] = r.action_counts.get(name, 0) + 1
         if name == "attack":
             r.attack_actions += 1

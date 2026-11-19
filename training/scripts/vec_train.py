@@ -74,6 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--rcon-port", type=int, default=25575)
     p.add_argument("--rcon-password", default="devpass")
+    p.add_argument("--action-space", default="v1", choices=["v1", "v2"],
+                   help="v1 = 单头 11 宏动作（默认）；v2 = 9 头 MultiDiscrete")
     p.add_argument("--opponent-mode", default="scripted",
                    choices=["random", "wander", "idle", "scripted", "rusher", "aimbot"])
     p.add_argument("--reward-preset", default="", help="reward 预设 JSON 路径（可选）")
@@ -155,6 +157,7 @@ def _config_dict(args: argparse.Namespace, center: tuple, jitter: tuple) -> dict
         "maxGradNorm": float(args.max_grad_norm),
         "normalizeReturns": bool(args.normalize_returns),
         "lrDecay": bool(args.lr_decay),
+        "actionSpace": args.action_space,
         "opponentMode": args.opponent_mode,
         "rewardPreset": args.reward_preset or None,
         "victory": (float(args.victory) if args.victory is not None else None),
@@ -203,7 +206,8 @@ def main(argv: list | None = None) -> int:
 
     # 初始策略先校验：无效直接退出，不建环境、不 spawn。
     loaded, init_error = validate_init_policy(
-        args.init_policy, obs_dim=OBS_DIM, n_actions=NUM_ACTIONS, hidden=args.hidden)
+        args.init_policy, obs_dim=OBS_DIM, n_actions=NUM_ACTIONS, hidden=args.hidden,
+        action_space=args.action_space)
     if init_error:
         print(f"[vec] {init_error}", file=sys.stderr)
         return 2
@@ -215,11 +219,13 @@ def main(argv: list | None = None) -> int:
         seed=args.seed,
         lr=args.lr,
         beta=args.beta,
+        action_space=args.action_space,
     )
     if loaded is not None:
         adopt_weights(policy, loaded)
         print(f"[vec] 已加载初始策略 {args.init_policy}"
-              f"（obs={OBS_DIM} actions={NUM_ACTIONS} hidden={args.hidden}）")
+              f"（obs={OBS_DIM} actions={policy.n_actions} hidden={args.hidden}"
+              f" space={args.action_space}）")
 
     preset = load_preset(args.reward_preset) if args.reward_preset else None
     specs = plan_arenas(
@@ -245,6 +251,7 @@ def main(argv: list | None = None) -> int:
             action_ticks=args.action_ticks,
             auto_spawn=not args.no_spawn,
             opponent_mode=args.opponent_mode,
+            action_space=args.action_space,
             reward_preset=preset,
             spacing=args.spacing,
             prep_seconds=args.prep_seconds,

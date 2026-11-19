@@ -108,7 +108,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def make_env_factory(args: argparse.Namespace, config: SuiteConfig):
+def make_env_factory(args: argparse.Namespace, config: SuiteConfig,
+                     action_space: str = "v1"):
+    """按策略的 ``_meta.actionSpace`` 建环境（v2 需要 MultiDiscrete 动作空间）。"""
     bots = [
         BotConfig(args.users[0], f"ws://{args.host}:{args.ports[0]}"),
         BotConfig(args.users[1], f"ws://{args.host}:{args.ports[1]}"),
@@ -124,6 +126,7 @@ def make_env_factory(args: argparse.Namespace, config: SuiteConfig):
             auto_spawn=not args.no_spawn,
             rcon=rcon or None,
             opponent_mode=mode,
+            action_space=action_space,
         )
 
     return factory
@@ -198,7 +201,13 @@ def main(argv: list | None = None) -> int:
 
     policy_a = _load_policy(args.policy)
     policy_b = _load_policy(args.policy_b) if args.policy_b else None
-    factory = make_env_factory(args, config)
+    if policy_b is not None and policy_b.action_space != policy_a.action_space:
+        raise SystemExit(
+            f"两个策略的动作空间不同（{policy_a.action_space} vs {policy_b.action_space}），"
+            "无法配对比较：请换成同一动作空间的模型")
+    print(f"[eval] 动作空间 {policy_a.action_space}"
+          + (f"（{len(policy_a.head_sizes())} 个头）" if policy_a.is_v2 else ""))
+    factory = make_env_factory(args, config, action_space=policy_a.action_space)
     started = time.strftime("%Y%m%d-%H%M")
     out_dir = Path(args.out)
     if not out_dir.is_absolute():

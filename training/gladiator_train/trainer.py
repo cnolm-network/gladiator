@@ -18,7 +18,7 @@ import numpy as np
 
 from gladiator_env.review import EpisodeTracker, write_review
 
-from .policy import Policy, discounted_returns, normalize_advantages
+from .policy import Policy, act_with_mask, discounted_returns, normalize_advantages
 
 
 #: 目标熵控制器的系系数下限（P2.2）。
@@ -122,8 +122,11 @@ class EpisodeResult:
     mean_health: float = 0.0
     review: Optional[Dict[str, Any]] = None
     observations: List[np.ndarray] = field(default_factory=list)
-    actions: List[int] = field(default_factory=list)
+    #: v1 是 int，v2 是长度 H 的 int 数组（factorized 的 9 个头）。
+    actions: List[Any] = field(default_factory=list)
     rewards: List[float] = field(default_factory=list)
+    #: 每帧的 v2 action mask（``list[list[bool]]``，按头顺序）；v1 恒为空。
+    masks: List[Any] = field(default_factory=list)
     #: 本局对手策略（取自 env.opponent_mode）；用于「固定对手池胜率」分桶。
     opponent_mode: str = ""
     #: 学习方是否赢下本局（winner == 学习方用户名）；未分胜负（超时截断）为 False。
@@ -175,9 +178,19 @@ class Trainer:
         saturation_logit_std: float = 4.0,
         saturation_max_prob: float = 0.95,
         saturation_boost: float = 1.5,
+        action_space: str | None = None,
     ) -> None:
         self.env = env
         self.policy = policy
+        #: 动作空间口径：缺省取策略自己的（v1 单头 / v2 九头），显式给了就必须一致。
+        self.action_space = str(
+            action_space or getattr(policy, "action_space", "v1")).strip().lower()
+        if self.action_space not in ("v1", "v2"):
+            raise ValueError(f"未知动作空间: {action_space}（允许 v1 / v2）")
+        if self.action_space != str(getattr(policy, "action_space", "v1")):
+            raise ValueError(
+                f"Trainer 的 action_space={self.action_space} 与策略的 "
+                f"{getattr(policy, 'action_space', 'v1')} 不一致")
         self.gamma = float(gamma)
         # 默认仍是 reinforce：老调用方（含既有单测）语义不变；train.py 默认走 ppo。
         if algo not in ("ppo", "reinforce"):
@@ -222,6 +235,27 @@ class Trainer:
         self.history: List[Dict[str, Any]] = []
         self._episode_no = 0
 
+    def _mask_from_info(self, info: Any):
+        """从 ``info["actionMask"]`` 取当前帧的 v2 掩码（v1 / 无掩码返回 None）。"""
+        if self.action_space != "v2" or not isinstance(info, dict):
+            return None
+        raw = info.get("actionMask")
+        if raw is None:
+            return None
+        normalizer = getattr(self.policy, "normalize_mask", None)
+        return normalizer(raw) if normalizer else raw
+
+    @staticmethod
+    def _v2_action_label(action) -> str:
+        """v2 动作 → 复盘用的粗粒度标签（``v2:attack`` / ``v2:forward``）。"""
+        from gladiator_env.spaces import decode_intent
+
+        try:
+            intent = decode_intent(action)
+        except Exception:  # noqa: BLE001 - 复盘标签不该影响训练
+            return "v2:?"
+        return "v2:" + ("attack" if intent.get("attack") else str(intent.get("move")))
+
     def _attacked_this_step(self, username: str) -> bool | None:
         """本 step 是否真的下发了 attack；env 不支持时返回 None（回落到动作编号）。"""
         getter = getattr(self.env, "last_dispatch", None)
@@ -237,21 +271,24 @@ class Trainer:
     def run_episode(self, greedy: bool = False) -> EpisodeResult:
         started = time.time()
         started_wall = time.time()
-        obs, _info = self.env.reset()
+        obs, reset_info = self.env.reset()
         result = EpisodeResult(0, 0.0, False, False, None, 0.0)
         healths: List[float] = []
         self._episode_no += 1
         username = self.env.bots[0].username
         opponent = self.env.bots[1].username if len(self.env.bots) > 1 else None
         tracker = EpisodeTracker(episode=self._episode_no, username=username, opponent=opponent)
+        # v2 的 mask 与观测一一对应：reset 的 info 给第一帧，之后每 step 的 info 给下一帧。
+        mask = self._mask_from_info(reset_info)
 
         while True:
             previous_raw = self.env.raw_observations
-            action = self.policy.act(obs, self.rng, greedy=greedy)
+            action = act_with_mask(self.policy, obs, self.rng, mask=mask, greedy=greedy)
             next_obs, reward, terminated, truncated, info = self.env.step(action)
             current_raw = self.env.raw_observations
             tracker.update(
-                action_index=int(action),
+                action_index=(int(action) if self.action_space == "v1" else -1),
+                action_label=(None if self.action_space == "v1" else self._v2_action_label(action)),
                 previous=previous_raw[0] if previous_raw else None,
                 current=current_raw[0] if current_raw else None,
                 opponent_previous=previous_raw[1] if len(previous_raw) > 1 else None,
@@ -264,7 +301,11 @@ class Trainer:
             )
 
             result.observations.append(np.asarray(obs, dtype=np.float64))
-            result.actions.append(int(action))
+            if self.action_space == "v2":
+                result.actions.append(np.asarray(action, dtype=np.int64).copy())
+                result.masks.append(mask)
+            else:
+                result.actions.append(int(action))
             result.rewards.append(float(reward))
             result.total_reward += float(reward)
             result.steps += 1
@@ -273,6 +314,7 @@ class Trainer:
                 healths.append(float(list(health.values())[0]))
 
             obs = next_obs
+            mask = self._mask_from_info(info)
             if terminated or truncated:
                 result.terminated = bool(terminated)
                 result.truncated = bool(truncated)
@@ -325,7 +367,8 @@ class Trainer:
         - ``seed`` 只影响 minibatch 洗牌（``None`` = 旧行为：按 history 长度取种子）。
         """
         observations: List[np.ndarray] = []
-        actions: List[int] = []
+        actions: List[Any] = []
+        masks: List[Any] = []
         old_logp_parts: List[np.ndarray] = []
         values_parts: List[np.ndarray] = []
         advantage_parts: List[np.ndarray] = []
@@ -333,7 +376,13 @@ class Trainer:
         for result in results or []:
             if not result.observations:
                 continue
-            old_logp, _, values = self.policy.evaluate_actions(result.observations, result.actions)
+            # v1 调用保持原签名（第三方/测试替身的 evaluate_actions 可能只接受两个参数）。
+            if self.action_space == "v2":
+                old_logp, _, values = self.policy.evaluate_actions(
+                    result.observations, result.actions, masks=result.masks or None)
+            else:
+                old_logp, _, values = self.policy.evaluate_actions(
+                    result.observations, result.actions)
             rewards = list(result.rewards)
             dones = [0.0] * len(rewards)
             if dones:
@@ -343,6 +392,8 @@ class Trainer:
                                       gamma=self.gamma, lam=self.gae_lambda)
             observations.extend(result.observations)
             actions.extend(result.actions)
+            if self.action_space == "v2":
+                masks.extend(result.masks)
             old_logp_parts.append(np.asarray(old_logp, dtype=np.float64))
             values_parts.append(np.asarray(values, dtype=np.float64))
             advantage_parts.append(advantages)
@@ -364,6 +415,9 @@ class Trainer:
         norm_adv = normalize_advantages(advantages)
 
         total = len(observations)
+        # 行为策略的平均 log 概率：v2（9 头）下它的绝对值约等于「各头熵之和」，
+        # 拿来判断 log_prob 是否有限、有没有被 mask 打成 -1e9。
+        mean_logp = float(np.mean(old_logp))
         # P2.2：价值头质量（用行为策略的 V 与 GAE 回报算，不受本次更新影响）。
         ev = explained_variance(values, returns)
         # minibatch<=0 → 整批一次更新（P2 行为）；否则按批打乱后逐批更新。
@@ -376,6 +430,9 @@ class Trainer:
             order = rng.permutation(total) if batch_size < total else np.arange(total)
             for start in range(0, total, max(1, batch_size)):
                 index = np.asarray(order[start:start + batch_size], dtype=int)
+                extra = {}
+                if self.action_space == "v2" and len(masks) == total:
+                    extra["masks"] = [masks[i] for i in index]
                 grads = self.policy.ppo_gradients(
                     [observations[i] for i in index],
                     [actions[i] for i in index],
@@ -387,11 +444,17 @@ class Trainer:
                     entropy_coef=self._entropy_coef,
                     old_values=np.asarray(values, dtype=np.float64)[index],
                     value_clip=self.value_clip,
+                    **extra,
                 )
                 norm = self.policy.apply_gradients(grads, max_grad_norm=self.max_grad_norm)
                 self._decay_lr()
 
-                new_logp, entropy, new_values = self.policy.evaluate_actions(observations, actions)
+                if self.action_space == "v2" and len(masks) == total:
+                    new_logp, entropy, new_values = self.policy.evaluate_actions(
+                        observations, actions, masks=masks)
+                else:
+                    new_logp, entropy, new_values = self.policy.evaluate_actions(
+                        observations, actions)
                 ratio = np.exp(new_logp - old_logp)
                 clipped = np.clip(ratio, 1.0 - self.clip, 1.0 + self.clip)
                 max_prob = float(self.policy.mean_max_prob(observations))
@@ -401,6 +464,7 @@ class Trainer:
                     "policyLoss": float(-np.mean(np.minimum(ratio * norm_adv, clipped * norm_adv))),
                     "valueLoss": float(np.mean(0.5 * (new_values - returns_target) ** 2)),
                     "entropy": float(np.mean(entropy)),
+                    "meanLogProb": mean_logp,
                     "approxKL": float(np.mean(old_logp - new_logp)),
                     "clipFraction": float(np.mean(np.abs(ratio - 1.0) > self.clip)),
                     "gradNorm": float(norm),
@@ -538,10 +602,14 @@ class Trainer:
                 **({"algo": self.algo, **ppo_stats} if self.algo == "ppo" else {}),
             }
             self.history.append(record)
+            extra = ""
+            if self.algo == "ppo" and "entropy" in ppo_stats:
+                extra = (f" entropy={ppo_stats['entropy']:.3f}"
+                         f" logp={ppo_stats.get('meanLogProb', 0.0):.2f}")
             self.log(
                 f"[train] episode {i}/{episodes} steps={result.steps} "
                 f"reward={result.total_reward:.3f} winner={result.winner} "
-                f"terminated={result.terminated} {result.duration_s:.1f}s"
+                f"terminated={result.terminated} {result.duration_s:.1f}s{extra}"
             )
             if on_episode is not None:
                 on_episode(i, result)

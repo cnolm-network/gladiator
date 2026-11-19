@@ -44,6 +44,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     policy = Policy.load(args.policy)
+    print(f"[eval] 动作空间 {policy.action_space}"
+          + (f"（{len(policy.head_sizes())} 个头）" if policy.is_v2 else ""))
     bots = [
         BotConfig(username=args.users[0], env_url=f"ws://{args.host}:{args.ports[0]}"),
         BotConfig(username=args.users[1], env_url=f"ws://{args.host}:{args.ports[1]}"),
@@ -63,6 +65,8 @@ def main() -> int:
         rcon={"host": args.host, "port": args.rcon_port, "password": args.rcon_password},
         opponent_mode=args.opponent_mode,
         reward_preset=preset,
+        # 动作空间由模型自己决定：v2 的 .npz 会把环境切成 MultiDiscrete。
+        action_space=policy.action_space,
     )
     try:
         rng = env.np_random
@@ -73,11 +77,13 @@ def main() -> int:
                 # 坑（与 eval_suite 共用同一份实现）：Bot 未就绪时 reset 会超时，
                 # 重试要用新的 seed，否则同一局的地图抖动会重复。
                 try:
-                    obs, _info = reset_with_retry(env, args.seed, logger=print)
+                    obs, info = reset_with_retry(env, args.seed, logger=print)
                 except RuntimeError as exc:
                     raise SystemExit(str(exc)) from exc
+                raw_mask = (info or {}).get("actionMask")
+                mask = policy.normalize_mask(raw_mask) if raw_mask is not None else None
                 result = rollout(env, policy, obs, max_steps=args.max_steps,
-                                 rng=rng, greedy=greedy)
+                                 rng=rng, greedy=greedy, mask=mask)
                 rows.append((result["steps"], result["reward"], result["terminated"]))
             wins = sum(1 for _s, _r, term in rows if term)
             print(

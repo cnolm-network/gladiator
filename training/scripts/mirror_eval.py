@@ -74,6 +74,15 @@ def main(argv: list[str] | None = None) -> int:
     ]
     rcon = parse_rcon(args.rcon)
 
+    from gladiator_train.policy import Policy as _Policy
+
+    spaces = {_Policy.load(args.policy).action_space, _Policy.load(args.policy_b).action_space}
+    if "v2" in spaces:
+        # v2 的对手动作由 env 侧按意图解码，而 env 的 opponent_policy 路径目前只会取 v1 的
+        # 单头下标（int）。强行跑会静默把 9 头动作当宏动作编号，所以直接拒绝。
+        raise SystemExit(
+            "mirror_eval 目前只支持 v1 模型作镜像对比：v2 需要环境侧支持 v2 对手动作解码"
+            "（本块未实现）。请改用 eval_suite.py --policy A --policy-b B。")
     rows = []
     for episode in range(args.episodes):
         # 交替左右位：偶数局新模型当 A（学习者），奇数局旧模型当 A。

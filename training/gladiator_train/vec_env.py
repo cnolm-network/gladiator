@@ -95,7 +95,8 @@ def build_env(spec: ArenaSpec, *, host: str = "127.0.0.1", rcon_port: int = 2557
               arena_jitter: Sequence[float] = (2.0, 1.0),
               victory: Optional[float] = None,
               opponent_policy: Any = None,
-              opponent_epsilon: float = 0.0):
+              opponent_epsilon: float = 0.0,
+              action_space: str = "v1"):
     """按 :class:`ArenaSpec` 构造一个 ``GladiatorEnv``（延迟导入 gymnasium 依赖）。
 
     ``opponent_policy``（自博弈快照：``Policy`` 或 ``.npz`` 路径）非空时，对手不再走
@@ -122,6 +123,7 @@ def build_env(spec: ArenaSpec, *, host: str = "127.0.0.1", rcon_port: int = 2557
         opponent_policy=opponent_policy,
         opponent_epsilon=float(opponent_epsilon),
         reward_preset=reward_preset,
+        action_space=action_space,
     )
     if victory is not None:
         # 与 train.py 同口径：命令行覆盖优先级高于 reward preset。
@@ -358,11 +360,12 @@ class VecTrainer:
         started = time.time()
         started_wall = time.time()
         rng = np.random.default_rng(seed)
-        obs, _info = env.reset(seed=seed)
+        obs, info = env.reset(seed=seed)
         username = str(env.bots[0].username)
         limit = self.max_steps or int(getattr(env, "max_steps", 400) or 400)
         observations: List[np.ndarray] = []
-        actions: List[int] = []
+        actions: List[Any] = []
+        masks: List[Any] = []
         rewards: List[float] = []
         healths: List[float] = []
         total_reward = 0.0
@@ -371,11 +374,21 @@ class VecTrainer:
         winner = None
         steps = 0
 
+        from .policy import act_with_mask
+
+        action_space = str(getattr(self.policy, "action_space", "v1"))
+        normalizer = getattr(self.policy, "normalize_mask", None)
+        raw_mask = (info or {}).get("actionMask") if isinstance(info, dict) else None
+        mask = normalizer(raw_mask) if (normalizer and raw_mask is not None) else None
         while steps < limit:
-            action = int(self.policy.act(obs, rng, greedy=False))
+            action = act_with_mask(self.policy, obs, rng, mask=mask, greedy=False)
             next_obs, reward, terminated, truncated, info = env.step(action)
             observations.append(np.asarray(obs, dtype=np.float64))
-            actions.append(action)
+            if action_space == "v2":
+                actions.append(np.asarray(action, dtype=np.int64).copy())
+                masks.append(mask)
+            else:
+                actions.append(int(action))
             rewards.append(float(reward))
             total_reward += float(reward)
             steps += 1
@@ -391,6 +404,9 @@ class VecTrainer:
                 except (TypeError, ValueError):
                     pass
             obs = next_obs
+            if action_space == "v2":
+                raw_mask = (info or {}).get("actionMask") if isinstance(info, dict) else None
+                mask = normalizer(raw_mask) if (normalizer and raw_mask is not None) else None
             if terminated or truncated:
                 break
         if steps >= limit and not (terminated or truncated):
@@ -409,6 +425,7 @@ class VecTrainer:
             mean_health=float(np.mean(healths)) if healths else 0.0,
             observations=observations,
             actions=actions,
+            masks=masks,
             rewards=rewards,
             opponent_mode=str(getattr(env, "opponent_mode_label", None)
                               or getattr(env, "opponent_mode", "") or ""),

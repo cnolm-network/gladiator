@@ -23,6 +23,8 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 import numpy as np
 
+from .policy import act_with_mask
+
 #: 评估套件默认配置（8 局 × 3 对手 = 24 局，正好是「可以下结论」的最低样本量）。
 SUITE_DEFAULT = {
     "opponents": ("scripted", "rusher", "aimbot"),
@@ -316,7 +318,7 @@ def _events_damage(env, username: str) -> Optional[tuple]:
 
 
 def rollout(env, policy, obs, *, max_steps: int, rng=None, greedy: bool = True,
-            username: Optional[str] = None) -> dict:
+            username: Optional[str] = None, mask=None) -> dict:
     """跑完一局，返回 ``steps/reward/terminated/truncated/winner/damageDealt/damageTaken``。
 
     只用 ``reset``/``step`` 返回的 obs（不读 env 内部状态），与 ``eval_policy.py`` 同口径。
@@ -339,9 +341,13 @@ def rollout(env, policy, obs, *, max_steps: int, rng=None, greedy: bool = True,
     max_steps = max(1, int(max_steps))
 
     while steps < max_steps:
-        action = policy.act(obs, rng, greedy=greedy)
+        # v1 → act()（int）；v2 → sample()（(H,) 数组，带 action mask）。
+        action = act_with_mask(policy, obs, rng, mask=mask, greedy=greedy)
         obs, reward, terminated, truncated, info = env.step(action)
         steps += 1
+        normalizer = getattr(policy, "normalize_mask", None)
+        raw_mask = (info or {}).get("actionMask")
+        mask = normalizer(raw_mask) if (normalizer and raw_mask is not None) else None
         total_reward += float(reward)
         info = info or {}
         winner = info.get("winner", winner)
@@ -408,15 +414,21 @@ def run_suite(env_factory: Callable[[str], Any], policy, config: SuiteConfig,
     """
     rows: list = []
     modes = tuple(config.opponents)
+    want_space = str(getattr(policy, "action_space", "v1"))
     for mode in modes:
         env = env_factory(mode)
         try:
+            env_space = str(getattr(env, "action_space_name", "v1"))
+            if env_space != want_space:
+                raise ValueError(
+                    f"策略是 {want_space} 但环境是 {env_space}："
+                    "请用同一个 --action-space 建环境（v2 需要 MultiDiscrete）")
             if hasattr(env, "opponent_mode"):
                 env.opponent_mode = str(mode)
             name = username or _default_username(env)
             for index in range(int(config.episodes)):
                 seed = int(config.seed) + index
-                obs, _info = reset_with_retry(
+                obs, info = reset_with_retry(
                     env, seed,
                     attempts=config.reset_attempts,
                     delay=config.reset_delay,
@@ -424,8 +436,11 @@ def run_suite(env_factory: Callable[[str], Any], policy, config: SuiteConfig,
                     logger=logger,
                 )
                 rng = np.random.default_rng(seed)
+                normalizer = getattr(policy, "normalize_mask", None)
+                raw_mask = (info or {}).get("actionMask")
+                mask = normalizer(raw_mask) if (normalizer and raw_mask is not None) else None
                 result = rollout(env, policy, obs, max_steps=config.max_steps,
-                                 rng=rng, greedy=config.greedy, username=name)
+                                 rng=rng, greedy=config.greedy, username=name, mask=mask)
                 outcome = _outcome(result.get("winner"), name)
                 rows.append({
                     "opponent": str(mode),

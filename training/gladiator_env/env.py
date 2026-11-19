@@ -1405,6 +1405,10 @@ class GladiatorEnv(gym.Env):
             if report["ok"] and report["armor"] == 4 and report["holding_sword"]:
                 continue
             if report["ok"] and report["armor"] == 4:
+                if self._action_v2:
+                    # v2 的 slot 头自己决定手持物：这里再强制切剑会和策略抢控制权
+                    # （实测表现为「切鱼竿/金苹果 → 立刻被切回剑」每 tick 刷屏）。
+                    continue
                 # 只是没拿剑（例如刚吃完金苹果）：切剑即可，不必开补装窗口把战斗动作剥掉。
                 self._ensure_sword_in_hand(index, bot, report=report)
                 continue
