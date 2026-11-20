@@ -7,9 +7,14 @@
 
     cd training
     .venv\\Scripts\\python.exe scripts\\teacher_eval.py --policy ..\\dashboard\\var\\models\\dagger-1118b\\policy.npz \\
-        --teacher v2 --episodes 8 --users Bot_V0A Bot_V0B --ports 8770 8771 --no-spawn
+        --teacher v3 --episodes 8 --users Bot_V0A Bot_V0B --ports 8770 8771 --no-spawn
 
-输出：被评估策略对老师的胜率（Wilson 区间 + 精确二项），写 ``artifacts/evals/<时间>-vs-teacher.json``。
+``--teacher`` 可选 ``v1`` / ``v2`` / ``v3``（默认 ``v2``）：v1 是静态四条规则、v2 在 v1 之上
+加跳劈、v3 改成「冷却感知」（冷却没好不空砍，改用走位/跳劈/格挡）。同一份策略对三个老师
+各跑一遍，就能看出老师之间的强度差。
+
+输出：被评估策略对老师的胜率（Wilson 区间 + 精确二项），写 ``artifacts/evals/<时间>-vs-teacher.json``
+（JSON 里的 ``teacher`` 字段记录本局用的是哪个版本）。
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from gladiator_train.demos import (  # noqa: E402
     heuristic_action,
     make_teacher,
     reset_teacher_v2,
+    reset_teacher_v3,
 )
 from gladiator_train.eval_suite import (  # noqa: E402
     SUITE_DEFAULT,
@@ -44,20 +50,23 @@ from gladiator_train.policy import Policy  # noqa: E402
 class TeacherPolicy:
     """把脚本老师包成 ``Policy.act`` 的接口，供 env 的 ``opponent_policy`` 使用。
 
-    v2 老师自带跨帧状态：这里用 :class:`TeacherV2` 实例持有它，并在环境 ``reset()``
-    时通过 ``reset_episode()`` 归档上一局的规则命中统计——否则不同局的节拍会互相污染，
-    也拿不到「谁一直在生效」的证据。
+    v2/v3 老师自带跨帧状态：这里用 :class:`TeacherV2` / :class:`TeacherV3` 实例持有它，
+    并在环境 ``reset()`` 时通过 ``reset_episode()`` 归档上一局的规则命中统计——否则不同局的
+    节拍会互相污染，也拿不到「谁一直在生效」的证据。
+
+    v1 是无状态函数，直接调用即可（``teacher`` 为 ``None``，reason 统计为空）。
     """
 
     def __init__(self, version: str = TEACHER_VERSION) -> None:
         self.version = version
         self.meta = {"actionSpace": "v1"}
         self.decisions = 0
-        self.teacher = make_teacher(version) if version == "v2" else None
+        #: v1 是无状态函数（``make_teacher("v1")`` 返回函数本身），只有 v2/v3 需要实例。
+        self.teacher = None if version == "v1" else make_teacher(version)
 
     def act(self, vector, rng=None, greedy: bool = True) -> int:
         self.decisions += 1
-        if self.version == "v2" and self.teacher is not None:
+        if self.teacher is not None:
             return int(self.teacher(vector, self.meta))
         return int(heuristic_action(vector))
 
@@ -82,6 +91,16 @@ class TeacherPolicy:
                 totals[key] = totals.get(key, 0) + int(value)
         return {"totals": totals, "perEpisode": episodes}
 
+    def frame_seconds(self) -> float | None:
+        """v3 自校准出来的「一帧多少秒」（v1/v2 没有这个能力，返回 ``None``）。
+
+        这个值本身就是重要诊断：它等于 ``GladiatorEnv`` 实际的 ``action_ticks/control_hz``。
+        如果它明显大于 0.05，说明「按 20Hz 写死的常数」全都偏了一倍——v3 会自己纠正，
+        但报告里记下来，才能解释别的脚本为什么节拍不对。
+        """
+        state = getattr(self.teacher, "state", None)
+        return getattr(state, "frame_seconds_est", None)
+
     # 自博弈统计里只用到 act；其余接口留空避免 AttributeError。
     def value(self, x):  # noqa: D401 - 兼容性占位
         return 0.0
@@ -90,7 +109,9 @@ class TeacherPolicy:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="评估脚本老师作为对手时的强度")
     parser.add_argument("--policy", required=True, help="被评估策略的 .npz 路径")
-    parser.add_argument("--teacher", default=TEACHER_VERSION, choices=("v1", "v2"))
+    parser.add_argument(
+        "--teacher", default="v2", choices=("v1", "v2", "v3"),
+        help="当对手的脚本老师版本（v1 静态四条 / v2 加跳劈 / v3 冷却感知，默认 v2）")
     parser.add_argument("--episodes", type=int, default=SUITE_DEFAULT["episodes"])
     parser.add_argument("--seed", type=int, default=SUITE_DEFAULT["seed"])
     parser.add_argument("--max-steps", type=int, default=SUITE_DEFAULT["maxSteps"])
@@ -150,6 +171,7 @@ def main(argv: list | None = None) -> int:
         greedy=not args.sampled,
     )
     reset_teacher_v2()
+    reset_teacher_v3()
     rows = run_suite(factory, policy, config)
     teacher.flush()
     reasons = teacher.reason_stats()
@@ -164,6 +186,9 @@ def main(argv: list | None = None) -> int:
     if reasons["totals"]:
         ordered = sorted(reasons["totals"].items(), key=lambda kv: -kv[1])
         print("  老师规则命中（全部局合计）：" + ", ".join(f"{k}={v}" for k, v in ordered))
+    frame_seconds = teacher.frame_seconds()
+    if frame_seconds:
+        print(f"  实测步长 {frame_seconds * 1000:.0f}ms/步（v3 自校准）")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -180,6 +205,9 @@ def main(argv: list | None = None) -> int:
         # 每条规则的命中次数：用来判断「是不是一直在后撤 / 一直在格挡」。
         "reasons": reasons["totals"],
         "episodeReasons": reasons["perEpisode"],
+        # v3 自校准出来的真实步长（秒/帧）；v1/v2 为 null。
+        # 它等于 GladiatorEnv 的 action_ticks/control_hz，是解释节拍的关键证据。
+        "frameSeconds": frame_seconds,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"  已写入 {target}")
     return 0

@@ -93,8 +93,9 @@ class TeacherVersionTest(unittest.TestCase):
                          ACTION_EAT)
 
     def test_unknown_version_rejected(self):
+        # v3 已上线（见 test_teacher_v3.py），这里改用仍未实现的版本号。
         with self.assertRaises(ValueError):
-            make_teacher("v3")
+            make_teacher("v9")
 
 
 class NoLongRetreatTest(unittest.TestCase):

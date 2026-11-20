@@ -106,9 +106,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bc-max-steps", type=int, default=120,
                    help="BC 每局最多步数")
     # --- 老师 v2 + BC 软目标（P2.3 后续：别再让 BC 把策略压死） ---
-    p.add_argument("--bc-teacher", default="v1", choices=["v1", "v2"],
+    p.add_argument("--bc-teacher", default="v1", choices=["v1", "v2", "v3"],
                    help="BC/DAgger 的老师版本：v1 = 静态四规则（默认）；"
-                        "v2 = v1 + 间距/鱼竿/金苹果/暴击跳/w-tap/低血格挡")
+                        "v2 = v1 + 间距/鱼竿/金苹果/暴击跳/w-tap/低血格挡；"
+                        "v3 = 冷却/暴击窗口感知（0.2s 步长，最好的规则老师）")
     p.add_argument("--bc-temperature", type=float, default=1.0,
                    help="BC 软目标温度 T：q = softmax(log p_teacher / T)。"
                         "T>1 更平（熵更大、PPO 推得动），T<1 更尖；1.0 = 旧行为")
