@@ -97,143 +97,147 @@ class TeacherVersionTest(unittest.TestCase):
             make_teacher("v3")
 
 
-class SpacingTest(unittest.TestCase):
-    """规则 1：距离 < 2.2 且血量落后 → 后撤；退到 2.6 才解除。"""
+class NoLongRetreatTest(unittest.TestCase):
+    """规则 1（间距后撤）已删除的回归。
 
-    def test_retreats_when_out_traded(self):
-        teacher = TeacherV2(rod_ready=False)
-        action = teacher(obs(health=8.0, target_health=18.0, distance=2.0))
-        self.assertEqual(action, ACTION_RETREAT)
+    2026-11-20 实测：v2 老师靠「血量落后就后撤」把出手率压到 9.6%，对 dagger-1118b
+    0/6（同期 v1 老师 4/6）。这里用合成观测锁死「被追打时必须还手」。
+    """
 
-    def test_retreat_latches_until_release_distance(self):
+    def test_does_not_retreat_when_out_traded(self):
         teacher = TeacherV2(rod_ready=False)
-        self.assertEqual(teacher(obs(health=8.0, target_health=18.0, distance=2.0)),
-                         ACTION_RETREAT)
-        # 2.2~2.6 之间还在闩锁里：继续退，不要急着贴回去。
-        self.assertEqual(teacher(obs(health=8.0, target_health=18.0, distance=2.45)),
-                         ACTION_RETREAT)
-        # 退到 2.6 以上：闩锁解除，重新压上（此时应该挥刀，因为仍在 reach 内）。
-        self.assertNotEqual(teacher(obs(health=8.0, target_health=18.0, distance=2.8)),
+        self.assertNotEqual(teacher(obs(health=8.0, target_health=18.0, distance=2.0)),
                             ACTION_RETREAT)
 
-    def test_no_retreat_when_health_not_behind(self):
+    def test_keeps_attacking_while_behind_on_health(self):
+        """挨打 40 帧：至少 35 帧要挥刀，且不存在 spacing_retreat。"""
         teacher = TeacherV2(rod_ready=False)
-        action = teacher(obs(health=18.0, target_health=10.0, distance=2.0))
-        self.assertNotEqual(action, ACTION_RETREAT)
+        probe = obs(health=6.0, target_health=18.0, distance=1.8, in_reach=1.0)
+        actions = [teacher(probe) for _ in range(40)]
+        attacks = sum(1 for a in actions if a == ACTION_ATTACK)
+        self.assertGreaterEqual(attacks, 35, f"只挥了 {attacks}/40 刀，说明又在长期后退")
+        self.assertNotIn("spacing_retreat", teacher.reasons)
+
+    def test_reason_stats_count_every_frame(self):
+        teacher = TeacherV2(rod_ready=False)
+        probe = obs(health=18.0, target_health=10.0, distance=2.0)
+        for _ in range(5):
+            teacher(probe)
+        self.assertEqual(sum(teacher.reasons.values()), 5)
 
 
 class RodTest(unittest.TestCase):
-    """规则 2：2.5–4.2 格、鱼竿可用、距上次释放 > 3 秒。"""
+    """规则 2（鱼竿）已删除的回归。
 
-    def test_uses_rod_in_window(self):
-        teacher = TeacherV2()
-        self.assertEqual(teacher(obs(distance=3.5)), ACTION_USE_ROD)
+    ``use_rod`` 解码不含位移，切回剑那帧也不动；只在「够不到、该往前压」时生效，
+    等于白站 2 帧。保留 ``rod_ready`` 解析只为兼容旧调用方。
+    """
 
-    def test_switches_back_to_sword_next_frame(self):
+    def test_never_uses_rod(self):
         teacher = TeacherV2()
-        teacher(obs(distance=3.5))
-        self.assertEqual(teacher(obs(distance=3.5)), ACTION_SWITCH_SWORD)
+        for distance in (2.6, 3.5, 4.1, 4.2):
+            action = teacher(obs(distance=distance, in_reach=0.0))
+            self.assertNotEqual(action, ACTION_USE_ROD, f"{distance} 格时仍在放鱼竿")
 
-    def test_respects_three_second_cooldown(self):
-        teacher = TeacherV2()
-        actions = []
-        probe = obs(distance=3.5)
-        for _ in range(45):
-            actions.append(teacher(probe))
-        rods = [index for index, action in enumerate(actions) if action == ACTION_USE_ROD]
-        self.assertEqual(rods[0], 0)
-        # 10Hz 控制：第 31 帧才过 3 秒（30 × 0.1 = 3.0 不算「超过」）。
-        self.assertEqual(rods[1], 31, f"第二次放鱼竿在第 {rods[1]} 帧（应为 31）")
+    def test_rod_ready_flag_is_still_accepted(self):
+        teacher = TeacherV2(rod_ready=False)
+        self.assertIsInstance(teacher(obs(distance=4.1, in_reach=0.0)), int)
 
-    def test_out_of_window_falls_through(self):
+    def test_out_of_reach_keeps_closing(self):
+        """够不到时必须是 approach（往前压），不是放竿也不是站着。"""
         teacher = TeacherV2()
-        # 4.5 格超出鱼竿窗口：应该走「贴近」，不是放竿。
-        self.assertNotEqual(teacher(obs(distance=4.5)), ACTION_USE_ROD)
-
-    def test_rod_unavailable_via_meta(self):
-        teacher = TeacherV2()
-        action = teacher(obs(distance=3.5), {"rod_ready": False})
-        self.assertNotEqual(action, ACTION_USE_ROD)
+        self.assertEqual(teacher(obs(distance=4.1, in_reach=0.0)), ACTION_APPROACH)
 
 
 class GappleTest(unittest.TestCase):
-    """规则 3：血量 ≤ 12 且距离 > 3 且背包有苹果。"""
+    """规则 3（金苹果）**已删除**的回归。
 
-    def test_eats_when_low_and_far(self):
-        teacher = TeacherV2()
-        self.assertEqual(teacher(obs(health=10.0, target_health=18.0, distance=4.1)),
-                         ACTION_EAT)
+    算术：吃一次 = 16 帧不能动/不能砍，换 4 点血（1 刀的伤害）；一局约 50 帧，
+    16 帧 ≈ 6.4 点输出。原来还会因「每帧重发 use{gapple}」形成活锁（实测 207/436 帧）。
+    """
 
-    def test_does_not_eat_too_close(self):
+    def test_never_eats(self):
         teacher = TeacherV2()
-        self.assertNotEqual(teacher(obs(health=10.0, target_health=18.0, distance=2.8)),
-                            ACTION_EAT)
+        for health in (6.0, 7.5, 12.0):
+            action = teacher(obs(health=health, target_health=18.0, distance=4.1,
+                                 in_reach=0.0))
+            self.assertNotEqual(action, ACTION_EAT, f"{health} 血时还在吃苹果")
 
-    def test_does_not_eat_without_gapple(self):
+    def test_low_health_keeps_closing(self):
         teacher = TeacherV2()
-        self.assertNotEqual(teacher(obs(health=10.0, target_health=18.0, distance=4.1,
-                                        gapples=0.0)), ACTION_EAT)
+        self.assertEqual(teacher(obs(health=6.0, target_health=18.0, distance=4.1,
+                                     in_reach=0.0)), ACTION_APPROACH)
+
+    def test_low_health_in_reach_attacks(self):
+        teacher = TeacherV2()
+        # 第一帧可能是跳劈（每局一次），之后必须是攻击。
+        actions = [teacher(obs(health=6.0, target_health=18.0, distance=2.0, in_reach=1.0))
+                   for _ in range(4)]
+        self.assertNotIn(ACTION_EAT, actions)
+        self.assertGreaterEqual(actions.count(ACTION_ATTACK), 3)
 
 
 class CritJumpAndWTapTest(unittest.TestCase):
-    """规则 4/5：先起跳再补刀（两帧），挥刀后的下一帧只前进不疾跑。
-
-    注意取 2.0 格而不是 2.5：2.5 已经进了鱼竿窗口（规则 2 优先于规则 4），
-    那时老师会先放竿而不是起跳。
-    """
+    """规则 4：先起跳再补刀（两帧）；规则 5（w-tap）已删除，挥刀后不再白丢一帧。"""
 
     def test_jump_then_attack(self):
         teacher = TeacherV2()
         probe = obs(distance=2.0, in_reach=1.0)
-        first = teacher(probe)
-        second = teacher(probe)
-        self.assertEqual(first, ACTION_JUMP)
-        self.assertEqual(second, ACTION_ATTACK)
+        self.assertEqual(teacher(probe), ACTION_JUMP)
+        self.assertEqual(teacher(probe), ACTION_ATTACK)
 
     def test_no_jump_when_target_airborne(self):
         teacher = TeacherV2()
-        action = teacher(obs(distance=2.0, in_reach=1.0, target_ground=0.0))
-        self.assertNotEqual(action, ACTION_JUMP)
+        self.assertNotEqual(teacher(obs(distance=2.0, in_reach=1.0, target_ground=0.0)),
+                            ACTION_JUMP)
 
     def test_no_jump_when_self_airborne(self):
         teacher = TeacherV2()
-        action = teacher(obs(distance=2.0, in_reach=1.0, self_ground=0.0))
-        self.assertNotEqual(action, ACTION_JUMP)
+        self.assertNotEqual(teacher(obs(distance=2.0, in_reach=1.0, self_ground=0.0)),
+                            ACTION_JUMP)
 
-    def test_wtap_after_attack_reports_sprint_off(self):
+    def test_no_wasted_frame_after_attack(self):
+        """w-tap 删除后：跳劈补刀之后每一帧都应该继续砍，不再插入 ``approach``。"""
         teacher = TeacherV2()
         probe = obs(distance=2.0, in_reach=1.0)
-        sequence = []
-        for _ in range(4):
-            meta: dict = {}
-            sequence.append((teacher(probe, meta), meta["sprint"]))
-        self.assertEqual(sequence[0][0], ACTION_JUMP)
-        self.assertEqual(sequence[1][0], ACTION_ATTACK)
-        # w-tap：挥刀后的这一帧只前进、不疾跑，并明确把 sprint=False 写进 meta。
-        self.assertEqual(sequence[2], (ACTION_APPROACH, False))
-        # 再下一帧恢复疾跑（默认 sprint=True）。
-        self.assertTrue(sequence[3][1])
-        self.assertEqual(sequence[3][0], ACTION_ATTACK)
+        sequence = [teacher(probe) for _ in range(6)]
+        self.assertEqual(sequence[0], ACTION_JUMP)
+        self.assertEqual(sequence[1], ACTION_ATTACK)
+        self.assertEqual(sequence[2:], [ACTION_ATTACK] * 4,
+                         f"挥刀后出现了非攻击帧：{sequence}")
 
-    def test_wtap_does_not_fire_without_previous_attack(self):
+    def test_jump_only_once_per_episode(self):
+        """``recent_attack_jumps`` 只在攻击后更新：跳劈每局最多一次（代价 1 帧）。"""
         teacher = TeacherV2()
-        meta: dict = {}
-        # 目标在空中 → 不跳，直接进入常规分支：第一帧就是 attack，不能带 sprint=False。
-        teacher(obs(distance=2.0, in_reach=1.0, target_ground=0.0), meta)
-        self.assertTrue(meta["sprint"])
+        probe = obs(distance=2.0, in_reach=1.0)
+        actions = [teacher(probe) for _ in range(10)]
+        self.assertEqual(actions.count(ACTION_JUMP), 1)
 
 
 class BlockTest(unittest.TestCase):
-    """规则 6：血量 < 10、在 reach 内、对手刚攻击过 → 举剑格挡。"""
+    """规则 6：只有拿到**对手**刚攻击的真信号才格挡；缺信号时优先还手。"""
 
     def test_blocks_when_low_health_and_pressured(self):
         teacher = TeacherV2()
-        self.assertEqual(teacher(obs(health=6.0, target_health=18.0, distance=2.0,
-                                     since_attack=0.2)), ACTION_BLOCK)
+        action = teacher(obs(health=6.0, target_health=18.0, distance=2.0),
+                         {"opponent_since_attack": 0.2})
+        self.assertEqual(action, ACTION_BLOCK)
+
+    def test_low_health_in_reach_attacks_without_signal(self):
+        """回归：没有对手攻击信号时，低血 + 贴身必须挥刀，不能连挡（实测 36 帧白丢）。
+
+        第一帧允许是跳劈（每局一次），之后必须每帧都砍。
+        """
+        teacher = TeacherV2()
+        probe = obs(health=6.0, target_health=18.0, distance=2.0, since_attack=0.1)
+        actions = [teacher(probe) for _ in range(6)]
+        self.assertNotIn(ACTION_BLOCK, actions)
+        self.assertGreaterEqual(actions.count(ACTION_ATTACK), 5, f"实际序列 {actions}")
 
     def test_no_block_when_opponent_not_attacking(self):
         teacher = TeacherV2()
-        action = teacher(obs(health=6.0, target_health=18.0, distance=2.0, since_attack=4.0))
+        action = teacher(obs(health=6.0, target_health=18.0, distance=2.0),
+                         {"opponent_since_attack": 4.0})
         self.assertNotEqual(action, ACTION_BLOCK)
 
     def test_opponent_since_attack_from_meta_wins(self):
@@ -241,6 +245,29 @@ class BlockTest(unittest.TestCase):
         action = teacher(obs(health=6.0, target_health=18.0, distance=2.0, since_attack=4.0),
                          {"opponent_since_attack": 0.1})
         self.assertEqual(action, ACTION_BLOCK)
+
+
+class V1ParityTest(unittest.TestCase):
+    """核心回归：贴身、双方满血、无特殊情况时，v2 必须与 v1 逐帧同动作。
+
+    v2 的定位是「v1 + 少量不亏节奏的时序行为」。一旦某些规则让它在能砍的时候不砍，
+    出手率就会掉回 2026-11-20 那次 9.6% 的坑里（那次对 dagger-1118b 是 0/6）。
+    """
+
+    def test_same_actions_as_v1_when_in_reach(self):
+        teacher = TeacherV2()
+        probe = obs(health=20.0, target_health=20.0, distance=2.5, in_reach=1.0)
+        v1_actions = [heuristic_action(probe) for _ in range(40)]
+        v2_actions = [teacher(probe) for _ in range(40)]
+        # 允许第一帧的跳劈（每局一次）不同，其余必须完全一致。
+        self.assertEqual(v2_actions[0], ACTION_JUMP)
+        self.assertEqual(v2_actions[1:], v1_actions[1:])
+
+    def test_same_actions_as_v1_when_far(self):
+        teacher = TeacherV2()
+        probe = obs(health=20.0, target_health=20.0, distance=8.0, in_reach=0.0)
+        self.assertEqual([teacher(probe) for _ in range(5)],
+                         [heuristic_action(probe) for _ in range(5)])
 
 
 class DegenerateInputTest(unittest.TestCase):

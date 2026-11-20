@@ -446,6 +446,14 @@ class GladiatorEnv(gym.Env):
         super().reset(seed=seed)
         self.shaping.reset()
         options = options or {}
+        # 对手策略的每局钩子：脚本老师用它清空跨帧记忆与按局统计（否则不同局的状态串味）。
+        if self.opponent_policy is not None:
+            hook = getattr(self.opponent_policy, "reset_episode", None)
+            if callable(hook):
+                try:
+                    hook()
+                except Exception as exc:  # noqa: BLE001 - 对手侧的统计不该打断训练
+                    self._log(f"对手策略 reset_episode 失败（忽略）: {exc}")
         # P1.6：起始分布随机化。同一局两只 Bot 共用一组中心/间距，保证对称。
         self._sample_arena()
         self._sample_opponent_profile()

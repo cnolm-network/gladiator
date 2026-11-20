@@ -77,22 +77,10 @@ TEACHER_APPROACH_DISTANCE = 4.0
 TEACHER_HEAL_HEALTH = 8.0
 
 # --- 老师 v2 的规则阈值（全部按「格 / 点 / 秒」写，单位见注释） -------------------
-#: 间距控制：距离小于该值且自己血量落后 → 后撤（格）。
-TEACHER_V2_SPACING_CLOSE = 2.2
-#: 间距控制：后撤到该距离才解除后撤闩锁、重新压上（格）。
-TEACHER_V2_SPACING_RELEASE = 2.6
-#: 间距控制：贴身带上沿（格）。超出它就继续压上——不在 3.9 格的 reach 边缘硬砍，
-#: 既避开 OUT_OF_REACH 的边界抖动，也顺手实现「维持 2.4–3.0」里的 3.0 一侧。
-#: 下沿 2.4 由后撤闩锁保证：只有在 ≥ 2.6 才解除后撤，不会停在 2.2–2.4 反复抖动。
-TEACHER_V2_BAND_HIGH = 3.0
-#: 鱼竿：有效距离区间（格，闭区间）。
-TEACHER_V2_ROD_RANGE = (2.5, 4.2)
-#: 鱼竿：两次释放之间的最短间隔（秒）。
-TEACHER_V2_ROD_COOLDOWN = 3.0
-#: 金苹果：血量不高于该值才吃（点）。
-TEACHER_V2_GAPPLE_HEALTH = 12.0
-#: 金苹果：距离大于该值才吃（贴身吃苹果等于白送一刀，格）。
-TEACHER_V2_GAPPLE_DISTANCE = 3.0
+# 说明（2026-11-20 实测，见 docs 与提交说明）：v2 老师曾因四条「保命/节奏」规则把
+# 出手率压到 9.6%（436 帧里只有 42 帧 attack），对 dagger-1118b 被打成 0/6，
+# 而同期 v1 老师（纯「射程内就砍」）是 4/6。下列阈值保留的都是**加伤害**的规则，
+# 被删掉的规则在各自的删除点写明了理由。
 #: 暴击跳：距离不大于该值才起跳（格）。
 TEACHER_V2_CRIT_DISTANCE = 3.0
 #: 暴击跳：回看最近几次攻击的「是否跳劈」。
@@ -169,16 +157,15 @@ class TeacherV2State:
     - ``last_attack_frame``：上次攻击的帧号（w-tap 判断「上一帧刚 attack」）。
     """
 
-    __slots__ = ("frame", "backing_off", "pending_crit", "pending_sword_switch",
+    __slots__ = ("frame", "pending_crit", "pending_sword_switch",
                  "last_rod_frame", "recent_attack_jumps", "last_attack_frame",
-                 "last_action", "sprint")
+                 "last_action", "sprint", "reasons", "crit_used")
 
     def __init__(self) -> None:
         self.reset()
 
     def reset(self) -> "TeacherV2State":
         self.frame = 0
-        self.backing_off = False
         self.pending_crit = False
         self.pending_sword_switch = False
         self.last_rod_frame: int | None = None
@@ -187,14 +174,12 @@ class TeacherV2State:
         self.last_action: int | None = None
         #: 本帧建议的疾跑开关（``False`` = w-tap 的「只前进不疾跑」）。
         self.sprint = True
+        #: 本局各条规则的命中次数（``reason -> count``），reset 时清零。
+        #: 谁在长期生效、谁从未生效，看这个字典就够了。
+        self.reasons: dict[str, int] = {}
+        #: 本局是否已经用过跳劈（每局只值得试一次）。
+        self.crit_used = False
         return self
-
-
-def _elapsed_seconds(state: TeacherV2State, frame_seconds: float) -> float:
-    """距上次放鱼竿过了多少秒（没放过 = 无穷大，等价「冷却已就绪」）。"""
-    if state.last_rod_frame is None:
-        return float("inf")
-    return max(0, state.frame - state.last_rod_frame) * float(frame_seconds)
 
 
 def _finish(state: TeacherV2State, action: int, *, sprint: bool | None = None,
@@ -209,6 +194,7 @@ def _finish(state: TeacherV2State, action: int, *, sprint: bool | None = None,
     state.last_action = action
     state.sprint = True if sprint is None else bool(sprint)
     state.frame = frame + 1
+    state.reasons[reason] = state.reasons.get(reason, 0) + 1
     return action, {"reason": reason, "sprint": state.sprint, "jumped": bool(jumped)}
 
 
@@ -221,7 +207,8 @@ def _teacher_options(meta: Any) -> dict:
     - ``gapples``：金苹果数量（默认取观测 ``self_gapples``，观测只有 0..1 的归一化值）；
     - ``since_attack``：**自己**距上次攻击的秒数（默认取观测）；
     - ``opponent_since_attack``：**对手**距上次攻击的秒数（观测里没有这个字段，
-      真机可由 bot-runtime 提供；缺省时退回 ``since_attack``——见 :func:`heuristic_action_v2`）；
+      真机可由 bot-runtime 提供）。**缺省时不做低血格挡**——用自己的 since_attack 兜底
+      会把「我刚砍完」误判成「对手在打我」（2026-11-20 实测的连挡问题）；
     - ``frame_seconds``：一帧多少秒（默认 0.1，即 10Hz 控制）；
     - ``state``：``TeacherV2State`` 实例（缺省用模块级默认状态）。
     """
@@ -235,6 +222,7 @@ def _teacher_options(meta: Any) -> dict:
         "rod_ready": bool(data.get("rod_ready", True)),
         "gapples": data.get("gapples"),
         "since_attack": data.get("since_attack"),
+        # 缺省保持 None：`_decide_v2` 用它区分「有真信号」与「没有信号」。
         "opponent_since_attack": data.get("opponent_since_attack"),
         "frame_seconds": (TEACHER_V2_FRAME_SECONDS if frame_seconds is None
                           else max(1e-6, float(frame_seconds))),
@@ -242,94 +230,88 @@ def _teacher_options(meta: Any) -> dict:
 
 
 def _decide_v2(obs: np.ndarray, options: dict) -> tuple[int, dict]:
-    """v2 的决策核心（纯函数 + 显式状态），返回 ``(动作, 诊断)``。"""
+    """v2 的决策核心（纯函数 + 显式状态），返回 ``(动作, 诊断)``。
+
+    判定顺序：格挡（仅真信号）→ 暴击补刀 → 起跳 → v1 兜底。
+
+    2026-11-20 修复：v2 原来比 v1 弱得多（对 dagger-1118b：v2 老师 0/6、v1 老师 4/6），
+    根因是四条「保命/节奏」规则把出手率压到 **9.6%**（436 帧里 42 帧 attack）：
+    吃苹果 207 帧、后撤 43、格挡 36、w-tap 18。处理方式与理由逐条写在下面。
+    """
     state: TeacherV2State = options["state"]
-    frame_seconds: float = options["frame_seconds"]
     frame = state.frame
 
     has_target = _get(obs, IDX_HAS_TARGET) >= 0.5
     if not has_target:
         # 看不到人：所有「上一帧刚做过什么」的节拍都作废，别把状态带进下一局。
-        state.backing_off = False
         state.pending_crit = False
         state.pending_sword_switch = False
         return _finish(state, ACTION_IDLE, reason="no_target")
 
     health = _get(obs, IDX_SELF_HEALTH) * HEALTH_SCALE
-    target_health = _get(obs, IDX_TARGET_HEALTH) * HEALTH_SCALE
     distance = _get(obs, IDX_TARGET_DISTANCE) * DISTANCE_SCALE
     in_reach = _get(obs, IDX_IN_REACH) >= 0.5
     self_ground = _get(obs, IDX_SELF_ON_GROUND) >= 0.5
     target_ground = _get(obs, IDX_TARGET_ON_GROUND) >= 0.5
 
-    gapples = options["gapples"]
-    if gapples is None:
-        gapples = _get(obs, IDX_SELF_GAPPLES) * GAPPLE_SCALE
-    since_attack = options["since_attack"]
-    if since_attack is None:
-        since_attack = _get(obs, IDX_SELF_SINCE_ATTACK) * 5.0
+    # ``gapples`` / ``since_attack`` 仍然被 :func:`_teacher_options` 解析（meta 契约不变），
+    # 但当前没有规则消费它们：金苹果规则已删（见规则 3），而 ``since_attack`` 是**自己**
+    # 的距上次攻击，不能当成「对手在打我」（见规则 6 的修复）。
     opponent_since_attack = options["opponent_since_attack"]
-    if opponent_since_attack is None:
-        # 观测里没有「对手距上次攻击」：按规格用 since_attack 这个可得信号兜底。
-        opponent_since_attack = since_attack
 
-    # --- 规则 6：低血格挡（最高优先级：先活下来） ---
-    if (health < TEACHER_V2_BLOCK_HEALTH and in_reach
-            and float(opponent_since_attack) <= TEACHER_V2_BLOCK_WINDOW):
-        state.backing_off = False
+    # --- 规则 6：低血格挡（只在拿到**真**的「对手刚攻击」信号时才用） ---
+    # 原来缺这个信号时回落到 `since_attack`（**自己**距上次攻击），于是「我刚挥完刀」
+    # 被当成「对手正在打我」→ 血量 <10 时疯狂格挡（实测 36 帧/6 局，全是白丢的输出）。
+    # 现在没有 meta 显式给 `opponent_since_attack` 就不格挡：宁可挨一刀也要换血。
+    if (opponent_since_attack is not None and health < TEACHER_V2_BLOCK_HEALTH
+            and in_reach and float(opponent_since_attack) <= TEACHER_V2_BLOCK_WINDOW):
         state.pending_crit = False
         return _finish(state, ACTION_BLOCK, reason="low_health_block")
 
-    # --- 规则 4 第二帧：上一帧起跳了，这一帧补刀 ---
+    # --- 规则 4 第二帧：上一帧起跳了，这一帧补刀（够不到就作废，别打空气） ---
     if state.pending_crit:
         state.pending_crit = False
-        if in_reach or distance <= TEACHER_V2_CRIT_DISTANCE:
+        if in_reach:
             return _finish(state, ACTION_ATTACK, jumped=True, reason="crit_attack")
 
-    # --- 规则 1：间距控制（只在「自己血量落后」时才讲究距离） ---
-    if health < target_health:
-        if distance < TEACHER_V2_SPACING_CLOSE:
-            state.backing_off = True
-        elif state.backing_off and distance >= TEACHER_V2_SPACING_RELEASE:
-            state.backing_off = False      # 退够了，可以再压上
-        if state.backing_off:
-            # retreat = look(面向对手) + move back；decode_action 已保证朝向。
-            return _finish(state, ACTION_RETREAT, reason="spacing_retreat")
-    else:
-        state.backing_off = False
+    # --- 规则 3：金苹果（**已删除**） ---
+    # ①先修的是活锁：一帧 0.1s、一次使用按住 1.6s，没有冷却会每帧重发 use{gapple}，
+    #   实测 207/436 帧（47%）卡在吃苹果上（苹果数量在「吃完」之前不下降）。
+    # ②加了冷却后仍然净亏：吃一次 = 16 帧不能动、不能砍，换回 4 点血（= 1 刀的伤害）。
+    #   一局只有约 50 帧，16 帧 ≈ 1.6 刀 ≈ 6.4 点输出。算术上「吃」永远不如「砍」。
+    # ③v1 的同类规则（<8 血吃）实际只在 3.84–4.0 格的窄缝里触发，本来也几乎不生效。
+    # 结论：这个动作空间里吃苹果没有正收益，直接删；``gapples`` 仍被解析（meta 契约不变）。
 
-    # --- 规则 3：金苹果（血量见底 + 拉开距离时才吃） ---
-    if (health <= TEACHER_V2_GAPPLE_HEALTH and distance > TEACHER_V2_GAPPLE_DISTANCE
-            and float(gapples) >= 1.0):
-        return _finish(state, ACTION_EAT, reason="gapple")
+    # --- 规则 2：鱼竿（**已删除**） ---
+    # 理由：``use_rod`` 解码出来是 ``[look, use{rod}]``，**不含位移**；切回剑那一帧也不动。
+    # 所以它只会在「够不到、正该往前压」的距离上白站 2 帧（实测 4–13 帧/6 局）。
+    # 运行时默认 CPS=15、控制 10Hz，攻击帧本来就不受点击上限限制——省下的每一帧都是净输出。
+    # ``rod_ready`` 仍然被解析（兼容旧调用方），但不再影响决策；``pending_sword_switch``
+    # 也保留在状态里，避免外部读取时 AttributeError。
 
-    # --- 规则 2：鱼竿（中距离击退，然后切回剑） ---
-    low, high = TEACHER_V2_ROD_RANGE
-    if (options["rod_ready"] and low <= distance <= high
-            and _elapsed_seconds(state, frame_seconds) > TEACHER_V2_ROD_COOLDOWN):
-        state.last_rod_frame = frame
-        state.pending_sword_switch = True
-        return _finish(state, ACTION_USE_ROD, reason="use_rod")
-    if state.pending_sword_switch:
-        state.pending_sword_switch = False
-        return _finish(state, ACTION_SWITCH_SWORD, reason="rod_switch_back")
-
-    # --- 规则 4：暴击跳（第一次挥刀前先起跳；最近两次都跳过了就不再跳） ---
-    recent = state.recent_attack_jumps[-TEACHER_V2_CRIT_MEMORY:]
-    if (distance <= TEACHER_V2_CRIT_DISTANCE and self_ground and target_ground
-            and not any(recent)):
+    # --- 规则 4：暴击跳（贴脸、双方在地面、本局还没跳劈过 → 起跳，下一帧补刀） ---
+    # 保留但收紧到 in_reach 内：原来距离 ≤3 就起跳，会把「本来能砍的一帧」换成起跳。
+    # 用显式 ``crit_used`` 闩锁，而不是靠 ``recent_attack_jumps`` 的两格窗口：
+    # 后者的 True 会被后续两次普通攻击挤出去，于是「每 4 刀跳一次」，实测 10 帧里
+    # 跳 3 次（约 12% 的帧被起跳顶掉）。跳劈每局试一次就够。
+    if (not state.crit_used and in_reach and distance <= TEACHER_V2_CRIT_DISTANCE
+            and self_ground and target_ground):
+        state.crit_used = True
         state.pending_crit = True
         return _finish(state, ACTION_JUMP, reason="crit_jump")
 
-    # --- 规则 5：w-tap（上一帧刚挥刀 → 这一帧只前进、不疾跑） ---
-    if state.last_attack_frame is not None and state.last_attack_frame == frame - 1:
-        return _finish(state, ACTION_APPROACH, sprint=False, reason="w_tap")
+    # --- 规则 5：w-tap（**已删除动作分支**） ---
+    # v1 动作空间里 ``approach`` 的疾跑由 decode_action 按距离决定（>2.5 格才疾跑），
+    # meta["sprint"]=False 没有消费方；所以「上一帧刚砍、这一帧只前进」实际就是
+    # **白丢一帧输出**（实测 18 帧/6 局）。节奏信息仍写进 state.sprint 供将来真机使用。
 
-    # --- v1 的兜底（顺序不变，只多一条「先压进贴身带再挥刀」） ---
-    if distance > TEACHER_V2_BAND_HIGH:
-        return _finish(state, ACTION_APPROACH, reason="approach_band")
+    # --- 兜底：与 v1 完全同序（射程内就砍 → 太远就压上 → 低血吃苹果 → 压上） ---
+    # 原来还有一条「距离 >3.0 先压进贴身带」，它让 3.0–3.99（in_reach 内）的帧变成
+    # approach，实测 approach_band 62 帧/6 局——同样是在能砍的时候不砍，一并去掉。
     if in_reach:
         return _finish(state, ACTION_ATTACK, reason="attack")
+    if distance > TEACHER_APPROACH_DISTANCE:
+        return _finish(state, ACTION_APPROACH, reason="approach")
     if health < TEACHER_HEAL_HEALTH:
         return _finish(state, ACTION_EAT, reason="heal_low")
     return _finish(state, ACTION_APPROACH, reason="approach")
@@ -346,32 +328,35 @@ def reset_teacher_v2() -> None:
 
 
 def heuristic_action_v2(obs: np.ndarray, meta: Mapping[str, Any] | None = None) -> int:
-    """老师 v2：v1 的规则 + 六条时序规则，只读观测（+ 可选 ``meta``），返回动作编号。
+    """老师 v2：v1 的规则 + 「每局一次跳劈」（+ 有真信号时的低血格挡）。
 
-    六条规则（编号与规格一致）：
+    只读观测（+ 可选 ``meta``），返回动作编号。
 
-    1. **间距控制**：距离 < 2.2 且自己血量落后 → 后撤（``retreat`` 自带面向对手），
-       退到 2.6 格才解除闩锁重新压上；健康时维持 2.4–3.0 的贴身带。
-    2. **鱼竿**：2.5 ≤ 距离 ≤ 4.2、鱼竿可用、距上次释放 > 3 秒 → 放鱼竿，下一帧切回剑。
-    3. **金苹果**：血量 ≤ 12 且距离 > 3 且背包里有金苹果 → 吃苹果。
-    4. **暴击跳**：距离 ≤ 3、双方都在地面、最近 2 次攻击都没跳 → 这一帧 ``jump``，
-       下一帧 ``attack``（同一拍拆两帧）。
-    5. **w-tap**：上一帧刚 ``attack`` → 这一帧只前进不疾跑（``approach`` + ``sprint=False``）。
-    6. **低血格挡**：血量 < 10、对手在 reach 内、对手刚攻击过 → ``block``（举剑 300ms）。
+    2026-11-20 大修：v2 原来比 v1 弱得多（对 dagger-1118b：v2 老师 0/6、v1 老师 1–5/6），
+    根因是「保命/节奏」规则把出手率压到 9.6%（436 帧只有 42 帧 attack）。逐条处理：
 
-    实际判定顺序（与编号不同，按「先活命、再抢节奏、最后常规」排）：
+    1. **间距后撤** —— **已删除**。原规则「自己血量落后且距离 <2.2 就后撤」，而血量落后
+       恰好是被追打的时候，退出去等于放弃还手（实测 43 帧/6 局）。v1 没有这条。
+    2. **鱼竿** —— **已删除**。``use_rod`` 解码不含位移、切回剑那帧也不动，只在
+       「够不到、正该往前压」时生效 → 白站 2 帧（实测 4–13 帧/6 局）。
+    3. **金苹果** —— **已删除**。先修活锁（每帧重发 use{gapple}，实测 207/436 帧 = 47%），
+       再算账：吃一次 = 16 帧不能动/不能砍 ≈ 1.6 刀 ≈ 6.4 点输出，换回 4 点血 → 永远净亏。
+    4. **暴击跳** —— 保留并收紧到 ``in_reach`` 内，且**每局只试一次**。原来靠
+       ``recent_attack_jumps`` 的两格窗口，True 被后续攻击挤出去后变成「每 4 刀跳一次」，
+       实测 10 帧跳 3 次（约 12% 的帧被起跳顶掉）。
+    5. **w-tap** —— **已删除动作分支**。v1 动作空间没有「前进但不疾跑」这个原子动作
+       （``decode_action`` 按距离决定疾跑），写 ``meta["sprint"]=False`` 没有消费方，
+       实际只是白丢一帧输出（实测 18 帧/6 局）。``state.sprint`` 仍然留档。
+    6. **低血格挡** —— 只在 ``meta`` **显式给出** ``opponent_since_attack`` 时生效。
+       观测里没有「对手距上次攻击」，原来的兜底（用自己的 ``since_attack``）把
+       「我刚砍完」当成「对手在打我」，血量 <10 时变成连挡不砍（实测 36 帧/6 局）。
 
-    ``6 格挡`` → ``4 补刀（上一帧已起跳）`` → ``1 后撤`` → ``3 金苹果`` → ``2 鱼竿`` →
-    ``2 切回剑`` → ``4 起跳`` → ``5 w-tap`` → ``v1 兜底``。
+    实际判定顺序：``6 格挡（需真信号）`` → ``4 补刀`` → ``4 起跳`` →
+    ``v1 兜底（射程内就砍 / >4 格压上 / <8 血吃苹果）``。
 
-    兜底与 v1 的唯一差别：距离 > 3.0（贴身带上沿）先 ``approach`` 压进去，再 ``attack``；
-    其余仍是「射程内 attack / 血量 < 8 eat_gapple / 其他 approach」。
-
-    关于 w-tap 的落地方式（**v1 宏动作空间的硬约束**）：v1 的 ``approach`` 在
-    ``decode_action`` 里按距离决定疾跑（> 2.5 格才疾跑），没有「前进但不疾跑」这个原子动作。
-    因此这里返回 ``approach``，同时把「本帧不要疾跑」写进 ``meta["sprint"] = False``
-    （并在 ``state.sprint`` 留档），真机侧按 meta 覆盖；离线 BC 只消费动作编号，
-    近距（≤ 2.5 格）时 ``approach`` 本来就不疾跑，语义损失有限。
+    也就是说，v2 现在**等价于 v1 + 每局一次跳劈 + （有真信号时的）低血格挡**。
+    这是刻意的：在这个动作空间里（控制 10Hz、运行时 CPS=15 不构成瓶颈），
+    「射程内每帧都砍」就是上限，任何额外规则只要占一帧就是净亏。
 
     ``meta`` 支持的键见 :func:`_teacher_options`；写回 ``meta["sprint"]`` 与
     ``meta["reason"]``（决策依据，便于复盘）。
@@ -397,10 +382,30 @@ class TeacherV2:
     def __init__(self, **defaults: Any) -> None:
         self.state = TeacherV2State()
         self.defaults = dict(defaults)
+        #: 已结束 episode 的原因统计（每次 :meth:`reset` 归档上一局）。
+        self.episode_reasons: list[dict[str, int]] = []
 
     def reset(self) -> "TeacherV2":
+        if self.state.reasons:
+            self.episode_reasons.append(dict(self.state.reasons))
         self.state.reset()
         return self
+
+    def reset_episode(self) -> None:
+        """环境 ``reset()`` 时的回调（``GladiatorEnv`` 约定）：归档上一局并清零状态。"""
+        self.reset()
+
+    @property
+    def reasons(self) -> dict[str, int]:
+        """当前 episode 各条规则的命中次数（``reason -> count``）。"""
+        return dict(self.state.reasons)
+
+    def flush(self) -> list[dict[str, int]]:
+        """把「还没归档的当前 episode」也收进 ``episode_reasons``（对局结束时调用）。"""
+        if self.state.reasons:
+            self.episode_reasons.append(dict(self.state.reasons))
+            self.state.reasons = {}
+        return list(self.episode_reasons)
 
     def __call__(self, obs: np.ndarray, meta: Mapping[str, Any] | None = None) -> int:
         merged: dict[str, Any] = dict(self.defaults)
