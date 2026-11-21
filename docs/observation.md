@@ -12,7 +12,7 @@
 | 文档 | 回答什么问题 | 不回答什么 |
 |---|---|---|
 | `docs/protocol.md` | 有哪些帧、信封长什么样、握手与错误码、限流策略 | 单个字段的单位、缺省值、逐维含义 |
-| **本文档 `docs/observation.md`** | 每个帧的 payload 字段表、19 维向量逐维定义、11 个离散动作如何翻译成协议帧 | Python 侧 `reset()/step()` 怎么调用 |
+| **本文档 `docs/observation.md`** | 每个帧的 payload 字段表、25 维向量逐维定义、11 个离散动作如何翻译成协议帧 | Python 侧 `reset()/step()` 怎么调用 |
 | `docs/training-env-api.md` | Gymnasium 环境的构造参数、`BotConfig`/`ArenaConfig`、RCON 准备流程、奖励预设 | 观测字段语义、动作编号与协议帧的映射 |
 
 一句话：**本文档讲「线上传什么」，`training-env-api.md` 讲「Python 里怎么用」。**
@@ -97,6 +97,7 @@
 | `yaw` | number | **弧度** | mineflayer 约定：`0` 面向 `+z`，正值逆时针（俯视）；缺失回落 `0` |
 | `pitch` | number | **弧度** | 正值向下；缺失回落 `0` |
 | `onGround` | bool | `true` / `false` | 是否着地（`Boolean(self.onGround)`） |
+| `velocity.x/y/z` | number | 格/秒（mineflayer 原值） | 自身速度；`y` 就是第 23 维 `self_vertical_speed` 的来源（下落为负）。缺失/非数一律填 `0`，字段恒存在 |
 | `health` | number | 0..20，0.5 粒度 | `bot.health` 原样透传，运行时不做夹取；消费方须容忍缺失（训练侧缺省按 20 处理） |
 | `food` | number | 0..20 | `bot.food`（饥饿值） |
 | `saturation` | number | 0..5 | `bot.foodSaturation`（饱和度） |
@@ -119,10 +120,11 @@
 | `kind` | string | `player` / `mob` / 其它 / `unknown` | 玩家判定优先（`entity.type === 'player'`） |
 | `name` | string | 玩家名或实体名 | 取 `username` → `displayName` → `name` → `String(id)` |
 | `pos.x/y/z` | number | 方块坐标（格） | 实体脚部位置 |
+| `velocity.x/y/z` | number | 格/秒 | 实体速度（第 19/20 维的来源）；缺失/非数填 `0` |
 | `distance` | number | 格 | 自身 `position.distanceTo(entity.position)`，**含 y 的 3D 距离** |
 | `heldItem` | object \| null | `{name, count}` | 对手手持物；`air` 视为 `null`。**不含耐久** |
 
-注意：`entities` **不携带血量**。19 维向量里的 `target_health` 由训练环境从「对手自己的 `OBSERVATION.self.health`」取（§4 第 11 维）。
+注意：`entities` **不携带血量**。25 维向量里的 `target_health` 由训练环境从「对手自己的 `OBSERVATION.self.health`」取（§4 第 11 维）。
 
 ### 3.4 `blockWindow`
 
@@ -168,9 +170,12 @@
 
 ---
 
-## 4. 训练用 19 维向量（`OBS_FIELDS` / `OBS_DIM = 19`）
+## 4. 训练用 25 维向量（`OBS_FIELDS` / `OBS_DIM = 25`）
 
-编码后为 `numpy.ndarray`，`shape=(19,)`，`dtype=float32`，最后统一 `np.clip(-5.0, 5.0)`。
+编码后为 `numpy.ndarray`，`shape=(25,)`，`dtype=float32`，最后统一 `np.clip(-5.0, 5.0)`。
+
+> 维度演进：19 → 23（P1：对手速度 / 出手间隔 / 能否打中）→ **25**（G-702：自身竖直速度 / 出手冷却）。
+> **新字段只在末尾追加**，索引 0–22 永不重排；旧模型右侧补零续训（`adopt_weights` → `W1[:, :23]` 逐位不变）。
 
 | idx | 名称 | 来源字段 | 归一化 / 裁剪 | 取值含义 | 缺失缺省 |
 |---|---|---|---|---|---|
@@ -193,6 +198,34 @@
 | 16 | `self_held_durability` | `self.heldItem.durability.remaining` | `clamp(·, 0, 1)` | 1 = 满耐久/无耐久概念 | 缺失 → `1.0` |
 | 17 | `self_armor_remaining` | `self.armorRemaining` | `clamp(·, 0, 1)` | 1 = 四件满耐久，0 = 未穿甲 | 缺失 → `0.0` |
 | 18 | `self_gapples` | `self.inventory` 中 `name == "golden_apple"` 的 `count` 之和 | `/5` 再 `clamp(0,1)` | 1.0 = ≥5 个金苹果 | 缺失 → `0.0` |
+| 19 | `opponent_speed` | 目标 `velocity.x/z` | `clip(√(vx²+vz²), 0, 10) / 10` | 1.0 = 10 格/s 的水平机动 | 无目标/无速度 → `0.0` |
+| 20 | `opponent_vertical_speed` | 目标 `velocity.y` | `clip(vy, -5, 5) / 5` | 对手在跳/在落 | 同上 → `0.0` |
+| 21 | `self_since_attack` | 环境 `_last_attack_at` | `clip(·, 0, 5) / 5` | 1.0 = ≥5s 没出手 | 从未出手 → **`1.0`**（视作已冷却） |
+| 22 | `in_reach` | 双方水平距离 vs 自己 `reach` | 布尔 → `1.0/0.0` | 1 = 这一刀打得中（**判水平距离**，不看 y 差） | 无目标 → `0.0` |
+| 23 | `self_vertical_speed` | **自身** `self.velocity.y` | `clip(vy, -5, 5) / 5` | **负 = 正在下落 = 跳劈窗口**；正 = 上升段 | 缺失 → `0.0` |
+| 24 | `self_attack_cooldown` | `0.5 − (now − _last_attack_at)` | `clip(·, 0, 0.5) / 0.5` | 1.0 = 刚打完（这一刀没伤害），0 = 可以打 | 从未出手 → `0.0`（可以打） |
+
+### 4.0 末尾两维的来历与原因（G-702）
+
+第 23/24 维是为「模型自己学会什么时候跳劈」补的，两者必须**成对**存在：
+
+- **`self_vertical_speed`（23）**：1.8 的暴击要求「下落中命中」（`fallDistance > 0 && !onGround`）。
+  观测里原本只有自己的 `onGround`（布尔）和**对手**的 vy，模型看得见对手在跳，却看不见自己在落——
+  等于要求它凭记忆推算自己的抛物线。给出自身 vy 后，「该出手了」变成一个可直接读出的数值。
+- **`self_attack_cooldown`（24）**：1.8 受击无敌帧 0.5s，同一目标 0.5s 内的第二刀**没有伤害**。
+  第 21 维 `self_since_attack` 是按 5s 归一化的，在 0.5s 附近的 0.1 变化只有 0.02 的分辨率，
+  网络几乎学不到「冷却没好别空砍」。单独给一维按 0.5s 归一化，分辨率提高 10 倍。
+
+真机对照（`training/scripts/tmp_combo_probe.py`，满甲对手，2026-11-22）：
+
+| jump 头 | attack 下发时机 | 命中 | 单刀伤害 |
+|---|---|---|---|
+| 0 | 每帧 | 5 | 全部 1.60（普通） |
+| 1 | 每帧（与 jump 同帧） | 5 | 全部 1.60（普通，被无敌帧锁相） |
+| 1 | 仅当上一帧 `vy<0` 且冷却已好 | 6 | 全部 **2.40（暴击）** |
+
+结论：「同帧 jump+attack」这条通路本身是通的（第二行证明出手确实落地），**但暴击取决于下落时机**；
+不看 vy 一律每帧砍，会与 0.5s 无敌帧锁相，永远停在上升段。这两维正是把这个时机变成可学的信号。
 
 ### 4.1 目标选择规则（决定 7..13 维）
 
@@ -297,7 +330,7 @@
 ### 6.2 字段只增不改
 
 - 观测字段**只增不改**：新增字段必须追加在 `OBSERVATION_FIELDS` 末尾，消费方按**名字**读取，禁止按下标。
-- 19 维向量是**训练侧**契约：新增观测字段**不自动**进向量，必须同时改 `OBS_FIELDS`、`OBS_DIM`、`encode_observation`，并递增模型输入版本；否则旧模型权重与新向量错位。
+- 25 维向量是**训练侧**契约：新增观测字段**不自动**进向量，必须同时改 `OBS_FIELDS`、`OBS_DIM`、`encode_observation`，并递增模型输入版本；否则旧模型权重与新向量错位。
 - 删除字段、改单位、改字段名属于破坏性变更：必须递增协议 `v` 并记录 ADR（`docs/protocol.md` §6 检查清单）。
 - `actionSpec.types` 追加新 verb 是兼容变更；移除或改语义是破坏性变更。
 
@@ -359,8 +392,8 @@
 
 | 结论 | 出处 |
 |---|---|
-| 19 维字段名与顺序、`OBS_CLIP`、`MOVE_MS`、`NUM_ACTIONS`、`ACTION_NAMES` | `training/gladiator_env/spaces.py` L18–L64 |
-| 19 维逐维归一化与缺省值 | `spaces.py` `encode_observation` L107–L165 |
+| 25 维字段名与顺序、`OBS_CLIP`、`ATTACK_COOLDOWN_S`、`MOVE_MS`、`NUM_ACTIONS`、`ACTION_NAMES` | `training/gladiator_env/spaces.py` L18–L76 |
+| 25 维逐维归一化与缺省值 | `spaces.py` `encode_observation` L113–L212 |
 | 目标选择（玩家/排除自身/名单过滤/最近） | `spaces.py` `nearest_player` L77–L104 |
 | `look` 帧构造、`yaw_to_target`、`pitch_to_target` | `spaces.py` L175–L199 |
 | 11 动作 → 协议帧与退化规则 | `spaces.py` `decode_action` L202–L269 |

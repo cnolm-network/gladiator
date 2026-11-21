@@ -33,7 +33,7 @@ v2 把这 9 帧空转成了「同一个 attack 再发一次」，v3 把它们换
 from __future__ import annotations
 
 import math
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -111,7 +111,10 @@ TEACHER_V2_FRAME_SECONDS = 0.1
 
 #: 编译期自检：字段顺序变了就立刻炸，而不是静默错位。
 assert OBS_DIM == len(OBS_FIELDS), f"OBS_DIM={OBS_DIM} 与 OBS_FIELDS={len(OBS_FIELDS)} 不一致"
-assert IDX_IN_REACH == OBS_DIM - 1, "in_reach 应是最后一个观测字段"
+# G-702：观测 23 → 25，两个新字段追加在 ``in_reach`` **之后**。这里断言的是
+# 「in_reach 没被挤走」（仍是 index 22），而不是「它是最后一个」——旧 23 维模型
+# 与老师的下标必须继续指向同一个量，否则右侧补零续训会在无人察觉时错位。
+assert IDX_IN_REACH == 22, "in_reach 的下标必须是 22（新字段只能追加在它之后）"
 assert 0 <= IDX_SELF_HEALTH < OBS_DIM and 0 <= IDX_HAS_TARGET < OBS_DIM
 assert 0 <= IDX_TARGET_DISTANCE < OBS_DIM
 for _name, _index in (
@@ -1551,6 +1554,7 @@ def behavior_clone(
     seed: int = 0,
     temperature: float = 1.0,
     label_smoothing: float = 0.0,
+    weights: Optional[Sequence[float]] = None,
 ) -> dict:
     """交叉熵监督训练策略头（W1/b1/W2/b2），**不动价值头 Wv/bv**。
 
@@ -1568,16 +1572,27 @@ def behavior_clone(
     口径说明：这里的 ``p`` 是 ``softmax(未除温度的 logits)``（与旧实现一致），
     ``policy.temperature`` 只影响采样/PPO 侧；BC 的 ``temperature`` 是**独立参数**，
     两者不要混用（要整体调平请在 BC 用 temperature，PPO 侧用 ``--logit-temp``）。
+    ``weights`` 给每条样本一个非负权重（默认全 1）：用于「赢的局权重大、输的局权重小」
+    与「交手帧权重大、跑位帧权重小」这类择优筛选。权重按批内和归一化，
+    因此全 1 时与原实现逐位一致。
     """
     if temperature <= 0:
         raise ValueError(f"temperature 必须为正，收到 {temperature}")
     if not 0.0 <= label_smoothing < 1.0:
         raise ValueError(f"label_smoothing 必须在 [0, 1) 内，收到 {label_smoothing}")
-    data = [(np.asarray(x, dtype=np.float64).reshape(-1), int(a)) for x, a, _ret in samples]
+    if weights is not None and len(weights) != len(samples):
+        raise ValueError(f"weights 长度 {len(weights)} 与样本数 {len(samples)} 不一致")
+    data: list[tuple[np.ndarray, int, float]] = []
+    for index, (x, a, _ret) in enumerate(samples):
+        w = 1.0 if weights is None else float(weights[index])
+        if w < 0 or not np.isfinite(w):
+            raise ValueError(f"第 {index} 条样本权重非法: {w}")
+        data.append((np.asarray(x, dtype=np.float64).reshape(-1), int(a), w))
     result = {"loss": [], "accuracy": 0.0, "samples": len(data), "epochs": 0,
               "temperature": float(temperature),
               "labelSmoothing": float(label_smoothing),
-              "teacherEntropy": 0.0}
+              "teacherEntropy": 0.0,
+              "totalWeight": float(sum(w for _x, _a, w in data))}
     if not data:
         return result
 
@@ -1598,24 +1613,26 @@ def behavior_clone(
         for start in range(0, len(data), max(1, int(batch))):
             chunk = [data[i] for i in order[start:start + max(1, int(batch))]]
             grads = {k: np.zeros_like(policy.params[k]) for k in names}
-            for x, action in chunk:
+            for x, action, w in chunk:
                 h, logits = _logits(policy.params, x)
                 p = _softmax(logits)
                 q = targets.get(action)
                 if q is None:
                     q = targets[action] = teacher_target(
                         action, n_actions, temperature, label_smoothing)
-                epoch_loss += float(-np.sum(q * np.log(p + 1e-12)))
-                dlogits = p - q
+                epoch_loss += w * float(-np.sum(q * np.log(p + 1e-12)))
+                dlogits = (p - q) * w
                 if entropy_coef:
                     entropy = _entropy(p)
-                    dlogits = dlogits - entropy_coef * p * (np.log(p + 1e-12) + entropy)
+                    dlogits = dlogits - entropy_coef * w * p * (np.log(p + 1e-12) + entropy)
                 grads["W2"] += np.outer(dlogits, h)
                 grads["b2"] += dlogits
                 dz = (policy.params["W2"].T @ dlogits) * (1.0 - h * h)
                 grads["W1"] += np.outer(dz, x)
                 grads["b1"] += dz
-            n = float(len(chunk))
+            n = float(sum(w for _x, _a, w in chunk))
+            if n <= 0:
+                continue
             step += 1
             bc1 = 1.0 - b1 ** step
             bc2 = 1.0 - b2 ** step
@@ -1624,21 +1641,23 @@ def behavior_clone(
                 m[key] = b1 * m[key] + (1.0 - b1) * g
                 v[key] = b2 * v[key] + (1.0 - b2) * (g * g)
                 policy.params[key] -= lr * (m[key] / bc1) / (np.sqrt(v[key] / bc2) + eps)
-        result["loss"].append(round(epoch_loss / max(1, len(data)), 6))
+        result["loss"].append(round(epoch_loss / max(1e-9, sum(w for _x, _a, w in data)), 6))
         result["epochs"] += 1
 
     correct = 0
+    weight_sum = 0.0
     entropy_sum = 0.0
-    for x, action in data:
+    for x, action, w in data:
         _h, logits = _logits(policy.params, x)
         p = _softmax(logits)
-        correct += int(int(np.argmax(p)) == action)
+        correct += w * float(int(np.argmax(p)) == action)
+        weight_sum += w
         q = targets.get(action)
         if q is None:
             q = targets[action] = teacher_target(action, n_actions, temperature, label_smoothing)
-        entropy_sum += max(0.0, _entropy(q))
-    result["accuracy"] = round(correct / max(1, len(data)), 4)
-    result["teacherEntropy"] = round(entropy_sum / max(1, len(data)), 6)
+        entropy_sum += w * max(0.0, _entropy(q))
+    result["accuracy"] = round(correct / max(1e-9, weight_sum), 4)
+    result["teacherEntropy"] = round(entropy_sum / max(1e-9, weight_sum), 6)
     policy.updates += int(result["epochs"])  # 与 PPO 的更新计数分开记，但保持单调
     return result
 

@@ -240,6 +240,19 @@ class MatchPlanTests(unittest.TestCase):
         with self.assertRaises(BadRequest):
             MatchPlan.from_payload({"player": "Steve", "respawnDelayMs": -1}, self.cfg)
 
+    def test_train_after_forces_recording(self) -> None:
+        plan = MatchPlan.from_payload(
+            {"player": "Steve", "record": False, "trainAfter": True}, self.cfg)
+        self.assertTrue(plan.record, "赛后训练必须录制，否则导入拿到空数据集")
+        self.assertTrue(plan.record_forced)
+        self.assertTrue(plan.to_dict()["recordForced"])
+
+    def test_recording_not_forced_without_train_after(self) -> None:
+        plan = MatchPlan.from_payload({"player": "Steve", "record": False}, self.cfg)
+        self.assertFalse(plan.record)
+        self.assertFalse(plan.record_forced)
+        self.assertFalse(plan.to_dict()["recordForced"])
+
     def test_player_is_required(self) -> None:
         with self.assertRaises(BadRequest):
             MatchPlan.from_payload({}, self.cfg)

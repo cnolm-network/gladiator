@@ -17,7 +17,7 @@ from .items import default_table
 
 # --- 观测 ---------------------------------------------------------------
 
-OBS_DIM = 23
+OBS_DIM = 25
 OBS_FIELDS = (
     "self_health",       # 0  自身血量 / 20
     "self_food",         # 1  饱食度 / 20
@@ -42,10 +42,16 @@ OBS_FIELDS = (
     "opponent_vertical_speed",  # 20 对手竖直速度 vy，clip-5..5 后 /5
     "self_since_attack",      # 21 距上次 attack 动作的秒数，clip0–5 后 /5（初始 5）
     "in_reach",               # 22 双方水平距离 ≤ 自己 reach
+    "self_vertical_speed",    # 23 自身 vy，clip-5..5 后 /5（下落为负 → 跳劈时机）
+    "self_attack_cooldown",   # 24 距上次 attack 还差多少到 0.5s，clip0–0.5 后 /0.5（1=刚打完）
 )
 
 #: 观测裁剪范围：协议字段理论上有限，但 NaN/异常值不应该进网络。
 OBS_CLIP = 5.0
+
+#: 1.8 受击无敌帧长度（秒）：两次有效伤害之间的最小间隔。
+#: ``self_attack_cooldown`` 以它为归一化分母（1 = 刚打完，0 = 可以打）。
+ATTACK_COOLDOWN_S = 0.5
 
 NUM_ACTIONS = 11
 ACTION_NAMES = (
@@ -118,6 +124,8 @@ def encode_observation(
     opponents: "set[str] | None" = None,
     reach: float = 3.99,
     since_attack: float = 5.0,
+    self_velocity_y: float | None = None,
+    attack_cooldown_remaining: float | None = None,
 ) -> np.ndarray:
     """把一条 OBSERVATION 编码成固定长度的 float32 向量。
 
@@ -125,6 +133,10 @@ def encode_observation(
     ``opponents`` 见 :func:`nearest_player`。
     ``reach`` 是**自己**的攻击距离（P1 新增 ``in_reach`` 用）；
     ``since_attack`` 是距上次 attack 动作的秒数（P1 新增 ``self_since_attack`` 用，默认 5）。
+    ``self_velocity_y`` 是自身竖直速度（G-702：跳劈时机的唯一直接信号）；
+    不传则回落读 ``observation.self.velocity.y``（运行时从 mineflayer 补的字段）。
+    ``attack_cooldown_remaining`` 是距上次 attack 还差多少秒到 0.5s 无敌帧结束（G-702）；
+    环境按 ``0.5 - 距上次下发 attack 的秒数`` 算好后传入，不传按 0（= 可以打）。
     """
     self_payload = observation.get("self") or {}
     pos = self_payload.get("pos") or {}
@@ -156,6 +168,19 @@ def encode_observation(
 
     # P1：距上次 attack 的时间（初始 5 秒 = 已经"冷却完毕"）。
     vector[21] = _clamp(_f(since_attack, 5.0), 0.0, 5.0) / 5.0
+
+    # G-702（index 23）：自身竖直速度。跳劈的**唯一**直接时序信号——
+    # 上升段 vy>0，到顶点 vy≈0，下落段 vy<0；「下落中且水平贴身」才是跳劈窗口。
+    # 只在末尾追加，旧 23 维模型右侧补零即可续训。
+    if self_velocity_y is None:
+        self_velocity_y = ((self_payload.get("velocity") or {}).get("y"))
+    vector[23] = _clamp(_f(self_velocity_y), -5.0, 5.0) / 5.0
+
+    # G-702（index 24）：出手冷却还剩多少（1=刚打完，0=可以打）。
+    # 与 index 21 的区别：21 是「过了多久」（0..5s，按 5s 归一），24 是「还差多久到 0.5s」，
+    # 在 0.5s 这个真正决定「这一刀有没有伤害」的尺度上分辨得开。
+    remaining = 0.0 if attack_cooldown_remaining is None else _f(attack_cooldown_remaining)
+    vector[24] = _clamp(remaining, 0.0, ATTACK_COOLDOWN_S) / ATTACK_COOLDOWN_S
 
     if target is not None:
         tpos = target.get("pos") or {}

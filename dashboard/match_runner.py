@@ -392,6 +392,8 @@ class MatchPlan:
     #: 软约束串（运行时参数，默认 "" = 全开）：``cps=12,noRod``。
     #: 只透传给 bot-runtime 的 ``--soft``，**不写进模型 / 模型清单**。
     soft: str = ""
+    #: 本次是否因为「勾了赛后训练」而强制打开录制（前端据此提示用户）。
+    record_forced: bool = False
 
     @classmethod
     def from_payload(cls, payload: dict, cfg: DashboardConfig) -> "MatchPlan":
@@ -417,6 +419,12 @@ class MatchPlan:
         brain = str(brain).strip() if brain not in (None, "") else None
         record = parse_bool(payload.get("record", True), "record")
         train_after = parse_bool(payload.get("trainAfter", False), "trainAfter")
+        # 赛后训练的数据来自录制：没有录制就没有 frames.jsonl，导入只会拿到空数据集。
+        # 这里静默补上录制（而不是 400），并在快照里标注 recordForced，前端负责提示。
+        record_forced = False
+        if train_after and not record:
+            record = True
+            record_forced = True
         respawn_delay_ms = parse_int(payload.get("respawnDelayMs", 800), "重生等待（毫秒）",
                                      minimum=0, maximum=5000)
         # 软约束是运行参数：语法错就在这里 400，别等拉起运行时才炸。
@@ -424,7 +432,8 @@ class MatchPlan:
         return cls(mode=mode, bot=bot, env_port=env_port, player=player,
                    rounds=rounds, round_seconds=float(round_seconds), kit=kit,
                    spawns=spawns, brain=brain, record=record, train_after=train_after,
-                   respawn_delay_ms=respawn_delay_ms, soft=soft)
+                   respawn_delay_ms=respawn_delay_ms, soft=soft,
+                   record_forced=record_forced)
 
     def to_dict(self) -> dict:
         return {
@@ -441,6 +450,7 @@ class MatchPlan:
             "trainAfter": self.train_after,
             "respawnDelayMs": self.respawn_delay_ms,
             "soft": self.soft,
+            "recordForced": self.record_forced,
         }
 
 

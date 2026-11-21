@@ -178,6 +178,10 @@ export function buildObservation(bot, {
   entities.sort((a, b) => a.distance - b.distance);
   const armor = armorOf(bot);
   const held = heldItemOf(bot);
+  // 自身速度：G-702 的 `self_vertical_speed` 直接读它（跳劈时机的唯一直接信号）。
+  // 与 entities[].velocity 同一口径：缺失/非数一律填 0，保证字段恒存在——
+  // 训练侧按名字取值，字段消失会让那一维悄悄变 0（模型以为「一直站着」）。
+  const selfVelocity = self.velocity || { x: 0, y: 0, z: 0 };
   return {
     tick,
     gameId,
@@ -187,6 +191,11 @@ export function buildObservation(bot, {
       yaw: self.yaw || 0,
       pitch: self.pitch || 0,
       onGround: Boolean(self.onGround),
+      velocity: {
+        x: Number(selfVelocity.x) || 0,
+        y: Number(selfVelocity.y) || 0,
+        z: Number(selfVelocity.z) || 0,
+      },
       health: bot.health,
       food: bot.food,
       saturation: bot.foodSaturation,

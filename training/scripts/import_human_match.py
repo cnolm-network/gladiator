@@ -57,6 +57,14 @@ HEAL_MIN = 1.5
 FORWARD_SPEED_MIN = 0.2
 JUMP_DY_MIN = 0.25
 
+#: 择优权重（a 结果过滤 / b 接触窗口）。权重只影响 BC 的交叉熵，不改数据集本身。
+WIN_WEIGHT = 1.0
+LOSS_WEIGHT = 0.3
+DRAW_WEIGHT = 0.5
+CONTACT_RANGE = 5.0
+CONTACT_WEIGHT = 1.0
+FAR_WEIGHT = 0.2
+
 ATTACK = ACTION_NAMES.index("attack")
 APPROACH = ACTION_NAMES.index("approach")
 EAT_GAPPLE = ACTION_NAMES.index("eat_gapple")
@@ -78,7 +86,64 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--min-samples", type=int, default=20, help="少于该样本数时跳过 BC")
     parser.add_argument("--run-dir", default=None, help="BC 产物目录（默认 artifacts/runs/<时间>-human-bc）")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
+    parser.add_argument("--win-weight", type=float, default=WIN_WEIGHT,
+                        help=f"玩家赢的局的样本权重（默认 {WIN_WEIGHT}）")
+    parser.add_argument("--loss-weight", type=float, default=LOSS_WEIGHT,
+                        help=f"玩家输的局的样本权重（默认 {LOSS_WEIGHT}）")
+    parser.add_argument("--draw-weight", type=float, default=DRAW_WEIGHT,
+                        help=f"平局/未知结果的样本权重（默认 {DRAW_WEIGHT}）")
+    parser.add_argument("--contact-range", type=float, default=CONTACT_RANGE,
+                        help=f"交手距离阈值（默认 {CONTACT_RANGE} 格）")
+    parser.add_argument("--far-weight", type=float, default=FAR_WEIGHT,
+                        help=f"超出交手距离的样本权重（默认 {FAR_WEIGHT}）")
+    parser.add_argument("--no-prefer-wins", action="store_true",
+                        help="关闭择优权重（所有样本等权，等价旧行为）")
     return parser.parse_args(argv)
+
+
+def load_round_winners(record_dir: Path) -> dict[int, str]:
+    """读 ``summary.json`` 的每局胜者；缺文件时返回空字典（全部按未知处理）。"""
+    path = record_dir / "summary.json"
+    if not path.is_file():
+        return {}
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    winners: dict[int, str] = {}
+    for item in summary.get("rounds") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            number = int(item.get("round"))
+        except (TypeError, ValueError):
+            continue
+        winners[number] = str(item.get("winner") or "unknown")
+    return winners
+
+
+def round_weight(winner: str, *, win_weight: float, loss_weight: float,
+                 draw_weight: float) -> float:
+    """(a) 结果过滤：赢的局满权重、输的局降权、平局居中。"""
+    if winner == "player":
+        return float(win_weight)
+    if winner == "bot":
+        return float(loss_weight)
+    return float(draw_weight)
+
+
+def contact_window_weight(frame: dict, *, player_name: str, bot_name: str,
+                   contact_range: float, contact_weight: float,
+                   far_weight: float) -> float:
+    """(b) 接触窗口：双方水平距离在 ``contact_range`` 内才按满权重学。"""
+    player = frame.get("player") or {}
+    bot = frame.get("bot") or {}
+    if not player or not bot:
+        return float(far_weight)
+    dx = _num(player.get("x")) - _num(bot.get("x"))
+    dz = _num(player.get("z")) - _num(bot.get("z"))
+    distance = math.hypot(dx, dz)
+    return float(contact_weight if distance <= contact_range else far_weight)
 
 
 # --- 读取与标签 -------------------------------------------------------------
@@ -216,12 +281,23 @@ def _observation(frame: dict, prev: Optional[dict], player_name: str, bot_name: 
 
 
 def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
-                  round_seconds: float = 120.0, reach: float = 3.99) -> dict:
-    """返回 ``{"obs": (N,23), "actions": (N,), "times": (N,), "rounds": (N,)}``。"""
+                  round_seconds: float = 120.0, reach: float = 3.99,
+                  winners: Optional[dict[int, str]] = None,
+                  win_weight: float = WIN_WEIGHT, loss_weight: float = LOSS_WEIGHT,
+                  draw_weight: float = DRAW_WEIGHT, contact_range: float = CONTACT_RANGE,
+                  contact_weight: float = CONTACT_WEIGHT,
+                  far_weight: float = FAR_WEIGHT) -> dict:
+    """返回 ``{"obs","actions","times","rounds","weights"}``（obs 为 23 维）。
+
+    ``weights`` 是 (a)(b) 两步择优的结果：``局结果权重 × 接触窗口权重``。
+    全部参数取默认值时，赢局接触帧为 1.0、输局远处帧为 0.06，权重并未丢弃任何样本。
+    """
     observations: list[np.ndarray] = []
     actions: list[int] = []
     times: list[float] = []
     rounds: list[int] = []
+    weights: list[float] = []
+    winners = winners or {}
     since_attack = 5.0
     previous: Optional[dict] = None
     for frame in frames:
@@ -239,7 +315,15 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
                                          step_fraction, since_attack, reach))
         actions.append(int(action))
         times.append(t)
-        rounds.append(int(_num(frame.get("round"), 1)))
+        round_number = int(_num(frame.get("round"), 1))
+        rounds.append(round_number)
+        weights.append(
+            round_weight(winners.get(round_number, "unknown"),
+                         win_weight=win_weight, loss_weight=loss_weight,
+                         draw_weight=draw_weight)
+            * contact_window_weight(frame, player_name=player_name, bot_name=bot_name,
+                             contact_range=contact_range,
+                             contact_weight=contact_weight, far_weight=far_weight))
         if _num(player.get("health"), 20.0) <= 0:
             since_attack = 5.0
         previous = frame
@@ -250,6 +334,7 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
         "actions": np.asarray(actions, dtype=np.int64),
         "times": np.asarray(times, dtype=np.float32),
         "rounds": np.asarray(rounds, dtype=np.int64),
+        "weights": np.asarray(weights, dtype=np.float32),
     }
 
 
@@ -264,6 +349,10 @@ def run_bc(dataset: dict, *, base_model: Optional[str], epochs: int,
 
     samples = [(dataset["obs"][i], int(dataset["actions"][i]), 0.0)
                for i in range(len(dataset["actions"]))]
+    weight_list = dataset.get("weights")
+    if weight_list is not None and len(weight_list) != len(samples):
+        return {"skipped": True,
+                "reason": f"权重长度 {len(weight_list)} 与样本数 {len(samples)} 不一致"}
     if len(samples) < int(min_samples):
         return {"skipped": True, "reason": f"样本太少（{len(samples)} < {min_samples}）"}
 
@@ -275,7 +364,8 @@ def run_bc(dataset: dict, *, base_model: Optional[str], epochs: int,
     else:
         policy = Policy(obs_dim=OBS_DIM, n_actions=len(ACTION_NAMES), hidden=64, seed=seed)
 
-    result = behavior_clone(policy, samples, epochs=max(1, int(epochs)), seed=seed)
+    result = behavior_clone(policy, samples, epochs=max(1, int(epochs)), seed=seed,
+                            weights=None if weight_list is None else list(weight_list))
     target = run_dir or (DEFAULT_ARTIFACTS / "runs" /
                          f"{time.strftime('%Y%m%d-%H%M')}-human-bc-{meta.get('player', 'player')}")
     target = Path(target)
@@ -322,8 +412,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     bot_name = str(plan.get("bot") or "bot")
     round_seconds = float(plan.get("roundSeconds") or 120)
 
-    dataset = build_dataset(frames, player_name=player_name, bot_name=bot_name,
-                            round_seconds=round_seconds)
+    dataset = build_dataset(
+        frames, player_name=player_name, bot_name=bot_name, round_seconds=round_seconds,
+        winners=load_round_winners(record_dir),
+        win_weight=args.win_weight, loss_weight=args.loss_weight,
+        draw_weight=args.draw_weight, contact_range=args.contact_range,
+        contact_weight=1.0, far_weight=args.far_weight,
+    )
+    if args.no_prefer_wins:
+        dataset["weights"] = np.ones_like(dataset["weights"])
     out_path = Path(args.out) if args.out else record_dir / "dataset.npz"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     counts = {ACTION_NAMES[index]: int((dataset["actions"] == index).sum())
@@ -334,6 +431,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         actions=dataset["actions"],
         times=dataset["times"],
         rounds=dataset["rounds"],
+        weights=dataset["weights"],
         meta=np.array(json.dumps({
             "schema": "gladiator.human-match-dataset/v1",
             "recordDir": str(record_dir),
@@ -344,6 +442,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             "obsDim": OBS_DIM,
             "actionNames": list(ACTION_NAMES),
             "labelRules": "见 import_human_match.py 模块 docstring",
+            "preferWins": not args.no_prefer_wins,
+            "weightRules": {
+                "win": args.win_weight, "loss": args.loss_weight,
+                "draw": args.draw_weight, "contactRange": args.contact_range,
+                "contact": 1.0, "far": args.far_weight,
+            },
         }, ensure_ascii=False)),
     )
 

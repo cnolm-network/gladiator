@@ -1,5 +1,5 @@
 /**
- * 23 维特征编码 + 离散动作解码（`spaces.py` 的 JS 镜像）。
+ * 25 维特征编码 + 离散动作解码（`spaces.py` 的 JS 镜像）。
  *
  * <p>**必须与 `training/gladiator_env/spaces.py::encode_observation` 逐项一致**：
  * 字段顺序、默认值、归一化尺度、clip 全部照抄。任何一侧改了观测定义，另一侧必须同步，
@@ -11,11 +11,14 @@
  * 运行时需要它才能在本地闭环决策，而不依赖 Layer 3 下发动作。
  */
 
-export const OBS_DIM = 23;
+export const OBS_DIM = 25;
 export const NUM_ACTIONS = 11;
 
-/** 观测裁剪范围（spaces.py:46 OBS_CLIP）。 */
+/** 观测裁剪范围（spaces.py:51 OBS_CLIP）。 */
 export const OBS_CLIP = 5.0;
+
+/** 1.8 受击无敌帧（秒），`self_attack_cooldown` 的归一化分母（spaces.py:56）。 */
+export const ATTACK_COOLDOWN_S = 0.5;
 
 /** 复合动作的移动时长（spaces.py:64 MOVE_MS）。 */
 export const MOVE_MS = 180;
@@ -48,6 +51,8 @@ export const OBS_FIELDS_JS = Object.freeze([
   'opponent_vertical_speed',// 20
   'self_since_attack',      // 21
   'in_reach',               // 22
+  'self_vertical_speed',    // 23 G-702：自身 vy，clip(-5,5) 后 /5
+  'self_attack_cooldown',   // 24 G-702：距上次 attack 还差多少到 0.5s，clip(0,0.5) 后 /0.5
 ]);
 
 /** 动作名（spaces.py:49 ACTION_NAMES），下标即离散动作编号。 */
@@ -172,17 +177,19 @@ export function entityHealth(entity) {
 }
 
 /**
- * 编码一帧观测为 23 维特征（`spaces.py:111 encode_observation`）。
+ * 编码一帧观测为 25 维特征（`spaces.py:113 encode_observation`）。
  *
  * @param {object} observation `buildObservation()` 的输出
  * @param {object} options
  * @param {string} options.username       自己
- * @param {number} [options.stepFraction] 当前步数 / 最大步数（spaces.py:114）
- * @param {number|null} [options.opponentHealth] 对手血量（优先于实体字段，spaces.py:114）
+ * @param {number} [options.stepFraction] 当前步数 / 最大步数（spaces.py:116）
+ * @param {number|null} [options.opponentHealth] 对手血量（优先于实体字段，spaces.py:116）
  * @param {Iterable<string>|null} [options.allowed] 只把这些玩家当目标
  * @param {number} [options.reach]        自己的攻击距离（默认 3.99）
  * @param {number} [options.sinceAttack]  距上次 attack 的秒数（默认 5）
- * @returns {Float64Array} 长度 23
+ * @param {number|null} [options.selfVelocityY] 自身 vy（G-702；缺省回落读 `observation.self.velocity.y`）
+ * @param {number|null} [options.attackCooldownRemaining] 距冷却结束还有多少秒（G-702；缺省 0）
+ * @returns {Float64Array} 长度 25
  *
  * <p>返回 float64（numpy 那边是 float32，逐项差 ≤1e-7，属 float32 舍入；
  * 策略前向一律按 float64 算，所以对最终概率无可见影响）。
@@ -194,6 +201,8 @@ export function encodeObservation(observation, {
   allowed = null,
   reach = 3.99,
   sinceAttack = 5.0,
+  selfVelocityY = null,
+  attackCooldownRemaining = null,
 } = {}) {
   const selfPayload = (observation && observation.self) || {};
   const pos = selfPayload.pos || {};
@@ -228,7 +237,18 @@ export function encodeObservation(observation, {
     }
   }
   vector[18] = clamp(gapples / 5.0, 0.0, 1.0);               // spaces.py:153
-  vector[21] = clamp(num(sinceAttack, 5.0), 0.0, 5.0) / 5.0; // spaces.py:156
+  vector[21] = clamp(num(sinceAttack, 5.0), 0.0, 5.0) / 5.0; // spaces.py:170
+
+  // G-702（index 23/24）：跳劈时序 + 出手冷却。与 spaces.py 同序同尺度。
+  const selfVelocity = selfPayload.velocity || {};
+  const vy = selfVelocityY !== null && selfVelocityY !== undefined
+    ? num(selfVelocityY)
+    : num(selfVelocity.y);
+  vector[23] = clamp(vy, -5.0, 5.0) / 5.0;                   // spaces.py:177
+  const cooldown = attackCooldownRemaining === null || attackCooldownRemaining === undefined
+    ? 0.0
+    : num(attackCooldownRemaining);
+  vector[24] = clamp(cooldown, 0.0, ATTACK_COOLDOWN_S) / ATTACK_COOLDOWN_S; // spaces.py:183
 
   if (target !== null) {
     const tpos = target.pos || {};
@@ -257,7 +277,7 @@ export function encodeObservation(observation, {
   }
 
   for (let index = 0; index < OBS_DIM; index += 1) {
-    vector[index] = clamp(vector[index], -OBS_CLIP, OBS_CLIP); // spaces.py:185
+    vector[index] = clamp(vector[index], -OBS_CLIP, OBS_CLIP); // spaces.py:212
   }
   return vector;
 }

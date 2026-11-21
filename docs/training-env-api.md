@@ -159,7 +159,10 @@ GladiatorEnv(
 所以进服旁观的人、路过的玩家都不会被当成目标，也不会被 Bot 追打。
 观战方法见 [`spectating.md`](spectating.md)。
 
-#### 观测（19 维，`float32`，裁剪到 ±5）
+#### 观测（25 维，`float32`，裁剪到 ±5）
+
+> 维度演进：19 → 23（P1，加对手速度/出手间隔/能否打中）→ **25**（G-702，末尾追加自身竖直速度与出手冷却）。
+> 新字段只在**末尾追加**，旧模型的 `W1` 右侧补零即可续训（`adopt_weights`）。
 
 | # | 字段 | 说明 |
 |---|---|---|
@@ -168,7 +171,7 @@ GladiatorEnv(
 | 2 | `self_saturation` | 饱和度 |
 | 3 | `self_on_ground` | 是否着地 |
 | 4–5 | `self_yaw_sin/cos` | 朝向（弧度编码，避免 ±π 跳变） |
-| 6 | `self_pitch` | 俯仰角（度） |
+| 6 | `self_pitch` | 俯仰角（弧度 / (π/2)） |
 | 7–9 | `target_dx/dy/dz` | 最近对手相对位置（格） |
 | 10 | `target_distance` | 到最近对手的距离 |
 | 11 | `target_health` | 对手血量（来自对手自己的观测，`entities` 不含 health） |
@@ -179,8 +182,15 @@ GladiatorEnv(
 | 16 | `self_held_durability` | 手持物品剩余耐久比例（无耐久=1，`G-608`） |
 | 17 | `self_armor_remaining` | 四件护甲平均剩余耐久比例（无甲=0，`G-608`） |
 | 18 | `self_gapples` | 背包金苹果数 / 5（`G-608`，训练“什么时候吃”） |
+| 19 | `opponent_speed` | 对手水平速度 √(vx²+vz²)，clip(0,10) / 10 |
+| 20 | `opponent_vertical_speed` | 对手 vy，clip(−5,5) / 5 |
+| 21 | `self_since_attack` | 距上次下发 attack 的秒数，clip(0,5) / 5（初始 5） |
+| 22 | `in_reach` | 双方水平距离 ≤ 自己 `reach` |
+| 23 | `self_vertical_speed` | **自身** vy，clip(−5,5) / 5（下落为负 = 跳劈窗口，`G-702`） |
+| 24 | `self_attack_cooldown` | 距上次 attack 还差多少到 0.5s，clip(0,0.5) / 0.5（1=刚打完、0=可以打，`G-702`） |
 
 缺失字段有默认值；`NaN`/`inf` 会被替换成 0，`G-402` 验收即此。
+第 23/24 维的语义与「为什么加」见 [`observation.md`](observation.md) §4.3。
 
 #### 动作（11 个离散动作，`G-403` / `G-607`）
 

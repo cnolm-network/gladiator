@@ -30,9 +30,10 @@ class P1ObservationTest(unittest.TestCase):
             raw["entities"][0]["velocity"] = velocity
         return raw
 
-    def test_obs_dim_is_23(self):
-        self.assertEqual(OBS_DIM, 23)
-        self.assertEqual(len(__import__("gladiator_env.spaces", fromlist=["OBS_FIELDS"]).OBS_FIELDS), 23)
+    def test_obs_dim_is_25(self):
+        # G-702：23 → 25，两维只在末尾追加（0–22 不许动）。
+        self.assertEqual(OBS_DIM, 25)
+        self.assertEqual(len(__import__("gladiator_env.spaces", fromlist=["OBS_FIELDS"]).OBS_FIELDS), 25)
 
     def test_opponent_speed_components(self):
         vector = encode_observation(self._obs(2.0, {"x": 3.0, "y": -2.5, "z": 4.0}), "Glad_Bot_1")

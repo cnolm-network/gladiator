@@ -1,5 +1,5 @@
 /**
- * `features.js` 单测：23 维编码逐项对齐 `spaces.py`，以及动作解码。
+ * `features.js` 单测：25 维编码逐项对齐 `spaces.py`，以及动作解码。
  */
 
 import assert from 'node:assert/strict';
@@ -70,23 +70,27 @@ function baseObservation(overrides = {}) {
 }
 
 test('观测字段与 spaces.py 同序同长度', () => {
-  assert.equal(OBS_DIM, 23);
-  assert.equal(OBS_FIELDS_JS.length, 23);
+  assert.equal(OBS_DIM, 25);
+  assert.equal(OBS_FIELDS_JS.length, 25);
   assert.equal(OBS_FIELDS_JS[0], 'self_health');
   assert.equal(OBS_FIELDS_JS[18], 'self_gapples');
   assert.equal(OBS_FIELDS_JS[22], 'in_reach');
+  // G-702：只在末尾追加，0–22 一个都不许动
+  assert.equal(OBS_FIELDS_JS[23], 'self_vertical_speed');
+  assert.equal(OBS_FIELDS_JS[24], 'self_attack_cooldown');
   assert.equal(ACTION_NAMES.length, 11);
   assert.equal(ACTION_NAMES[2], 'attack');
 });
 
-test('编码 23 维：逐项对齐 spaces.encode_observation', () => {
+test('编码 25 维：逐项对齐 spaces.encode_observation', () => {
   const vector = encodeObservation(baseObservation(), {
     username: 'Glad_Bot_1',
     stepFraction: 0.5,
     reach: 3.99,
     sinceAttack: 2.0,
+    attackCooldownRemaining: 0.25,
   });
-  assert.equal(vector.length, 23);
+  assert.equal(vector.length, 25);
   const near = (index, expected) => assert.ok(
     Math.abs(vector[index] - expected) < 1e-9,
     `第 ${index} 维 ${vector[index]} != ${expected}`,
@@ -107,6 +111,29 @@ test('编码 23 维：逐项对齐 spaces.encode_observation', () => {
   near(17, 0.75);                             // armorRemaining
   near(18, 1.0);                              // (3+4)/5 = 1.4 → clip 1
   near(21, 2.0 / 5.0);                        // since_attack
+  near(23, 0.0);                              // self_vertical_speed（本帧 self 无 velocity → 0）
+  near(24, 0.25 / 0.5);                       // self_attack_cooldown
+});
+
+test('G-702：自身 vy 优先取 options，缺省回落 self.velocity.y 并裁剪', () => {
+  const observation = baseObservation();
+  observation.self.velocity = { x: 0.1, y: -1.2, z: 0.3 };
+
+  const fromPayload = encodeObservation(observation, { username: 'Glad_Bot_1' });
+  assert.ok(Math.abs(fromPayload[23] - (-1.2 / 5.0)) < 1e-12);
+
+  const fromOption = encodeObservation(observation, { username: 'Glad_Bot_1', selfVelocityY: 3.0 });
+  assert.ok(Math.abs(fromOption[23] - 0.6) < 1e-12);
+
+  // clip：自由下落速度会超过 5，归一化后最多 1
+  const clipped = encodeObservation(observation, { username: 'Glad_Bot_1', selfVelocityY: -40 });
+  assert.equal(clipped[23], -1.0);
+
+  // 冷却裁剪：负值→0（可打），超 0.5→1（刚打完）
+  assert.equal(encodeObservation(observation, { username: 'Glad_Bot_1', attackCooldownRemaining: -1 })[24], 0.0);
+  assert.equal(encodeObservation(observation, { username: 'Glad_Bot_1', attackCooldownRemaining: 9 })[24], 1.0);
+  // 不传 = 「可以打」
+  assert.equal(encodeObservation(observation, { username: 'Glad_Bot_1' })[24], 0.0);
 });
 
 test('最近的非自己玩家胜出，Bot 也在候选里（由 allowed 决定）', () => {

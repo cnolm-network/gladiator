@@ -30,6 +30,7 @@ from . import reward_presets
 from .shaping import ShapingReward, ShapingWeights
 from .spaces import (
     ACTION_NAMES,
+    ATTACK_COOLDOWN_S,
     MULTI_DISCRETE_V2,
     MOVE_MS,
     NUM_ACTIONS,
@@ -1649,6 +1650,13 @@ class GladiatorEnv(gym.Env):
             opponent_health = self_health(self._raw[opponent]) if opponent is not None and opponent < len(self._raw) else None
             last_attack = self._last_attack_at.get(bot.username)
             since_attack = 5.0 if last_attack is None else (time.monotonic() - last_attack)
+            raw = self._raw[index] if index < len(self._raw) else {}
+            # G-702：自身 vy 直接取协议里 self.velocity.y（运行时由 mineflayer 的
+            # bot.entity.velocity 补上）。缺字段按 0，等价于旧模型的「不知道」。
+            self_velocity_y = ((raw.get("self") or {}).get("velocity") or {}).get("y")
+            # G-702：出手冷却剩多少秒到 0.5s。与 index 21 用**同一个** since_attack，
+            # 避免两个时钟（monotonic 与 tick 计数）在掉帧时给出互相矛盾的读数。
+            cooldown_remaining = max(0.0, ATTACK_COOLDOWN_S - since_attack)
             encoded[self._key(index)] = encode_observation(
                 self._raw[index],
                 bot.username,
@@ -1657,6 +1665,8 @@ class GladiatorEnv(gym.Env):
                 opponents=self._opponent_names(),
                 reach=float(bot.reach),
                 since_attack=since_attack,
+                self_velocity_y=self_velocity_y,
+                attack_cooldown_remaining=cooldown_remaining,
             )
         return encoded
 
