@@ -20,6 +20,10 @@
 - **v3** ``heuristic_action_v3``：把「攻击冷却」当资源，用死时间换位置与暴击（规则表见
   :func:`heuristic_action_v3` 的 docstring）。带跨帧记忆（:class:`TeacherV3State`），
   用 ``collect_demos(..., teacher_version="v3")`` 或 ``scripts/teacher_eval.py --teacher v3`` 选择。
+- **v4** ``heuristic_action_v4``：跑在 **v2 动作空间（10 头）** 上，按
+  ``docs/knowledge/pvp-1.8-mechanics.md`` §3 的招式表实现 wtap / block_hit / spacing /
+  strafe / jump_crit 的**组合**（有剑走 block_hit、无剑走 wtap，二者互斥）。
+  它返回 10 头数组而不是动作编号，见 :class:`TeacherV4`。
 
 ``meta`` 是 v2/v3 的「观测之外的状态」入口（鱼竿是否可用、对手多久前攻击过、一帧多少秒、
 对手是否正在挥刀），缺省值都能跑，所以离线采集不需要额外接线。
@@ -28,6 +32,20 @@
 1.8 的受击无敌帧是 500ms，而控制频率是 20Hz，于是每 10 帧里最多只有 1 帧真的能造成伤害。
 v2 把这 9 帧空转成了「同一个 attack 再发一次」，v3 把它们换成走位、跳劈准备与格挡，
 因此单位时间的**有效伤害**更高（暴击 +50%），而不是靠出手率堆出来的。
+
+为什么需要 v2 的 BC（2026-11-22，G-710）：老师 v4 跑在 **v2 十头动作空间**上，它的标签
+不是一个动作编号，而是「每个头选哪一档」。于是 BC 的数据契约按动作空间分两种：
+
+========================  ==============================  ====================
+动作空间                 标签                            第三字段
+========================  ==============================  ====================
+v1（``Discrete``）       动作编号 ``int``                该局折扣回报（不使用）
+v2（``MultiDiscrete``）  10 头下标元组（:data:`V2_HEADS`）  样本权重（默认 1.0）
+========================  ==============================  ====================
+
+损失也随之变化：v1 是单头交叉熵；v2 是**逐头交叉熵按头平均**（每个头权重相同），
+返回里多一个 ``perHeadAccuracy``。``intent`` ↔ 下标元组的翻译只发生在
+:func:`intent_to_tuple` 一处，避免「老师说的意图」和「BC 训练的下标」各写一遍。
 """
 
 from __future__ import annotations
@@ -37,13 +55,114 @@ from typing import Any, Callable, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
 
-from gladiator_env.spaces import ACTION_NAMES, OBS_DIM, OBS_FIELDS
+from gladiator_env.spaces import (
+    ACTION_HEADS_V2, ACTION_NAMES, LOOK_PITCH_V2, LOOK_YAW_V2, MULTI_DISCRETE_V2,
+    MOVE_VALUES_V2, OBS_DIM, OBS_FIELDS, SPRINT_RESET_VALUES_V2, USE_VALUES_V2,
+    decode_intent,
+)
 
 #: 默认老师版本（v1 = 规则老师，行为与 P1.5 完全一致）。
 TEACHER_VERSION = "v1"
 #: 可选老师版本。v2 在 v1 之上加间距/鱼竿/金苹果/暴击跳/w-tap/格挡六条规则；
-#: v3 把攻击冷却当资源（死时间走位/跳劈/格挡），见 ``heuristic_action_v3``。
-SUPPORTED_TEACHER_VERSIONS: tuple[str, ...] = ("v1", "v2", "v3")
+#: v3 把攻击冷却当资源（死时间走位/跳劈/格挡），见 ``heuristic_action_v3``；
+#: v4 用 v2 动作空间（10 头）实现 1.8 招式的**组合**（wtap / block_hit / spacing /
+#: strafe / jump_crit），见 ``heuristic_action_v4``。
+SUPPORTED_TEACHER_VERSIONS: tuple[str, ...] = ("v1", "v2", "v3", "v4")
+
+#: v2 十头的名字，顺序与 ``ACTION_HEADS_V2`` 的声明顺序逐位一致
+#: （``move, look_yaw, look_pitch, attack, use, jump, sneak, sprint, slot, sprint_reset``）。
+#: 蒸馏样本里的「标签」就是这个顺序的下标元组，改顺序等于作废旧数据集。
+V2_HEADS: tuple[str, ...] = tuple(ACTION_HEADS_V2)
+
+
+def _v2_index(head: str, value: Any, values: Sequence[Any]) -> int:
+    """把 intent 里的一档取值翻成头下标（字符串按等值、浮点按 1e-6 容差）。
+
+    ``int`` 输入按「已经是下标」处理并校验范围——日志里偶尔会有
+    「人写死的下标」与「语义值」混用，两种都收但越界立刻报错。
+    """
+    if isinstance(value, bool):
+        # bool 是 int 的子类，但 head 表里没有 True/False（二值头走 _v2_binary）。
+        raise ValueError(f"intent 的 {head} 不接受布尔值: {value!r}")
+    if value is None:
+        for index, candidate in enumerate(values):
+            if candidate is None:
+                return index
+        raise ValueError(f"intent 的 {head} 不接受 None（合法 {tuple(values)!r}）")
+    if isinstance(value, (int, np.integer)):
+        index = int(value)
+        if not 0 <= index < len(values):
+            raise ValueError(f"intent 的 {head} 下标越界: {index}（合法 0..{len(values) - 1}）")
+        return index
+    for index, candidate in enumerate(values):
+        if isinstance(candidate, str) or isinstance(value, str):
+            if str(candidate) == str(value):
+                return index
+            continue
+        try:
+            if abs(float(candidate) - float(value)) <= 1e-6:
+                return index
+        except (TypeError, ValueError):
+            continue
+    raise ValueError(f"intent 的 {head} 取值 {value!r} 不在 {tuple(values)!r} 里")
+
+
+def _v2_binary(head: str, value: Any) -> int:
+    """二值头（attack/jump/sneak/sprint）：``True/False`` 或 ``0/1`` → 下标。"""
+    if isinstance(value, (bool, np.bool_)):
+        return 1 if bool(value) else 0
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"intent 的 {head} 必须是布尔或 0/1，收到 {value!r}") from exc
+    if number not in (0, 1):
+        raise ValueError(f"intent 的 {head} 只能是 0/1，收到 {number}")
+    return number
+
+
+def intent_to_tuple(intent: Mapping[str, Any] | None) -> tuple[int, ...]:
+    """把 teacher 的 `intent` 字典翻成 **10 个头的下标元组**（顺序 = :data:`V2_HEADS`）。
+
+    两种输入都收：
+
+    - ``{"intent": {...}, "reason": ...}``：老师 v4 写回 ``meta`` 的形态（也兼容日志/JSON）；
+    - 直接是 ``decode_intent`` 的输出（``{"move": ..., "look": {...}, "attack": ...}``）。
+
+    缺省值与 ``decode_intent`` 的对称规则一致：``look`` 缺省为不转视角、``use`` 缺省
+    ``None``、``sprintReset`` 缺省 ``none``、``slot`` 缺省 0。**越界/未知取值一律抛
+    ``ValueError``**，不做「悄悄退化成 idle」的兜底——蒸馏标签错了会污染整个策略头。
+
+    为什么需要它：BC 的标签必须是「每头一个下标」，而老师与日志说的是**语义**
+    （``move="forward"`` / ``attack=True``）。这个函数就是两者之间唯一的翻译点。
+    """
+    data: Any = intent
+    if isinstance(data, Mapping) and "intent" in data:
+        inner = data.get("intent")
+        if isinstance(inner, Mapping):
+            data = inner
+    if not isinstance(data, Mapping):
+        raise ValueError(f"intent_to_tuple 需要 dict，收到 {type(intent).__name__}")
+    look = data.get("look")
+    if look is None:
+        look = {}
+    if not isinstance(look, Mapping):
+        raise ValueError(f"intent 的 look 必须是 dict，收到 {look!r}")
+    picked: dict[str, int] = {
+        "move": _v2_index("move", data.get("move", "idle"), MOVE_VALUES_V2),
+        "look_yaw": _v2_index("look_yaw", look.get("dyaw", 0.0), LOOK_YAW_V2),
+        "look_pitch": _v2_index("look_pitch", look.get("dpitch", 0.0), LOOK_PITCH_V2),
+        "attack": _v2_binary("attack", data.get("attack", False)),
+        "use": _v2_index("use", data.get("use"), USE_VALUES_V2),
+        "jump": _v2_binary("jump", data.get("jump", False)),
+        "sneak": _v2_binary("sneak", data.get("sneak", False)),
+        "sprint": _v2_binary("sprint", data.get("sprint", False)),
+        "slot": _v2_index("slot", data.get("slot", 0),
+                          tuple(range(ACTION_HEADS_V2["slot"]))),
+        "sprint_reset": _v2_index("sprint_reset", data.get("sprintReset", "none"),
+                                  SPRINT_RESET_VALUES_V2),
+    }
+    return tuple(picked[head] for head in V2_HEADS)
+
 
 # --- 观测下标：全部从 OBS_FIELDS 查，不写死数字 ---------------------------------
 
@@ -67,6 +186,9 @@ IDX_IN_REACH = field_index("in_reach")
 # v3 额外要用的字段（仍然按名字查，观测定义变了会立刻报错而不是静默错位）。
 IDX_OPPONENT_SPEED = field_index("opponent_speed")
 IDX_OPPONENT_VY = field_index("opponent_vertical_speed")
+# v4 额外要用的字段：自身竖直速度（跳劈时机）与出手冷却（0=可打，1=刚打完）。
+IDX_SELF_VY = field_index("self_vertical_speed")
+IDX_ATTACK_COOLDOWN = field_index("self_attack_cooldown")
 
 ACTION_IDLE = ACTION_NAMES.index("idle")
 ACTION_APPROACH = ACTION_NAMES.index("approach")
@@ -1379,11 +1501,453 @@ class TeacherV3:
         return action
 
 
+# ============================================================================
+# 老师 v4：1.8 招式的**组合**（v2 动作空间 / 10 头）
+# ============================================================================
+#
+# 为什么需要 v4（``docs/knowledge/pvp-1.8-mechanics.md`` §4 第 1 条）：
+# v1–v3 都跑在 v1 的 11 个宏动作上，那里**没有「重置疾跑」这个维度**——``approach``
+# 的疾跑由 ``decode_action`` 按距离决定，「松一帧 W」根本无法表达。于是：
+#   - teacher 演示不了 wtap，BC 学不到；
+#   - 策略也就永远学不到「命中帧非疾跑」这件事（1.8 的 KB 大小完全由它决定）。
+#
+# G-707 在 v2 动作空间里加了 ``sprint_reset`` 头（none / release_w / block_hit），
+# v4 就是**唯一**能用它的老师：它输出 10 头动作，而不是 v1 的动作编号。
+#
+# 两条互斥的对刀路线（视频原话：有刀用防砍、无刀用 wtap，**不要同时用**）：
+#   - 有剑 → ``block_hit``（按住 W + 举剑 ≥300ms，兼吃 0.5× 伤害）；
+#   - 无剑 → ``release_w`` 的两种用法：命中后 ``wtap_keep_combo``（让对手持续吃大 KB）、
+#     受击后 ``wtap_reduce_kb``（减小自己的 KB，快速回到攻击距离）；**永不按右键**。
+# 这条分叉不是「优化」，是机制：没剑时右键只会在服务端拿到 ``ITEM_MISSING``。
+#
+# 观测里**没有手持物品字段**（25 维里只有耐久，区分不出剑和苹果），所以「有没有剑」
+# 必须由 ``meta["has_sword"]`` 给出；缺省 ``True``（训练服初始套装必带剑）。
+# 真机可由 bot-runtime 的 ``heldItem.name`` 直接喂进来。
+#
+# 与 v3 的关系：v4 **不**复用 v3 的「冷却预算」逻辑，而是按 KB §3 的招式表逐条实现
+# （``jump_crit`` 只看 ``vy<0`` 这个真信号、``spacing_hold`` 用 2.6–3.3 的带）。
+# 两者可以各自独立跑真机做对照（``teacher_eval.py --teacher v3/v4``）。
+
+#: 目标带（格）。§3 ``spacing_hold``：太近 S、太远 W。
+TEACHER_V4_SPACING_MIN = 2.6
+TEACHER_V4_SPACING_MAX = 3.3
+#: 有剑时用 ``block_hit`` 的上界（格）。§3 ``block_hit``：双方距离 ≤3.0 且自己有剑。
+TEACHER_V4_BLOCK_DISTANCE = 3.0
+#: ``jump_crit`` 的距离上界（格）。§3：距离 ≤2.4 且冷却已好。
+TEACHER_V4_CRIT_MAX_DISTANCE = 2.4
+#: 贴脸下界：太近（<1.4 格）时起跳会跳过对手，先退一步。
+TEACHER_V4_CRIT_MIN_DISTANCE = 1.4
+#: 「起跳预备」的最小间隔（秒）：只在着地且冷却已好时跳一次，防止「一直跳、一直等不到下落」。
+TEACHER_V4_JUMP_ARM_COOLDOWN = 1.0
+#: 接战前的横移区间（格）。§3 ``strafe_poke``：距离 4–6 格。
+TEACHER_V4_STRAFE_POKE_MIN = 4.0
+TEACHER_V4_STRAFE_POKE_MAX = 6.0
+#: 横移换向区间（秒）。``strafe_poke`` 每 0.4–0.8s 换向（幅度大、频率低）。
+TEACHER_V4_STRAFE_POKE_SPAN = (0.4, 0.8)
+#: ``strafe_combo`` 的换向区间（秒）：幅度小、频率高（KB §3 原话）。
+TEACHER_V4_STRAFE_COMBO_SPAN = (0.2, 0.4)
+#: ``strafe_poke`` 期间每 N 帧插一帧纯前进。
+#:
+#: v2 的 ``move`` 是**单方向**的（forward / left / right 互斥），表达不了人类那种
+#: 「按住 W 同时 A/D 横移」。纯横移的后果是实测出来的：4–6 格带里连站 58/103 帧
+#: （2026-11-22 首轮冒烟），双方都不进带，等于把接战无限推迟。
+#: 所以这里按「2 帧横移 + 1 帧前进」的节拍逼近：既保住了晃准星的意图，
+#: 又保证每 0.6s 有一步是在缩短距离。``0`` 表示关闭（纯横移，用于对照实验）。
+TEACHER_V4_POKE_PUSH_EVERY = 3
+#: 攻击冷却（秒）。1.8 受击无敌帧 500ms。
+TEACHER_V4_ATTACK_COOLDOWN = 0.5
+#: 判定「掉血 = 一次命中 / 一次受击」的最小血量差（点）。
+TEACHER_V4_HIT_EPS = 0.4
+#: 一帧多少秒（缺省值；``meta["frame_seconds"]`` 可覆盖，真机实测约 0.2）。
+TEACHER_V4_FRAME_SECONDS = 0.2
+#: 热键栏槽位：训练套件的剑在第 0 格，因此固定 ``slot=0`` 等价于「不换槽」。
+TEACHER_V4_SLOT = 0
+
+#: 各头在 10 头向量里的下标（按 ``ACTION_HEADS_V2`` 的声明顺序查，不写死数字）。
+_V4_HEADS = list(ACTION_HEADS_V2)
+_V4_IDX = {name: index for index, name in enumerate(_V4_HEADS)}
+#: ``look`` 的「不转」取值下标（0.0 度那一档）：老师不做瞄准，朝向交给运行时/策略。
+_V4_LOOK_NEUTRAL = (LOOK_YAW_V2.index(0.0), LOOK_PITCH_V2.index(0.0))
+
+#: 编译期自检：v4 输出的必须是 10 头（G-707 后的形状），否则 decode_intent 会拒收。
+assert tuple(MULTI_DISCRETE_V2) == (5, 7, 5, 2, 3, 2, 2, 2, 9, 3), \
+    f"v4 老师按 10 头写的，当前 nvec={tuple(MULTI_DISCRETE_V2)}"
+
+
+def _v4_action(*, move: str = "idle", attack: bool = False, jump: bool = False,
+               sprint: bool = False, reset: str = "none",
+               slot: int = TEACHER_V4_SLOT) -> list[int]:
+    """构造一个 v2 的 10 头动作（``MultiDiscrete`` 的取值，不是 one-hot）。"""
+    action = [0] * len(_V4_HEADS)
+    action[_V4_IDX["move"]] = MOVE_VALUES_V2.index(move)
+    action[_V4_IDX["look_yaw"]] = _V4_LOOK_NEUTRAL[0]
+    action[_V4_IDX["look_pitch"]] = _V4_LOOK_NEUTRAL[1]
+    action[_V4_IDX["attack"]] = 1 if attack else 0
+    action[_V4_IDX["use"]] = 0                     # 老师从不主动按右键（举剑走 sprint_reset）
+    action[_V4_IDX["jump"]] = 1 if jump else 0
+    action[_V4_IDX["sneak"]] = 0
+    action[_V4_IDX["sprint"]] = 1 if sprint else 0
+    action[_V4_IDX["slot"]] = max(0, min(8, int(slot)))
+    action[_V4_IDX["sprint_reset"]] = SPRINT_RESET_VALUES_V2.index(reset)
+    return action
+
+
+def v4_intent_of(action: Sequence[int]) -> dict:
+    """把 v4 的 10 头动作翻成 env 约定形状的 intent（``decode_intent`` 的输出）。
+
+    调用方（真机探针、日志、单测）需要「这一帧到底想干什么」时用它，
+    不必自己重复一遍 ``ACTION_HEADS_V2`` 的顺序。
+    """
+    return decode_intent(list(action))
+
+
+class TeacherV4State:
+    """老师 v4 的跨帧记忆（每局一份）。
+
+    字段：
+
+    - ``frame``：调用计数；
+    - ``frame_seconds``：一帧秒数（``meta`` 可钉死，默认 0.2）；
+    - ``last_target_health`` / ``last_self_health``：血量的上一帧值（判定命中/受击）；
+    - ``last_hit_frame`` / ``last_hurt_frame``：最近一次「打中别人」/「被别人打中」的帧号；
+    - ``last_arm_frame``：最近一次「起跳预备」的帧号（jump_crit 的起跳节流）；
+    - ``strafe_direction`` / ``strafe_until_frame`` / ``strafe_span_index``：横移换向节拍；
+    - ``reasons``：本局各条规则的命中次数；
+    - ``hits_landed`` / ``hits_taken``：真实命中/受击次数（按血量掉幅统计）。
+    """
+
+    __slots__ = (
+        "frame", "frame_seconds", "last_target_health", "last_self_health",
+        "last_hit_frame", "last_hurt_frame", "last_arm_frame", "strafe_direction",
+        "strafe_until_frame", "strafe_span_index", "reasons",
+        "hits_landed", "hits_taken", "last_action",
+    )
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> "TeacherV4State":
+        self.frame = 0
+        self.frame_seconds = TEACHER_V4_FRAME_SECONDS
+        self.last_target_health: float | None = None
+        self.last_self_health: float | None = None
+        self.last_hit_frame: int | None = None
+        self.last_hurt_frame: int | None = None
+        self.last_arm_frame: int | None = None
+        self.strafe_direction = 0            # 0 = 左，1 = 右
+        self.strafe_until_frame = 0
+        self.strafe_span_index = 0
+        self.reasons: dict[str, int] = {}
+        self.hits_landed = 0
+        self.hits_taken = 0
+        self.last_action: list[int] | None = None
+        return self
+
+
+def _v4_options(meta: Any, state: TeacherV4State | None) -> dict:
+    """把 ``meta`` 规范成 v4 的决策上下文（全部可缺省）。"""
+    data: Mapping[str, Any] = meta if isinstance(meta, Mapping) else {}
+    chosen = state if isinstance(state, TeacherV4State) else data.get("state")
+    if not isinstance(chosen, TeacherV4State):
+        chosen = _DEFAULT_V4_STATE
+    frame_seconds = data.get("frame_seconds")
+    return {
+        "state": chosen,
+        "frame_seconds": (TEACHER_V4_FRAME_SECONDS if frame_seconds is None
+                          else max(1e-6, float(frame_seconds))),
+        #: 有没有剑（观测里没有手持物字段，只能由调用方给；缺省 True）。
+        "has_sword": bool(data.get("has_sword", True)),
+        #: 热键栏目标槽（缺省 0 = 训练套件的剑位）。
+        "slot": int(data.get("slot", TEACHER_V4_SLOT)),
+    }
+
+
+def _v4_track(state: TeacherV4State, obs: np.ndarray) -> None:
+    """更新「上一刀打中了 / 刚被打了」这两个跨帧判定（按血量掉幅，不依赖信号缺失的字段）。"""
+    target_health = _get(obs, IDX_TARGET_HEALTH) * HEALTH_SCALE
+    self_health = _get(obs, IDX_SELF_HEALTH) * HEALTH_SCALE
+
+    prev_target = state.last_target_health
+    if prev_target is not None and target_health > 0.0 and prev_target - target_health >= TEACHER_V4_HIT_EPS:
+        state.last_hit_frame = state.frame
+        state.hits_landed += 1
+    # 对手满血（重生/被补满）时不把血量抬升当成命中，但要把基线重置。
+    state.last_target_health = target_health if target_health > 0.0 else None
+
+    prev_self = state.last_self_health
+    if prev_self is not None and self_health > 0.0 and prev_self - self_health >= TEACHER_V4_HIT_EPS:
+        state.last_hurt_frame = state.frame
+        state.hits_taken += 1
+    state.last_self_health = self_health if self_health > 0.0 else None
+
+
+def _v4_strafe(state: TeacherV4State, frame_seconds: float, span: tuple[float, float]) -> str:
+    """横移换向节拍：``span`` 秒换一次向（不要每帧抖方向）。"""
+    if state.frame >= state.strafe_until_frame:
+        state.strafe_direction = 1 - state.strafe_direction
+        low, high = span
+        chosen = low + (high - low) * (state.strafe_span_index % 2)
+        state.strafe_span_index += 1
+        state.strafe_until_frame = state.frame + max(1, int(round(chosen / frame_seconds)))
+    return "left" if state.strafe_direction == 0 else "right"
+
+
+def _v4_finish(state: TeacherV4State, action: list[int], *, reason: str) -> tuple[list[int], dict]:
+    """收尾：记账并返回 ``(10 头动作, 诊断)``。"""
+    state.last_action = list(action)
+    state.frame += 1
+    state.reasons[reason] = state.reasons.get(reason, 0) + 1
+    return action, {"reason": reason, "intent": decode_intent(list(action))}
+
+
+def _decide_v4(obs: np.ndarray, options: dict) -> tuple[list[int], dict]:
+    """v4 的决策核心：严格按 ``pvp-1.8-mechanics.md`` §3 的招式表。
+
+    判定顺序（顺序即优先级）::
+
+        0. 无目标                     → idle
+        1. block_hit（有剑 + ≤3.0 格 + 冷却好）
+                                      → move=forward, reset=block_hit, attack=1
+        2. jump_crit（在 1.4–2.4 格、冷却好时先 jump_arm 起跳，
+            vy<0 那一帧）→ jump=1 + attack=1（同一帧，G-701 组合）
+        3. wtap_keep_combo（无剑 + 上一帧命中）→ move=forward, reset=release_w, attack=1
+        4. wtap_reduce_kb（无剑 + 上一帧受击）→ move=forward, reset=release_w, attack=0
+        5. 射程内且冷却好             → attack
+        6. 距离阶梯（§3 的三条带，顺序即优先级）
+           <2.6 格                    → S（spacing_back）
+           >6.0 格                    → W（spacing_forward，追人）
+           4–6 格                     → strafe_poke（慢换向）
+           3.3–4.0 格                 → W（spacing_forward，压进带）
+           2.6–3.3 格                 → strafe_combo（快换向）
+        7. 兜底                       → forward
+
+    有剑时**绝不**走第 3/4 条，无剑时**绝不**走第 1 条——两条 reset 路线互斥，
+    这是视频里明确讲的（同时用失误率高），也是本模块最容易写错的地方。
+    """
+    state: TeacherV4State = options["state"]
+    has_sword = options["has_sword"]
+    slot = options["slot"]
+    frame_seconds = options["frame_seconds"]
+    state.frame_seconds = frame_seconds
+
+    has_target = _get(obs, IDX_HAS_TARGET) >= 0.5
+    if not has_target:
+        return _v4_finish(state, _v4_action(slot=slot), reason="no_target")
+
+    distance = _get(obs, IDX_TARGET_DISTANCE) * DISTANCE_SCALE
+    in_reach = _get(obs, IDX_IN_REACH) >= 0.5
+    vy = _get(obs, IDX_SELF_VY) * 5.0                     # 格/秒，下落为负
+    cooldown = _get(obs, IDX_ATTACK_COOLDOWN) * 0.5       # 还差多少秒到 0.5s
+    ready = cooldown <= frame_seconds * 0.25 or \
+        _get(obs, IDX_SELF_SINCE_ATTACK) * 5.0 >= TEACHER_V4_ATTACK_COOLDOWN
+
+    _v4_track(state, obs)
+    hit_landed = state.last_hit_frame is not None and 0 <= state.frame - state.last_hit_frame <= 1
+    hurt_now = state.last_hurt_frame is not None and 0 <= state.frame - state.last_hurt_frame <= 1
+
+    # --- 6. 控距（任何时候都先修正站位，避免在够不到的带里空耗）-----------------
+    spacing_forward = distance > TEACHER_V4_SPACING_MAX
+    spacing_back = distance < TEACHER_V4_SPACING_MIN
+
+    # --- 1. 有剑：防砍（reset=block_hit + 同一帧出手）---------------------------
+    if has_sword and distance <= TEACHER_V4_BLOCK_DISTANCE:
+        return _v4_finish(
+            state,
+            _v4_action(move="forward", attack=bool(ready), reset="block_hit", slot=slot),
+            reason="block_hit")
+
+    # --- 2. 跳劈：先「起跳预备」，再在**下落中**出手 ---------------------------
+    # KB §3：距离 ≤2.4 且冷却已好 → 起跳 → 下落中挥刀。本环境把 jump 与 attack 放进
+    # 同一帧（G-701 已验证会被服务端按跳劈结算），所以「vy<0」那一帧就是暴击窗口。
+    #
+    # 2026-11-22 真机 12 局暴露的问题：只按 `vy<0` 触发时这条规则**永远不可能生效**
+    # ——vy 要变负得先起跳，而起跳又只在 vy<0 时发（自锁）。首轮 12 局的 reason 里
+    # jump_crit 出现 0 次就是这个原因。现在拆成两拍：
+    #   ① arm：着地 + 冷却已好 + 在距离带内 → 只起跳（reason=jump_arm，带 1s 节流）；
+    #   ② crit：`vy<0` 且冷却仍好 → jump+attack 同帧（reason=jump_crit）。
+    # 「只在 vy<0 时出手」这一条没有变：出手帧仍然要求正在下落。
+    if (vy < 0.0 and ready
+            and TEACHER_V4_CRIT_MIN_DISTANCE <= distance <= TEACHER_V4_CRIT_MAX_DISTANCE):
+        return _v4_finish(
+            state,
+            _v4_action(move="forward", attack=True, jump=True, slot=slot),
+            reason="jump_crit")
+
+    arm_ready = (
+        state.last_arm_frame is None
+        or (state.frame - state.last_arm_frame) * frame_seconds >= TEACHER_V4_JUMP_ARM_COOLDOWN)
+    if (ready and arm_ready and _get(obs, IDX_SELF_ON_GROUND) >= 0.5
+            and TEACHER_V4_CRIT_MIN_DISTANCE <= distance <= TEACHER_V4_CRIT_MAX_DISTANCE):
+        state.last_arm_frame = state.frame
+        return _v4_finish(
+            state,
+            _v4_action(move="forward", jump=True, slot=slot),
+            reason="jump_arm")
+
+    # --- 3/4. 无剑：wtap 的两种用法（永不按右键）-------------------------------
+    if not has_sword and (hit_landed or hurt_now):
+        if hit_landed:
+            # wtap_keep_combo：刚命中 → 松 W 再按回来 + 立刻挥刀，让对手持续吃大 KB。
+            return _v4_finish(
+                state,
+                _v4_action(move="forward", attack=True, reset="release_w", slot=slot),
+                reason="wtap_keep_combo")
+        # wtap_reduce_kb：刚受击 → 松 W 再按回来，缩小自己的 KB、快速回到攻击距离。
+        return _v4_finish(
+            state,
+            _v4_action(move="forward", attack=False, reset="release_w", slot=slot),
+            reason="wtap_reduce_kb")
+
+    # --- 5. 射程内且冷却好：砍 -------------------------------------------------
+    if in_reach and ready and not spacing_back:
+        return _v4_finish(state, _v4_action(move="forward", attack=True, slot=slot),
+                          reason="attack")
+
+    # --- 6. 距离阶梯：S → 追（>6）→ strafe_poke（4–6）→ W（3.3–4）→ combo（2.6–3.3）---
+    # 顺序本身就是招式表（§3）：`strafe_poke` 的适用带是「接战前 4–6 格」，
+    # 它**必须**排在「太远就压上」之前，否则 4–6 格永远被 approach 吃掉，
+    # 那条规则在这份代码里就是死的。
+    if spacing_back:
+        return _v4_finish(state, _v4_action(move="back", slot=slot), reason="spacing_back")
+    if distance > TEACHER_V4_STRAFE_POKE_MAX:
+        return _v4_finish(
+            state,
+            _v4_action(move="forward", sprint=distance > 2.5, slot=slot),
+            reason="spacing_forward")
+    if TEACHER_V4_STRAFE_POKE_MIN <= distance <= TEACHER_V4_STRAFE_POKE_MAX:
+        # 「边晃边压」：每 N 帧插一帧纯前进（单方向动作空间的折中，见常量注释）。
+        if (TEACHER_V4_POKE_PUSH_EVERY > 0
+                and state.frame % TEACHER_V4_POKE_PUSH_EVERY == TEACHER_V4_POKE_PUSH_EVERY - 1):
+            return _v4_finish(
+                state,
+                _v4_action(move="forward", sprint=distance > 2.5, slot=slot),
+                reason="strafe_poke")
+        direction = _v4_strafe(state, frame_seconds, TEACHER_V4_STRAFE_POKE_SPAN)
+        return _v4_finish(state, _v4_action(move=direction, slot=slot), reason="strafe_poke")
+    if spacing_forward:
+        return _v4_finish(
+            state,
+            _v4_action(move="forward", sprint=distance > 2.5, slot=slot),
+            reason="spacing_forward")
+    if TEACHER_V4_SPACING_MIN <= distance <= TEACHER_V4_SPACING_MAX:
+        direction = _v4_strafe(state, frame_seconds, TEACHER_V4_STRAFE_COMBO_SPAN)
+        return _v4_finish(state, _v4_action(move=direction, slot=slot), reason="strafe_combo")
+
+    # --- 7. 兜底：压上（进带 / 进射程）-----------------------------------------
+    return _v4_finish(state, _v4_action(move="forward", sprint=distance > 2.5, slot=slot),
+                      reason="approach")
+
+
+#: ``heuristic_action_v4(obs)``（不传 state）时使用的默认状态。
+#: 多局/多线程场景请用 :class:`TeacherV4` 实例，或显式传 ``state=``。
+_DEFAULT_V4_STATE = TeacherV4State()
+
+
+def reset_teacher_v4() -> None:
+    """清空模块级默认状态（测试 / 新 episode 之间调用）。"""
+    _DEFAULT_V4_STATE.reset()
+
+
+def heuristic_action_v4(
+    obs: np.ndarray,
+    meta: Mapping[str, Any] | None = None,
+    state: TeacherV4State | None = None,
+) -> list[int]:
+    """老师 v4：按 1.8 招式表输出 **v2 的 10 头动作**（``list[int]``，可直接喂 env）。
+
+    与 v1–v3 的差别：返回值不是动作编号，而是 ``MultiDiscrete`` 的取值向量
+    （``[move, look_yaw, look_pitch, attack, use, jump, sneak, sprint, slot, sprint_reset]``）。
+    想拿「这一帧的意图」用 :func:`v4_intent_of`（= ``decode_intent`` 的输出，
+    与 env 下发给运行时的 ``{type:"intent", intent:{...}}`` 里的 intent 完全同形状）。
+
+    招式表（``docs/knowledge/pvp-1.8-mechanics.md`` §3）与代码的对应关系：
+
+    ================== ============================================ ==============
+    招式               条件                                          动作
+    ================== ============================================ ==============
+    ``block_hit``      有剑 + ≤3.0 格                                W + 举剑 + 砍
+    ``jump_crit``      ``vy<0`` + 冷却好 + 1.4–2.4 格                 jump + attack
+    ``wtap_keep_combo`` 无剑 + 上一帧命中                            W + release_w + 砍
+    ``wtap_reduce_kb`` 无剑 + 上一帧受击                            W + release_w
+    ``spacing_hold``   >3.3 格 → W；<2.6 格 → S                    approach / retreat
+    ``strafe_poke``    4–6 格                                        A/D，0.4–0.8s 换向
+    ``strafe_combo``   2.6–3.3 格                                    A/D，0.2–0.4s 换向
+    ``no_sword_fight`` 手上没剑                                    只用 wtap，**不按右键**
+    ================== ============================================ ==============
+
+    ``meta`` 支持的键：``has_sword``（缺省 ``True``；观测里没有手持物字段）、
+    ``frame_seconds``（缺省 0.2）、``slot``（缺省 0）、``state``。
+    传入 dict 时会写回 ``meta["reason"]`` 与 ``meta["intent"]``，便于复盘。
+    """
+    options = _v4_options(meta, state)
+    action, info = _decide_v4(obs, options)
+    if isinstance(meta, dict):
+        meta["reason"] = info["reason"]
+        meta["intent"] = info["intent"]
+    return action
+
+
+class TeacherV4:
+    """可复用的 v4 老师实例（自己持有一份 :class:`TeacherV4State`）。
+
+    ``teacher = TeacherV4(); teacher(obs)`` 返回 10 头动作；每个 episode 开头调
+    :meth:`reset`（环境 ``reset()`` 会通过 ``reset_episode`` 回调）。
+    ``is_v2 = True`` / ``action_space = "v2"`` 是给 ``GladiatorEnv`` 看的：
+    它据此知道这个对手给的是意图向量而不是动作编号（见 env 的 ``_opponent_v2``）。
+    """
+
+    version = "v4"
+    is_v2 = True
+    action_space = "v2"
+
+    def __init__(self, **defaults: Any) -> None:
+        self.state = TeacherV4State()
+        self.defaults = dict(defaults)
+        #: 已结束 episode 的原因统计（每次 :meth:`reset` 归档上一局）。
+        self.episode_reasons: list[dict[str, int]] = []
+
+    def reset(self) -> "TeacherV4":
+        if self.state.reasons:
+            self.episode_reasons.append(dict(self.state.reasons))
+        self.state.reset()
+        return self
+
+    def reset_episode(self) -> None:
+        """环境 ``reset()`` 时的回调：归档上一局并清零状态。"""
+        self.reset()
+
+    @property
+    def reasons(self) -> dict[str, int]:
+        return dict(self.state.reasons)
+
+    def flush(self) -> list[dict[str, int]]:
+        if self.state.reasons:
+            self.episode_reasons.append(dict(self.state.reasons))
+            self.state.reasons = {}
+        return list(self.episode_reasons)
+
+    def act(self, vector, rng=None, greedy: bool = True) -> list[int]:
+        """与 ``Policy.act`` 同签名（env 的 ``opponent_policy`` 约定），但返回 10 头动作。"""
+        merged: dict[str, Any] = dict(self.defaults)
+        return heuristic_action_v4(vector, merged, self.state)
+
+    def __call__(self, obs: np.ndarray, meta: Mapping[str, Any] | None = None) -> list[int]:
+        merged: dict[str, Any] = dict(self.defaults)
+        if isinstance(meta, Mapping):
+            merged.update(meta)
+        action = heuristic_action_v4(obs, merged, self.state)
+        if isinstance(meta, dict):
+            meta["reason"] = merged.get("reason", "")
+            meta["intent"] = merged.get("intent")
+        return action
+
+
 def make_teacher(version: str = TEACHER_VERSION) -> Callable[..., int]:
     """按版本号取老师。
 
     ``"v1"`` → :func:`heuristic_action`（无状态函数）；
-    ``"v2"`` → :class:`TeacherV2`；``"v3"`` → :class:`TeacherV3`。
+    ``"v2"`` → :class:`TeacherV2`；``"v3"`` → :class:`TeacherV3`；
+    ``"v4"`` → :class:`TeacherV4`（**返回 10 头 v2 动作**，不是动作编号）。
     """
     key = str(version or TEACHER_VERSION).strip().lower()
     if key == "v1":
@@ -1392,6 +1956,8 @@ def make_teacher(version: str = TEACHER_VERSION) -> Callable[..., int]:
         return TeacherV2()
     if key == "v3":
         return TeacherV3()
+    if key == "v4":
+        return TeacherV4()
     raise ValueError(f"未知老师版本: {version!r}（允许 {', '.join(SUPPORTED_TEACHER_VERSIONS)}）")
 
 
@@ -1399,37 +1965,60 @@ def collect_demos(
     env,
     episodes: int = 4,
     max_steps: int = 120,
-    teacher: Callable[[np.ndarray], int] | None = None,
+    teacher: Callable[..., Any] | None = None,
     gamma: float = 0.99,
     teacher_version: str = TEACHER_VERSION,
-) -> list[tuple[np.ndarray, int, float]]:
-    """用老师跑 ``episodes`` 局，返回 ``[(obs, action, discounted_return)]``。
+    v2_weight: float = 1.0,
+) -> list[tuple[np.ndarray, Any, float]]:
+    """用老师跑 ``episodes`` 局，返回 ``[(obs, 动作标签, 第三个字段)]``。
+
+    两种动作空间，第三个字段的含义不同（**调用方必须按同一个口径解释**）：
+
+    - **v1**（``env.action_space`` 是 ``Discrete``）：标签是动作编号 ``int``，
+      第三字段是**该局后续折扣回报**（末步之后为 0，不做 bootstrap）；
+    - **v2**（``env.action_space`` 是 ``MultiDiscrete``）：标签是 **10 个头的下标元组**
+      （顺序 = :data:`V2_HEADS`），第三字段是**样本权重**（默认全 ``v2_weight``）。
+      v2 没有「动作编号」，硬塞一个扁平下标会让 `decode_intent` 把 10 个头压成 1 个，
+      所以这里显式换成「头下标 + 权重」，折扣回报在 v2 的逐头交叉熵里也没有用途。
 
     ``teacher`` 显式给出时直接用它；否则按 ``teacher_version`` 取
-    （``"v1"`` 默认 / ``"v2"`` 见 :func:`heuristic_action_v2`）。
-    v2 是有状态的，所以每局 ``env.reset()`` 之后会调 ``teacher.reset()``（若有）。
+    （``"v1"`` 默认 / ``"v2"`` 见 :func:`heuristic_action_v2` / ``"v4"`` 见 :class:`TeacherV4`）。
+    有状态的老师（v2/v3/v4）每局 ``env.reset()`` 之后会调 ``teacher.reset()``。
 
-    回报按 **该局后续折扣回报** 计算（末步之后为 0）；单步环境不做 bootstrap。
+    v2 下老师返回的必须是 10 头动作（``TeacherV4`` 即如此）；返回 ``{"intent": {...}}``
+    的老师也支持——经 :func:`intent_to_tuple` 翻成下标。若老师自己把 intent 写回
+    ``meta["intent"]``（v4 的约定），这里还会做一次**交叉校验**：两种写法不一致
+    说明老师内部与日志口径已经分叉，直接报错而不是把错标签喂进 BC。
+
     只支持单智能体环境（``single_agent=True``），否则动作契约不同，直接报错而不是瞎猜。
     """
     teacher = teacher if teacher is not None else make_teacher(teacher_version)
-    samples: list[tuple[np.ndarray, int, float]] = []
+    v2 = _env_is_v2(env)
+    samples: list[tuple[np.ndarray, Any, float]] = []
     for _episode in range(int(max(0, episodes))):
         obs, _info = env.reset()
         if isinstance(obs, dict):
             raise ValueError("collect_demos 只支持 single_agent=True 的环境（obs 应为向量）")
         _reset_teacher(teacher)
-        steps: list[tuple[np.ndarray, int, float]] = []
+        steps: list[tuple[np.ndarray, Any, float]] = []
         done = False
         for _step in range(int(max(0, max_steps))):
             vector = np.asarray(obs, dtype=np.float64).reshape(-1)
-            action = int(teacher(vector))
+            action = _teacher_label(teacher, vector, v2=v2)
             next_obs, reward, terminated, truncated, _info = env.step(action)
             steps.append((vector, action, float(reward)))
             obs = next_obs
             if terminated or truncated:
                 done = True
                 break
+        if v2:
+            # v2：权重守恒（默认 1.0），不做折扣回报——见 docstring。
+            weight = float(v2_weight)
+            if weight < 0 or not math.isfinite(weight):
+                raise ValueError(f"v2_weight 必须是非负有限数，收到 {v2_weight}")
+            for vector, action, _reward in steps:
+                samples.append((vector, action, weight))
+            continue
         # 反向累加折扣回报；局末之后视为 0（terminated/truncated 都按终止处理）。
         running = 0.0
         returns = [0.0] * len(steps)
@@ -1442,6 +2031,60 @@ def collect_demos(
             # 截断的对局同样可用（回报就是到截断为止），这里不做额外处理。
             pass
     return samples
+
+
+def _env_is_v2(env) -> bool:
+    """环境是不是 v2 动作空间（``MultiDiscrete``）。
+
+    优先读 ``env.action_space_name``（GladiatorEnv 的显式字段），退化到
+    「``action_space`` 有 ``nvec``」——这样 FakeEnv/测试替身也能被正确识别。
+    """
+    name = getattr(env, "action_space_name", None)
+    if name is not None:
+        return str(name).strip().lower() == "v2"
+    return hasattr(getattr(env, "action_space", None), "nvec")
+
+
+def _v2_label(raw: Any) -> tuple[int, ...]:
+    """把老师输出规范成 10 头下标元组（校验头数与取值范围）。"""
+    if isinstance(raw, Mapping):
+        return intent_to_tuple(raw)
+    values = [int(value) for value in np.asarray(raw, dtype=np.int64).reshape(-1)]
+    if len(values) != len(V2_HEADS):
+        raise ValueError(
+            f"v2 老师应返回 {len(V2_HEADS)} 个头，收到 {len(values)} 个：{values!r}")
+    for index, (value, size) in enumerate(zip(values, MULTI_DISCRETE_V2)):
+        if not 0 <= value < int(size):
+            raise ValueError(
+                f"v2 老师第 {index} 个头（{V2_HEADS[index]}）越界: {value}（0..{size - 1}）")
+    return tuple(values)
+
+
+def _teacher_label(teacher: Callable[..., Any], vector: np.ndarray, *, v2: bool) -> Any:
+    """取一帧的老师标签（v1 → int；v2 → 头下标元组），并做 intent 交叉校验。"""
+    if not v2:
+        try:
+            return int(teacher(vector))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "v1 环境的标签必须是动作编号；这个老师给的是 v2 十头动作，"
+                "请用 --action-space v2（v2 下的 BC 只支持 teacher v4）") from exc
+    meta: dict[str, Any] = {}
+    # v4 约定 `teacher(obs, meta)` 会把本帧 intent 写回 meta；不带 meta 的老师（纯函数）
+    # 不传第二参，避免用 TypeError 去猜签名。
+    if bool(getattr(teacher, "is_v2", False)) or bool(getattr(teacher, "accepts_meta", False)):
+        raw = teacher(vector, meta)
+    else:
+        raw = teacher(vector)
+    action = _v2_label(raw)
+    intent = meta.get("intent")
+    if isinstance(intent, Mapping):
+        from_intent = intent_to_tuple(intent)
+        if from_intent != action:
+            raise ValueError(
+                "老师返回的动作与它写回的 intent 不一致："
+                f"动作={action} intent→{from_intent}（老师的两个出口已经分叉）")
+    return action
 
 
 def _reset_teacher(teacher: Callable[..., int]) -> None:
@@ -1459,32 +2102,67 @@ def collect_dagger_samples(
     teacher: Callable[[np.ndarray], int] | None = None,
     rng: np.random.Generator | None = None,
     teacher_version: str = TEACHER_VERSION,
-) -> list[tuple[np.ndarray, int, float]]:
+    sample_weight: float = 1.0,
+) -> list[tuple[np.ndarray, Any, float]]:
     """DAgger 的一轮采样：用**当前策略**跑，每步让老师给动作标签（P2.3）。
 
     与 :func:`collect_demos` 的区别是「谁在跑」：BC 用老师跑（数据分布 = 老师的状态分布），
     策略自己跑久了会走到老师从没去过的状态（covariate shift），DAgger 每轮都用
     当前策略的状态分布重新打标签，于是「策略越强、标签越贴它的实际处境」。
 
-    返回结构与 :func:`collect_demos` 一致（``(obs, action, 0.0)``，第三个字段不用），
-    这样可以直接喂给 :func:`behavior_clone`。
+    返回结构与 :func:`collect_demos` 一致，可以直接喂给 :func:`behavior_clone`：
+
+    - **v1**：``(obs, 动作编号, 0.0)``（第三字段不被 BC 使用，保持旧值以免改变日志口径）；
+    - **v2**：``(obs, 10 头下标元组, sample_weight)``（第三字段是**权重**，默认 1.0）。
+
+    v2 下「策略自己走」用 :meth:`Policy.sample` 并按环境的 ``actionMask`` 掩码，
+    与训练主循环同一口径（否则策略会走出被屏蔽的 slot/use，采到老师从没见过的分布）。
+    标签仍然来自老师，所以「同帧取 v4 标签」这件事与 v1 完全一致。
     """
     teacher = teacher if teacher is not None else make_teacher(teacher_version)
     rng = rng if rng is not None else np.random.default_rng(0)
-    samples: list[tuple[np.ndarray, int, float]] = []
+    v2 = _env_is_v2(env)
+    samples: list[tuple[np.ndarray, Any, float]] = []
     for _episode in range(int(max(0, episodes))):
-        obs, _info = env.reset()
+        obs, info = env.reset()
         if isinstance(obs, dict):
             raise ValueError("collect_dagger_samples 只支持 single_agent=True 的环境（obs 应为向量）")
         _reset_teacher(teacher)
+        mask = _mask_of(policy, info) if v2 else None
         for _step in range(int(max(0, max_steps))):
             vector = np.asarray(obs, dtype=np.float64).reshape(-1)
-            label = int(teacher(vector))          # 老师对**这个状态**的标签
-            action = int(policy.act(vector, rng))  # 策略自己走，才能采到自己的状态分布
-            samples.append((vector, label, 0.0))
-            obs, _reward, terminated, truncated, _info = env.step(action)
+            label = _teacher_label(teacher, vector, v2=v2)  # 老师对**这个状态**的标签
+            if v2:
+                # 策略自己走，才能采到自己的状态分布；v2 的动作是 (H,) 数组。
+                action = policy.sample(vector, rng, mask=mask)
+                samples.append((vector, label, float(sample_weight)))
+            else:
+                action = int(policy.act(vector, rng))
+                samples.append((vector, label, 0.0))
+            obs, _reward, terminated, truncated, info = env.step(action)
+            if v2:
+                mask = _mask_of(policy, info)
             if terminated or truncated:
                 break
+    return samples
+
+
+def _mask_of(policy, info: Any):
+    """从 ``info["actionMask"]`` 取 v2 掩码并规范成策略要的``list[list[bool]]``。
+
+    任何异常都退化成 ``None``（不掩码）：DAgger 的标签由老师给，掩码只影响
+    「策略走到哪些状态」，不值得为此中断一整轮采样。
+    """
+    if not isinstance(info, Mapping):
+        return None
+    raw = info.get("actionMask")
+    if raw is None:
+        return None
+    normalize = getattr(policy, "normalize_mask", None)
+    try:
+        return normalize(raw) if callable(normalize) else raw
+    except Exception:  # noqa: BLE001 - 见 docstring
+        return None
     return samples
 
 
@@ -1546,7 +2224,7 @@ def _entropy(p: np.ndarray) -> float:
 
 def behavior_clone(
     policy,
-    samples: Sequence[tuple[np.ndarray, int, float]],
+    samples: Sequence[tuple[np.ndarray, Any, float]],
     epochs: int = 30,
     lr: float = 1e-3,
     batch: int = 64,
@@ -1558,11 +2236,17 @@ def behavior_clone(
 ) -> dict:
     """交叉熵监督训练策略头（W1/b1/W2/b2），**不动价值头 Wv/bv**。
 
-    返回 ``{"loss": [...每轮平均交叉熵...], "accuracy": 最终 teacher 动作命中率,
-    "samples": 样本数, "epochs": 实际轮数, "temperature": T,
-    "labelSmoothing": eps, "teacherEntropy": 老师分布的平均熵}``。
+    两种策略结构，**样本第三字段的含义随之不同**：
 
-    ``entropy_coef>0`` 时在损失里减去 ``β·H(π)``（鼓励保留探索）。
+    - **v1**（单头 softmax，11 宏动作）：标签是动作编号，第三字段是折扣回报（不使用）。
+      返回 ``{"loss", "accuracy", "samples", "epochs", "temperature",
+      "labelSmoothing", "teacherEntropy", "totalWeight"}``。
+    - **v2**（10 个离散头的 factorized 策略）：标签是 10 个头下标组成的元组，
+      第三字段是**权重**，返回在上面基础上多一个 ``perHeadAccuracy``（10 个头各自
+      的加权命中率），且 ``accuracy`` = 各头准确率的平均。实现见
+      :func:`_behavior_clone_v2`，**v1 的代码路径逐位未改**。
+
+    ``entropy_coef>0`` 时在损失里减去 ``β·H(π)``（鼓励保留探索）；v2 的熵按各头平均。
 
     温度/平滑的作用（P2.3 后续）：硬标签 + 30 轮 Adam 会把 softmax 压到熵 0.01~0.03，
     之后 PPO 的 ratio 与熵正则都推不动。``temperature>1`` 让目标变软（交叉熵
@@ -1574,8 +2258,16 @@ def behavior_clone(
     两者不要混用（要整体调平请在 BC 用 temperature，PPO 侧用 ``--logit-temp``）。
     ``weights`` 给每条样本一个非负权重（默认全 1）：用于「赢的局权重大、输的局权重小」
     与「交手帧权重大、跑位帧权重小」这类择优筛选。权重按批内和归一化，
-    因此全 1 时与原实现逐位一致。
+    因此全 1 时与原实现逐位一致。v2 下样本第三字段的权重与 ``weights`` **相乘**，
+    所以两者都缺省（全 1）时与「只给一个全 1 权重」完全等价。
     """
+    if getattr(policy, "is_v2", False):
+        # v2 走独立实现：v1 的 W2/b2 是单张量，v2 是 W2_<head>/b2_<head>，
+        # 混在一个函数里会把 v1 的逐位行为改坏（15 条权重测试就是判据）。
+        return _behavior_clone_v2(
+            policy, samples, epochs=epochs, lr=lr, batch=batch,
+            entropy_coef=entropy_coef, seed=seed, temperature=temperature,
+            label_smoothing=label_smoothing, weights=weights)
     if temperature <= 0:
         raise ValueError(f"temperature 必须为正，收到 {temperature}")
     if not 0.0 <= label_smoothing < 1.0:
@@ -1662,8 +2354,21 @@ def behavior_clone(
     return result
 
 
-def teacher_agreement(policy, samples: Iterable[tuple[np.ndarray, int, float]]) -> float:
-    """老师动作与策略 argmax 的一致率（BC 前后对比用）。"""
+def teacher_agreement(policy, samples: Iterable[tuple[np.ndarray, Any, float]]):
+    """老师动作与策略 argmax 的一致率（BC 前后对比用）。
+
+    - **v1**：返回一个 ``float``（单头 argmax 命中率），与旧口径逐位一致；
+    - **v2**：返回 ``{"meanHeadAgreement": float, "exactMatch": float,
+      "perHead": [float] * H, "heads": [...], "samples": int}``——十个头各算各的
+      命中率再取平均（``meanHeadAgreement``，与 BC 的 ``accuracy`` 同口径），
+      外加「十个头全部命中」的全体完全一致率（``exactMatch``）。
+      只报一个数会骗人：8 个头对、`attack` 头全错时平均仍有 0.8，但那一帧根本不出手。
+
+    v2 不做加权（与 v1 一致）：这里量的是「策略与老师的贴合度」，加权会把
+    「样本多的局面」放大，反而看不出头与头之间的差别。
+    """
+    if getattr(policy, "is_v2", False):
+        return _teacher_agreement_v2(policy, samples)
     total = 0
     correct = 0
     for x, action, _ret in samples:
@@ -1672,3 +2377,207 @@ def teacher_agreement(policy, samples: Iterable[tuple[np.ndarray, int, float]]) 
         correct += int(int(np.argmax(p)) == int(action))
         total += 1
     return round(correct / total, 4) if total else 0.0
+
+
+def _head_probs(policy, head_logits: np.ndarray) -> np.ndarray:
+    """单头概率（优先用策略自己的 ``_head_probs``，含它配置的温度）。"""
+    fn = getattr(policy, "_head_probs", None)
+    if callable(fn):
+        return np.asarray(fn(head_logits), dtype=np.float64)
+    temperature = max(1e-9, float(getattr(policy, "temperature", 1.0)))
+    return _softmax(np.asarray(head_logits, dtype=np.float64) / temperature)
+
+
+def _teacher_agreement_v2(policy, samples: Iterable[tuple[np.ndarray, Any, float]]) -> dict:
+    """:func:`teacher_agreement` 的 v2 实现（逐头一致率 + 全体完全一致率）。"""
+    heads = list(policy.head_names())
+    sizes = list(policy.head_sizes())
+    per_head_correct = [0] * len(heads)
+    exact = 0
+    total = 0
+    for x, action, _weight in samples:
+        vector = np.asarray(x, dtype=np.float64).reshape(-1)
+        picked = np.asarray(action, dtype=np.int64).reshape(-1)
+        if picked.size != len(heads):
+            raise ValueError(
+                f"v2 样本的动作应有 {len(heads)} 个头，收到 {picked.size} 个")
+        logits = policy.logits_all(vector)
+        total += 1
+        all_hit = True
+        for index, head_logits in enumerate(logits):
+            hit = int(np.argmax(_head_probs(policy, head_logits))) == int(picked[index])
+            per_head_correct[index] += int(hit)
+            all_hit = all_hit and hit
+        exact += int(all_hit)
+    if total == 0:
+        return {"meanHeadAgreement": 0.0, "exactMatch": 0.0,
+                "perHead": [0.0] * len(heads), "heads": heads, "samples": 0}
+    per_head = [round(count / total, 4) for count in per_head_correct]
+    return {
+        "meanHeadAgreement": round(sum(per_head) / len(per_head), 4),
+        "exactMatch": round(exact / total, 4),
+        "perHead": per_head,
+        "heads": heads,
+        "samples": total,
+    }
+
+
+def _behavior_clone_v2(
+    policy,
+    samples: Sequence[tuple[np.ndarray, Sequence[int], float]],
+    *,
+    epochs: int,
+    lr: float,
+    batch: int,
+    entropy_coef: float,
+    seed: int,
+    temperature: float,
+    label_smoothing: float,
+    weights: Optional[Sequence[float]],
+) -> dict:
+    """v2（多离散头）的 BC：**逐头交叉熵按头平均**，样本第三个字段当权重。
+
+    损失口径（H = 头数，w_i = 样本权重）::
+
+        L_i = (1/H) · Σ_h CE(q_h, p_h)          # 逐头平均：每个头权重相同
+        L   = Σ_i w_i · L_i / Σ_i w_i
+
+    为什么逐头平均、而不是「求和后再按样本归一化」：各头取值个数差 3 倍以上
+    （``slot`` 9 档 vs ``attack`` 2 档），求和会让 slot 头的梯度压过 attack；
+    平均保证每个头同等重要，也让 loss 的量级与 v1（单头 CE）可比。
+    反传时 ``dlogits_h = (p_h - q_h) · w / H``，W1/b1 由各头之和更新。
+
+    熵正则同样按头平均：``L_i -= β · (1/H) Σ_h H(p_h)``，梯度按每个头自己那一项减。
+
+    返回与 :func:`behavior_clone` 相同，另加 ``perHeadAccuracy``（10 个头的加权命中率）；
+    ``accuracy`` = 各头准确率的平均，与 :func:`teacher_agreement` 的
+    ``meanHeadAgreement`` 同口径。``totalWeight`` 是**乘过**样本权重与 ``weights``
+    之后的总权重。
+    """
+    if temperature <= 0:
+        raise ValueError(f"temperature 必须为正，收到 {temperature}")
+    if not 0.0 <= label_smoothing < 1.0:
+        raise ValueError(f"label_smoothing 必须在 [0, 1) 内，收到 {label_smoothing}")
+    if weights is not None and len(weights) != len(samples):
+        raise ValueError(f"weights 长度 {len(weights)} 与样本数 {len(samples)} 不一致")
+
+    heads = list(policy.head_names())
+    sizes = list(policy.head_sizes())
+    n_heads = len(heads)
+    data: list[tuple[np.ndarray, tuple[int, ...], float]] = []
+    for index, (x, action, sample_weight) in enumerate(samples):
+        picked = np.asarray(action, dtype=np.int64).reshape(-1)
+        if picked.size != n_heads:
+            raise ValueError(
+                f"第 {index} 条 v2 样本的动作应有 {n_heads} 个头（{heads}），"
+                f"收到 {picked.size} 个")
+        for head_index, value in enumerate(picked):
+            if not 0 <= int(value) < sizes[head_index]:
+                raise ValueError(
+                    f"第 {index} 条样本的 {heads[head_index]} 头越界: {int(value)}"
+                    f"（0..{sizes[head_index] - 1}）")
+        base = 1.0 if sample_weight is None else float(sample_weight)
+        if not np.isfinite(base) or base < 0:
+            raise ValueError(f"第 {index} 条样本权重非法: {sample_weight}")
+        extra = 1.0 if weights is None else float(weights[index])
+        if not np.isfinite(extra) or extra < 0:
+            raise ValueError(f"第 {index} 条样本 weights 非法: {weights[index]}")
+        data.append((np.asarray(x, dtype=np.float64).reshape(-1),
+                     tuple(int(value) for value in picked), base * extra))
+
+    result = {"loss": [], "accuracy": 0.0, "samples": len(data), "epochs": 0,
+              "temperature": float(temperature),
+              "labelSmoothing": float(label_smoothing),
+              "teacherEntropy": 0.0,
+              "totalWeight": float(sum(w for _x, _a, w in data)),
+              "perHeadAccuracy": [0.0] * n_heads,
+              "heads": heads}
+    if not data:
+        return result
+
+    rng = np.random.default_rng(seed)
+    names = (["W1", "b1"] + [f"W2_{head}" for head in heads]
+             + [f"b2_{head}" for head in heads])
+    m = {key: np.zeros_like(policy.params[key]) for key in names}
+    v = {key: np.zeros_like(policy.params[key]) for key in names}
+    step = 0
+    b1, b2 = 0.9, 0.999
+    eps = 1e-8
+    inv_heads = 1.0 / float(n_heads)
+    # 软目标只与「标签元组」有关：每个头独立算一份，按标签元组缓存。
+    targets: dict[tuple[int, ...], List[np.ndarray]] = {}
+
+    def _q_of(label: tuple[int, ...]) -> List[np.ndarray]:
+        cached = targets.get(label)
+        if cached is None:
+            cached = [teacher_target(value, size, temperature, label_smoothing)
+                      for value, size in zip(label, sizes)]
+            targets[label] = cached
+        return cached
+
+    total_weight = sum(w for _x, _a, w in data)
+
+    for _epoch in range(int(max(0, epochs))):
+        order = rng.permutation(len(data))
+        epoch_loss = 0.0
+        for start in range(0, len(data), max(1, int(batch))):
+            chunk = [data[i] for i in order[start:start + max(1, int(batch))]]
+            grads = {key: np.zeros_like(policy.params[key]) for key in names}
+            for x, label, w in chunk:
+                h = np.tanh(policy.params["W1"] @ x + policy.params["b1"])
+                logits = [policy.params[f"W2_{head}"] @ h + policy.params[f"b2_{head}"]
+                          for head in heads]
+                probs = [_softmax(head_logits) for head_logits in logits]
+                qs = _q_of(label)
+                sample_loss = 0.0
+                # 隐层是各头共享的：每个头的 dlogits 各自回传到 h 再相加。
+                dz = np.zeros_like(h)
+                for head_index, (p, q) in enumerate(zip(probs, qs)):
+                    sample_loss += float(-np.sum(q * np.log(p + 1e-12)))
+                    dlogits = (p - q) * (w * inv_heads)
+                    if entropy_coef:
+                        entropy = _entropy(p)
+                        dlogits = dlogits - (entropy_coef * w * inv_heads
+                                             * p * (np.log(p + 1e-12) + entropy))
+                    head = heads[head_index]
+                    grads[f"W2_{head}"] += np.outer(dlogits, h)
+                    grads[f"b2_{head}"] += dlogits
+                    dz += policy.params[f"W2_{head}"].T @ dlogits
+                sample_loss *= inv_heads
+                epoch_loss += w * sample_loss
+                dz = dz * (1.0 - h * h)
+                grads["W1"] += np.outer(dz, x)
+                grads["b1"] += dz
+            n = float(sum(w for _x, _a, w in chunk))
+            if n <= 0:
+                continue
+            step += 1
+            bc1 = 1.0 - b1 ** step
+            bc2 = 1.0 - b2 ** step
+            for key in names:
+                g = grads[key] / n  # 最小化方向（交叉熵）
+                m[key] = b1 * m[key] + (1.0 - b1) * g
+                v[key] = b2 * v[key] + (1.0 - b2) * (g * g)
+                policy.params[key] -= lr * (m[key] / bc1) / (np.sqrt(v[key] / bc2) + eps)
+        result["loss"].append(round(epoch_loss / max(1e-9, total_weight), 6))
+        result["epochs"] += 1
+
+    correct = [0.0] * n_heads
+    weight_sum = 0.0
+    entropy_sum = 0.0
+    for x, label, w in data:
+        h = np.tanh(policy.params["W1"] @ x + policy.params["b1"])
+        qs = _q_of(label)
+        weight_sum += w
+        for head_index, head in enumerate(heads):
+            head_logits = policy.params[f"W2_{head}"] @ h + policy.params[f"b2_{head}"]
+            p = _softmax(head_logits)
+            correct[head_index] += w * float(int(np.argmax(p)) == int(label[head_index]))
+            entropy_sum += w * max(0.0, _entropy(qs[head_index]))
+    per_head = [round(value / max(1e-9, weight_sum), 4) for value in correct]
+    result["perHeadAccuracy"] = per_head
+    result["accuracy"] = round(sum(per_head) / float(n_heads), 4) if n_heads else 0.0
+    result["teacherEntropy"] = round(
+        entropy_sum / max(1e-9, weight_sum * n_heads), 6)
+    policy.updates += int(result["epochs"])
+    return result

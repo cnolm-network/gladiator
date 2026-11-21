@@ -25,7 +25,7 @@ import sys
 import time
 
 import numpy as np
-from typing import List
+from typing import Any, List
 
 from .policy import Policy, adopt_weights, validate_init_policy
 from .runs import new_run_dir, run_paths
@@ -97,7 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="评估固定种子（写入 report.config.evalSeed，跨轮可比）")
     # --- 动作空间（v1 单头 / v2 九头 factorized） ---
     p.add_argument("--action-space", default="v1", choices=["v1", "v2"],
-                   help="v1 = 11 个宏动作的单头 softmax（默认）；v2 = 9 头 MultiDiscrete")
+                   help="v1 = 11 个宏动作的单头 softmax（默认）；v2 = 10 头 MultiDiscrete"
+                        "（BC 需配 --bc-teacher v4）")
     # --- P1.5：行为克隆热启动 ---
     p.add_argument("--bc-episodes", type=int, default=4,
                    help="BC 老师的对局数（0 表示不采集）")
@@ -106,10 +107,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bc-max-steps", type=int, default=120,
                    help="BC 每局最多步数")
     # --- 老师 v2 + BC 软目标（P2.3 后续：别再让 BC 把策略压死） ---
-    p.add_argument("--bc-teacher", default="v1", choices=["v1", "v2", "v3"],
+    p.add_argument("--bc-teacher", default="v1", choices=["v1", "v2", "v3", "v4"],
                    help="BC/DAgger 的老师版本：v1 = 静态四规则（默认）；"
                         "v2 = v1 + 间距/鱼竿/金苹果/暴击跳/w-tap/低血格挡；"
-                        "v3 = 冷却/暴击窗口感知（0.2s 步长，最好的规则老师）")
+                        "v3 = 冷却/暴击窗口感知（0.2s 步长，最好的规则老师）；"
+                        "v4 = 跑在 v2 十头动作空间上的 1.8 招式组合（**v2 动作空间下唯一可用**）")
     p.add_argument("--bc-temperature", type=float, default=1.0,
                    help="BC 软目标温度 T：q = softmax(log p_teacher / T)。"
                         "T>1 更平（熵更大、PPO 推得动），T<1 更尖；1.0 = 旧行为")
@@ -287,14 +289,55 @@ def sliding_windows(records: list[dict], username: str, size: int = 10) -> list[
     return out
 
 
+def _agreement_scalar(value: Any) -> float | None:
+    """把一致率压成一个数字（v1 是 float，v2 是 dict → 取逐头平均）。
+
+    report 里 ``agreementBefore/After`` 必须始终是「一个可比数字」：dashboard 与
+    ``--dagger-target-agreement`` 都按单值读，v2 的十头明细另存
+    ``headAgreementBefore/After``（见 :func:`_agreement_detail`）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        raw = value.get("meanHeadAgreement")
+        return None if raw is None else float(raw)
+    return float(value)
+
+
+def _agreement_detail(value: Any, key: str):
+    """v2 的明细字段（``exactMatch`` / ``perHead``）；v1 返回 ``None``。"""
+    if isinstance(value, dict):
+        return value.get(key)
+    return None
+
+
+def _fmt_agreement(value: Any) -> str:
+    """打印用：v1 一个数，v2 加上全体完全一致率。"""
+    scalar = _agreement_scalar(value)
+    if scalar is None:
+        return "n/a"
+    if isinstance(value, dict):
+        exact = value.get("exactMatch")
+        if exact is None:
+            return f"{scalar:.3f}"
+        return f"{scalar:.3f}（逐头均）/ 全一致 {float(exact):.3f}"
+    return f"{scalar:.3f}"
+
+
 def main(argv: List[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     # 参数组合校验放在建目录之前：拒绝时不该留下空 run 目录。
-    if args.action_space == "v2" and args.bc_episodes > 0:
-        print("[train] --action-space v2 下 --bc-episodes 必须为 0："
-              "BC 老师是 v1 宏动作脚本，没有 v2 的 9 头标签。"
-              "请加 --bc-episodes 0（或先用 v1 训好再用 v2 续训）。", file=sys.stderr)
-        return 2
+    # G-710：v2 动作空间下 BC/DAgger 只允许 teacher v4——v1/v2/v3 给的是「一个动作编号」，
+    # 没有 10 个头的标签，强行喂给 v2 只会把 10 个头压成 1 个（静默错标签）。
+    if args.action_space == "v2" and (args.bc_episodes > 0 or args.dagger_rounds > 0):
+        if str(args.bc_teacher or "").strip().lower() != "v4":
+            print(
+                "[train] v2 下的 BC 只支持 teacher v4："
+                f"收到 --bc-teacher {args.bc_teacher}。"
+                "老师 v1/v2/v3 输出的是 v1 宏动作编号，没有 v2 的 10 头标签。"
+                "请加 --bc-teacher v4，或把 --bc-episodes / --dagger-rounds 设为 0。",
+                file=sys.stderr)
+            return 2
     run_dir = args.run_dir or new_run_dir("train", "-".join(args.users[:2]))
     paths = run_paths(run_dir, "train")
     args.save = args.save or paths["policy"]
@@ -428,12 +471,15 @@ def main(argv: List[str] | None = None) -> int:
                "agreementBefore": None, "agreementAfter": None, "loss": None,
                "teacher": args.bc_teacher, "temperature": float(args.bc_temperature),
                "labelSmoothing": float(args.bc_label_smoothing),
-               "teacherEntropy": None}
+               "teacherEntropy": None, "perHeadAccuracy": None, "heads": None,
+               "totalWeight": None, "agreementBeforeExact": None,
+               "agreementAfterExact": None, "headAgreementBefore": None,
+               "headAgreementAfter": None}
     if args.bc_epochs > 0 and args.bc_episodes > 0:
         from .demos import behavior_clone, collect_demos, teacher_agreement
 
         print(f"[bc] 采集老师对局：{args.bc_episodes} 局 × 最多 {args.bc_max_steps} 步"
-              f"（teacher={args.bc_teacher}）")
+              f"（teacher={args.bc_teacher} / space={args.action_space}）")
         samples = collect_demos(env, episodes=args.bc_episodes, max_steps=args.bc_max_steps,
                                 teacher_version=args.bc_teacher)
         before = teacher_agreement(policy, samples)
@@ -448,20 +494,34 @@ def main(argv: List[str] | None = None) -> int:
             "epochs": int(args.bc_epochs),
             "samples": len(samples),
             "accuracy": bc_result["accuracy"],
-            "agreementBefore": before,
-            "agreementAfter": after,
+            # v1 是 float；v2 是「逐头平均」（单值），明细另存 headAgreement*。
+            "agreementBefore": _agreement_scalar(before),
+            "agreementAfter": _agreement_scalar(after),
+            "agreementBeforeExact": _agreement_detail(before, "exactMatch"),
+            "agreementAfterExact": _agreement_detail(after, "exactMatch"),
+            "headAgreementBefore": _agreement_detail(before, "perHead"),
+            "headAgreementAfter": _agreement_detail(after, "perHead"),
             "loss": bc_result["loss"][-1] if bc_result["loss"] else None,
             "teacher": args.bc_teacher,
             "temperature": float(bc_result["temperature"]),
             "labelSmoothing": float(bc_result["labelSmoothing"]),
             "teacherEntropy": bc_result["teacherEntropy"],
+            # G-710：v2 才有（v1 为 None），逐头的 argmax 命中率
+            "perHeadAccuracy": bc_result.get("perHeadAccuracy"),
+            "heads": bc_result.get("heads") or policy.head_names(),
+            "totalWeight": bc_result.get("totalWeight"),
         }
         print(
-            f"[bc] teacher 一致率 {before:.3f} → {after:.3f}（BC 后）"
+            f"[bc] teacher 一致率 {_fmt_agreement(before)} → {_fmt_agreement(after)}（BC 后）"
             f" / loss {bc_info['loss']} / 样本 {len(samples)} / {bc_result['epochs']} 轮"
             f" / T={bc_info['temperature']:g} eps={bc_info['labelSmoothing']:g}"
             f" / 老师熵 {bc_info['teacherEntropy']}"
         )
+        if bc_info["perHeadAccuracy"]:
+            head_names = bc_info["heads"] or []
+            print("[bc] 逐头准确率 " + " ".join(
+                f"{name}={float(value):.2f}"
+                for name, value in zip(head_names, bc_info["perHeadAccuracy"])))
     elif args.bc_epochs <= 0:
         print("[bc] 跳过（--bc-epochs 0）")
     else:
@@ -496,6 +556,13 @@ def main(argv: List[str] | None = None) -> int:
         args.eval_episodes if args.eval_episodes is not None else 1)
     eval_epochs = max(0, int(eval_epochs))
     per_epoch = sum(count for _mode, count in plan)
+    # G-710：`--episodes 0`（纯蒸馏 / 只做训练前评估）时训练计划每回合 0 局，
+    # 照 plan 跑评估会得到 0 局、胜率恒 0/0。此时每个阶段每回合跑 **1** 局，
+    # 于是 `eval_epochs` 遍正好是 `eval_epochs` 局（按 eval_epochs 局塞进 count
+    # 会变成 eval_epochs² 局——第一版就是这么写成 36 局的）。
+    # per_epoch>0 时 eval_plan == plan，与旧行为完全一致。
+    eval_plan = plan if per_epoch > 0 else [(mode, 1) for mode, _count in plan]
+    eval_episodes = eval_epochs * sum(count for _mode, count in eval_plan)
     print(
         f"[train] bots={args.users} ports={args.ports} plan={plan} "
         f"max_steps={args.max_steps} obs={env.observation_space.shape} "
@@ -514,7 +581,7 @@ def main(argv: List[str] | None = None) -> int:
     )
     print(
         f"[train] 训练回合={epochs} × 每回合 {per_epoch} 轮次 = {epochs * per_epoch} 局；"
-        f"评估回合={eval_epochs}（共 {eval_epochs * per_epoch} 局，"
+        f"评估回合={eval_epochs}（共 {eval_episodes} 局，"
         f"{'采样' if args.eval_sampling else '贪心'}不学习）"
     )
 
@@ -525,7 +592,7 @@ def main(argv: List[str] | None = None) -> int:
         trainer.rng = np.random.default_rng(args.eval_seed)
         records: list[dict] = []
         for epoch in range(1, eval_epochs + 1):
-            for mode, count in plan:
+            for mode, count in eval_plan:
                 env.opponent_mode = mode
                 for record in trainer.evaluate(count, greedy=greedy):
                     record["opponentMode"] = mode
@@ -588,11 +655,16 @@ def main(argv: List[str] | None = None) -> int:
                                        temperature=args.bc_temperature,
                                        label_smoothing=args.bc_label_smoothing)
             after = teacher_agreement(policy, samples)
+            # v1 是 float、v2 是 dict：report 里统一存「单值」，明细另存。
+            after_scalar = _agreement_scalar(after)
             entry = {
                 "round": round_no,
                 "samples": len(samples),
-                "agreement": after,
-                "agreementBefore": before,
+                "agreement": after_scalar,
+                "agreementBefore": _agreement_scalar(before),
+                "agreementExact": _agreement_detail(after, "exactMatch"),
+                "headAgreement": _agreement_detail(after, "perHead"),
+                "perHeadAccuracy": bc_result.get("perHeadAccuracy"),
                 "loss": bc_result["loss"][-1] if bc_result["loss"] else None,
                 "evaluation": {"sampling": None, "greedy": None},
             }
@@ -605,11 +677,11 @@ def main(argv: List[str] | None = None) -> int:
             dagger_report.append(entry)
             print(
                 f"[dagger] 第 {round_no} 轮：samples={len(samples)} "
-                f"agreement {before:.3f} → {after:.3f} / loss {entry['loss']} "
-                f"评估={_fmt_eval(entry['evaluation'])}"
+                f"agreement {_fmt_agreement(before)} → {_fmt_agreement(after)} "
+                f"/ loss {entry['loss']} 评估={_fmt_eval(entry['evaluation'])}"
             )
-            if after >= float(args.dagger_target_agreement):
-                print(f"[dagger] 一致率 {after:.3f} ≥ {args.dagger_target_agreement}，提前结束")
+            if after_scalar is not None and after_scalar >= float(args.dagger_target_agreement):
+                print(f"[dagger] 一致率 {after_scalar:.3f} ≥ {args.dagger_target_agreement}，提前结束")
                 break
 
     if args.eval_before_train and eval_epochs > 0:
@@ -668,7 +740,7 @@ def main(argv: List[str] | None = None) -> int:
             # evalEpisodes = 实际评估对局数 = evalRounds × Σ(阶段轮次)（派生，只读）；
             # evalEpochs 保留给旧读者。
             "evalRounds": eval_epochs,
-            "evalEpisodes": eval_epochs * per_epoch,
+            "evalEpisodes": eval_episodes,
             "evalEpochs": eval_epochs,
             "initModel": args.init_model or None,
             "initPolicy": init_path or None,
@@ -725,6 +797,14 @@ def main(argv: List[str] | None = None) -> int:
                 "accuracy": bc_info["accuracy"],
                 "agreementBefore": bc_info.get("agreementBefore"),
                 "agreementAfter": bc_info.get("agreementAfter"),
+                # G-710：v2 蒸馏的逐头明细（v1 为 null，旧读者不受影响）
+                "agreementBeforeExact": bc_info.get("agreementBeforeExact"),
+                "agreementAfterExact": bc_info.get("agreementAfterExact"),
+                "headAgreementBefore": bc_info.get("headAgreementBefore"),
+                "headAgreementAfter": bc_info.get("headAgreementAfter"),
+                "perHeadAccuracy": bc_info.get("perHeadAccuracy"),
+                "heads": bc_info.get("heads"),
+                "totalWeight": bc_info.get("totalWeight"),
                 "loss": bc_info.get("loss"),
                 "maxSteps": int(args.bc_max_steps),
                 # 老师版本与软目标参数（T>1 / eps>0 时 BC 不再把 softmax 压死）
@@ -772,6 +852,15 @@ def main(argv: List[str] | None = None) -> int:
             "temperature": bc_info.get("temperature", float(args.bc_temperature)),
             "labelSmoothing": bc_info.get("labelSmoothing", float(args.bc_label_smoothing)),
             "teacherEntropy": bc_info.get("teacherEntropy"),
+            # G-710：v2 蒸馏（十头）的逐头明细；v1 全部为 null。
+            # agreementBefore/After 在 v2 下是「逐头平均」，exactMatch 是全体完全一致率。
+            "agreementBeforeExact": bc_info.get("agreementBeforeExact"),
+            "agreementAfterExact": bc_info.get("agreementAfterExact"),
+            "headAgreementBefore": bc_info.get("headAgreementBefore"),
+            "headAgreementAfter": bc_info.get("headAgreementAfter"),
+            "perHeadAccuracy": bc_info.get("perHeadAccuracy"),
+            "heads": bc_info.get("heads"),
+            "totalWeight": bc_info.get("totalWeight"),
         },
         # P2.2 块 B：训练前评估（--eval-before-train 时非 null）。
         "evaluationBefore": eval_before,

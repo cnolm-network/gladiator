@@ -336,6 +336,12 @@ class GladiatorEnv(gym.Env):
         self.opponent_epsilon = float(opponent_epsilon or 0.0)
         if not 0.0 <= self.opponent_epsilon <= 1.0:
             raise ValueError(f"opponent_epsilon 必须在 [0, 1]，收到 {opponent_epsilon}")
+        #: 对手策略是不是 **v2 意图策略**（G-707）。
+        #: 为 True 时对手给的是 10 头数组，``step`` 会走 ``decode_intent`` 那条路径；
+        #: 为 False 时仍是 v1 的 11 路宏动作编号（历史行为，保持不变）。
+        self._opponent_v2 = bool(
+            getattr(self.opponent_policy, "is_v2", False)
+            or str(getattr(self.opponent_policy, "action_space", "v1")).strip().lower() == "v2")
         #: 对手（策略驱动）最近一次真下发 attack 的时刻，观测 self_since_attack 用。
         self._opponent_last_attack_at: dict[str, float] = {}
         #: 对手策略的运行统计（累计，不随 reset 清零）：决策数/随机探索数/动作失败数。
@@ -504,10 +510,13 @@ class GladiatorEnv(gym.Env):
     def step(self, action):
         self._steps += 1
         if self.single_agent:
-            # 单智能体：只把 bot_0 的决策交给调用方；对手仍用 v1 宏动作（手写控制器）。
+            # 单智能体：只把 bot_0 的决策交给调用方；对手默认用 v1 宏动作（手写控制器）。
+            # G-707：策略驱动的对手可能是 **v2 意图策略**（例如 teacher v4 要能表达
+            # `sprintReset`），此时它给的是 10 头数组而不是动作编号，原样带给 decode_intent。
             action_map = {self._key(0): action}
             for index in range(1, len(self.bots)):
-                action_map[self._key(index)] = int(self._opponent_action(index))
+                action_map[self._key(index)] = self._coerce_action_value(
+                    self._opponent_action(index))
         else:
             action_map = action
 
@@ -518,8 +527,10 @@ class GladiatorEnv(gym.Env):
         opponents = self._opponent_names()
         for i, bot in enumerate(self.bots):
             value = action_map.get(self._key(i), 0)
-            # 多智能体 v2：所有 Bot 都走意图；单智能体 v2：只有学习方走意图。
-            use_intent = self._action_v2 and (not self.single_agent or i == 0)
+            # 多智能体 v2：所有 Bot 都走意图；单智能体 v2：学习方走意图；
+            # 单智能体 + v2 对手策略（G-707）：对手也走意图。
+            use_intent = ((self._action_v2 and (not self.single_agent or i == 0))
+                          or (i != 0 and self._opponent_v2))
             intent: dict | None = None
             if use_intent:
                 intent = decode_intent(value)
@@ -926,8 +937,9 @@ class GladiatorEnv(gym.Env):
 
         编码口径与学习方完全一致（同一个 ``encode_observation``）：把**对手自己**当
         ``username``、``opponent_health`` 取学习方血量、``reach`` 用对手自己的、
-        ``since_attack`` 用 ``_opponent_last_attack_at``。返回离散动作编号，
-        decode + 发送沿用 ``step()`` 里与学习方相同的那条路径。
+        ``since_attack`` 用 ``_opponent_last_attack_at``。返回动作编号（v1 策略）或
+        10 头数组（v2 策略，见 ``_opponent_v2``），decode + 发送沿用 ``step()`` 里
+        与学习方相同的那条路径。
 
         ``opponent_epsilon``：以该概率把动作**换成随机动作**（``act`` 仍会被调用一次，
         统计里能对上步数，也便于观察策略到底想干什么）。
@@ -956,7 +968,7 @@ class GladiatorEnv(gym.Env):
         )
         explore = float(self.np_random.random()) < self.opponent_epsilon
         try:
-            action = int(self.opponent_policy.act(vector, self.np_random, greedy=not explore))
+            action = self.opponent_policy.act(vector, self.np_random, greedy=not explore)
         except Exception as exc:  # noqa: BLE001 - 坏快照不该打断整局采样
             stats["errors"] += 1
             if stats["errors"] == 1:
@@ -964,6 +976,23 @@ class GladiatorEnv(gym.Env):
                           f"{type(exc).__name__}: {exc}")
             action = 0
         stats["decisions"] += 1
+        if self._opponent_v2:
+            # v2 对手（teacher v4 / 自博弈 v2 快照）：动作是 10 头数组，不做 v1 的编号校验。
+            picked = np.asarray(action, dtype=np.int64).reshape(-1)
+            if explore or picked.size != len(MULTI_DISCRETE_V2):
+                # 探索时按各头均匀采样（与 env 的 MultiDiscrete 同分布）；
+                # 头数对不上说明策略与当前动作空间不一致，退回随机而不是把越界值发出去。
+                if not explore:
+                    stats["invalidActions"] += 1
+                picked = np.asarray(
+                    [self.np_random.integers(0, size) for size in MULTI_DISCRETE_V2],
+                    dtype=np.int64)
+                if explore:
+                    stats["epsilonPicks"] += 1
+            stats["lastAction"] = [int(v) for v in picked]
+            stats["lastGreedy"] = not explore
+            return picked
+        action = int(action)
         if explore:
             action = int(self.np_random.integers(NUM_ACTIONS))
             stats["epsilonPicks"] += 1
@@ -973,6 +1002,19 @@ class GladiatorEnv(gym.Env):
         stats["lastAction"] = int(action)
         stats["lastGreedy"] = not explore
         return int(action)
+
+    @staticmethod
+    def _coerce_action_value(value: Any) -> Any:
+        """对手动作归一：v2 是头数组（保持数组），v1 是动作编号（转 ``int``）。
+
+        ``step`` 里对 ``self._opponent_action(index)`` 的返回值统一走这里，
+        这样「v1 对手 + v2 对手」可以共存于同一段派发代码，不必分叉。
+        """
+        if isinstance(value, np.ndarray):
+            return value.astype(np.int64, copy=False).reshape(-1)
+        if isinstance(value, (list, tuple)):
+            return np.asarray(value, dtype=np.int64).reshape(-1)
+        return int(value)
 
     @staticmethod
     def _key(index: int) -> str:

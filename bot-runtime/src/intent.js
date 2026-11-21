@@ -2,8 +2,9 @@
  * 动作空间 v2 的意图执行器：`{type:"intent", intent:{...}}` → mineflayer 调用。
  *
  * <p>背景见 `docs/identity-and-action-space.md` §2.2：v1 的 11 个宏动作把
- * 「选槽 + 右键 + 按住 + 切回剑」写死，加物品就要重训。v2 把这些拆成 9 个正交头，
- * 环境只发意图，**怎么按**由 `items.json` 的能力表决定，因此加物品零改代码。
+ * 「选槽 + 右键 + 按住 + 切回剑」写死，加物品就要重训。v2 把这些拆成 10 个正交头
+ * （G-707 追加 `sprintReset`），环境只发意图，**怎么按**由 `items.json` 的能力表决定，
+ * 因此加物品零改代码。
  *
  * <p>分工与 v1 保持一致：
  * - `move` / `jump` / `sneak` / `sprint` / `look` 直接打 mineflayer 的控制状态；
@@ -24,6 +25,19 @@ export const MOVE_VALUES = Object.freeze(['idle', 'forward', 'back', 'left', 'ri
 export const MOVE_DIRECTIONS = Object.freeze(['forward', 'back', 'left', 'right']);
 /** 意图里合法的 use 取值（`none` 用 `null` 表示）。 */
 export const USE_VALUES = Object.freeze([null, 'click', 'hold']);
+/**
+ * 意图里合法的 `sprintReset` 取值（与 `spaces.py::SPRINT_RESET_VALUES_V2` 同序，G-707）。
+ *
+ * - `none`：不重置疾跑（缺省，行为与九头时代完全一致）；
+ * - `release_w`：**同一帧内**先松 `forward` → 发 attack → 立刻按回 `forward`（wtap）；
+ * - `block_hit`：**同一帧内**先举剑（右键按住 300ms）再 attack（防砍 / block-hit）。
+ *
+ * 组合权在模型手里（ADR-020）：这里**不**做「命中后自动 reset」的隐式合成，
+ * 只负责把意图里已经写明的那一步按物理顺序派发出去。
+ */
+export const SPRINT_RESET_VALUES = Object.freeze(['none', 'release_w', 'block_hit']);
+/** `block_hit` 举剑的保持时长（毫秒）。1.8 的「防砍」至少要举过命中帧。 */
+export const BLOCK_HIT_HOLD_MS = 300;
 
 /** 一个 tick 的毫秒数（1.8 固定 20 TPS）。 */
 export const INTENT_TICK_MS = 50;
@@ -95,7 +109,8 @@ function num(value, fallback = 0) {
  *
  * @param {object} raw 意图字典
  * @returns {{move:string, look:{dyaw:number, dpitch:number}, attack:boolean,
- *            use:string|null, slot:number|null, jump:boolean, sneak:boolean, sprint:boolean}}
+ *            use:string|null, slot:number|null, jump:boolean, sneak:boolean, sprint:boolean,
+ *            sprintReset?:string}}
  */
 export function normalizeIntent(raw) {
   if (!raw || typeof raw !== 'object') {
@@ -123,7 +138,16 @@ export function normalizeIntent(raw) {
       throw new Error(`intent.slot 越界：${raw.slot}（热键栏 0..8）`);
     }
   }
-  return {
+  // G-707：sprintReset 缺省 = none，且**不写进返回对象**——这样九头时代的 intent
+  // 归一化结果逐字段不变（回归口径），只有真的要重置时才多一个键。
+  const resetRaw = raw.sprintReset === undefined || raw.sprintReset === null
+    ? 'none'
+    : String(raw.sprintReset).trim().toLowerCase();
+  if (!SPRINT_RESET_VALUES.includes(resetRaw)) {
+    throw new Error(
+      `intent.sprintReset 不认识：${raw.sprintReset}（允许 ${SPRINT_RESET_VALUES.join(' / ')}）`);
+  }
+  const normalized = {
     move,
     look: { dyaw: num(look.dyaw, 0), dpitch: num(look.dpitch, 0) },
     attack: Boolean(raw.attack),
@@ -133,6 +157,10 @@ export function normalizeIntent(raw) {
     sneak: Boolean(raw.sneak),
     sprint: Boolean(raw.sprint),
   };
+  if (resetRaw !== 'none') {
+    normalized.sprintReset = resetRaw;
+  }
+  return normalized;
 }
 
 /** 一行紧凑回显（运行时日志 / 复盘用）。 */
@@ -161,6 +189,9 @@ export function describeIntent(raw) {
   if (keys.length) {
     parts.push(`keys=${keys.join('+')}`);
   }
+  if (intent.sprintReset) {
+    parts.push(`reset=${intent.sprintReset}`);
+  }
   return parts.join(' ');
 }
 
@@ -172,6 +203,21 @@ function releaseMove(bot, state) {
       // Bot 掉线时 setControlState 会抛，交给上层的连接处理。
     }
     state.pressed[direction] = false;
+  }
+}
+
+/** 重新起「没有新意图就松键」的宽限计时（`release_w` 松手后再按回来也要重新计时）。 */
+function armMoveRelease(bot, state, graceMs) {
+  if (state.moveTimer) {
+    clearTimeout(state.moveTimer);
+    state.moveTimer = null;
+  }
+  state.moveTimer = setTimeout(() => {
+    state.moveTimer = null;
+    releaseMove(bot, state);
+  }, Math.max(1, graceMs));
+  if (typeof state.moveTimer.unref === 'function') {
+    state.moveTimer.unref();
   }
 }
 
@@ -196,13 +242,7 @@ function applyMove(bot, state, move, graceMs) {
   if (move === 'idle') {
     return;
   }
-  state.moveTimer = setTimeout(() => {
-    state.moveTimer = null;
-    releaseMove(bot, state);
-  }, Math.max(1, graceMs));
-  if (typeof state.moveTimer.unref === 'function') {
-    state.moveTimer.unref();
-  }
+  armMoveRelease(bot, state, graceMs);
 }
 
 /** 应用视角头：**增量**旋转（度 → 弧度），每 tick 各自 clamp。 */
@@ -306,6 +346,54 @@ async function applyUse(bot, state, use, table) {
     state.useTimer.unref();
   }
   return { mode, held: name, ticks, holdMs };
+}
+
+/**
+ * `sprintReset = block_hit`：举剑（防砍）。
+ *
+ * <p>复用 `use{sword, holdMs=300}` 那条既有路径：先按 `items.js` 切到剑
+ * （手里不是剑时 `needsSwordSwap` 才动背包），再 `activateItem`，300ms 后自动松开。
+ * 与 `applyUse` 共用 `state.useHeld` / `state.useTimer`，因此：
+ * - 本帧随后若还有 `use` 意图，不会再 `activateItem` 一次（不会把举剑点掉）；
+ * - `use: null` 或下一个 tick 的普通 hold 仍能正常接管，计时也不会叠成「永不松手」。
+ *
+ * <p>举剑与出手在**同一次 applyIntent 调用里**完成（先举后砍），这正是 1.8「防砍」
+ * 的物理顺序：命中帧手持剑且处于格挡姿态，吃 0.5× 伤害并重置疾跑。
+ */
+async function applyBlockHit(bot, state, table) {
+  if (needsSwordSwap(bot.heldItem)) {
+    try {
+      await selectItem(bot, 'sword');
+    } catch {
+      // 没剑也照样出手：空手挥击的伤害由服务端决定，不该吞掉意图。
+    }
+  }
+  const held = bot.heldItem;
+  const name = held && typeof held.name === 'string' ? held.name : '';
+  const spec = table && typeof table.useSpec === 'function'
+    ? table.useSpec(name)
+    : { mode: 'none' };
+  const mode = String(spec.mode || 'none');
+  if (!name || mode === 'none') {
+    return { reset: 'block_hit', held: name || null, skipped: 'no-usable-item' };
+  }
+  if (!state.useHeld) {
+    bot.activateItem(Boolean(spec.offhand));
+    state.useHeld = true;
+    state.stats.holds += 1;
+  }
+  if (state.useTimer) {
+    clearTimeout(state.useTimer);
+    state.useTimer = null;
+  }
+  state.useTimer = setTimeout(() => {
+    state.useTimer = null;
+    releaseUse(bot, state);
+  }, BLOCK_HIT_HOLD_MS);
+  if (typeof state.useTimer.unref === 'function') {
+    state.useTimer.unref();
+  }
+  return { reset: 'block_hit', held: name, mode, holdMs: BLOCK_HIT_HOLD_MS };
 }
 
 /** 找最近的其他玩家（战斗目标的唯一来源；意图里不带 entityId）。 */
@@ -437,15 +525,62 @@ export async function applyIntent(bot, intent, ctx = {}) {
     applied.jump = true;
   }
 
+  // 3.5) sprintReset = release_w（G-707）：**攻击前**松 W 再按回，把疾跑速度重置回最大值。
+  // 依据 `docs/knowledge/pvp-1.8-mechanics.md` §2.5（用户整理的 `PVP_overview.md` 正本）：
+  // 「疾跑速度越大，产生的击退越大；第一次疾跑攻击后速度会降下来——一次疾跑的第一次攻击最大」，
+  // 所以 reset 的目的是让**这一刀**吃满疾跑速度 → 对手吃更大 KB（配上高低差就是 combo），
+  // 而不是把这一刀变成非疾跑小 KB（那是早期理解，已纠正）。
+  // 顺序必须是 release → re-press → attack，全部在同一帧内完成。
+  const reset = action.sprintReset || 'none';
+  const holdingForward = action.move === 'forward';
+  let releasedForward = false;
+  let didRelease = false;
+  if (reset === 'release_w' && holdingForward) {
+    bot.setControlState('forward', false);
+    state.pressed.forward = false;
+    releasedForward = true;
+    didRelease = true;
+  }
+  if (reset === 'release_w' && releasedForward) {
+    // 立刻按回：这一对 false→true 就是「重置疾跑速度」本身。
+    bot.setControlState('forward', true);
+    state.pressed.forward = true;
+    armMoveRelease(bot, state, graceMs);
+    releasedForward = false;
+  }
+  // 3.6) 疾跑位同样要走一次 false→true：mineflayer 只在 controlState.sprint 变化时才发
+  // START_SPRINTING，而 1.8 的 sprint 是服务端状态位（命中后清掉），客户端状态还是 true，
+  // 于是「重置」不会真的生效。只在意图本身要求疾跑时才动，绝不替模型做决定。
+  if (reset === 'release_w' && action.sprint) {
+    bot.setControlState('sprint', false);
+    bot.setControlState('sprint', true);
+    applied.sprint = true;
+    applied.sprintResent = true;
+  }
+
   // 4) 右键：能力表决定按多久。
   const useResult = await applyUse(bot, state, action.use, ctx.itemTable);
   if (useResult && (useResult.mode || useResult.released)) {
     applied.use = useResult;
   }
 
+  // 4.5) sprintReset = block_hit：同一帧内先举剑，紧接的 5) 再出手。
+  if (reset === 'block_hit') {
+    applied.sprintReset = await applyBlockHit(bot, state, ctx.itemTable);
+  }
+
   // 5) 左键：attack-guard（切剑 + 500ms 节流）。
   if (action.attack) {
     applied.attack = await applyAttack(bot, state, ctx);
+  }
+
+  // 6) release_w 回报：reset 已经在 attack 之前完成（release → re-press → attack）。
+  if (reset === 'release_w') {
+    applied.sprintReset = applied.sprintReset
+      || { reset: 'release_w', released: didRelease ? 'forward' : null, restored: didRelease };
+    if (applied.sprintResent) {
+      applied.sprintReset.sprintResent = true;
+    }
   }
 
   state.stats.intents += 1;

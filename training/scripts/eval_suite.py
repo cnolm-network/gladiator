@@ -42,7 +42,8 @@ from gladiator_train.eval_suite import (  # noqa: E402
     summarize,
     verdict,
 )
-from gladiator_train.policy import Policy  # noqa: E402
+from gladiator_train.policy import Policy, load_for_obs_dim  # noqa: E402
+from gladiator_env.spaces import OBS_DIM  # noqa: E402
 
 TRAINING_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = TRAINING_DIR / "artifacts" / "evals"
@@ -171,7 +172,8 @@ def _load_policy(path: str) -> Policy:
     target = Path(path)
     if not target.is_file():
         raise SystemExit(f"策略文件不存在: {target}")
-    return Policy.load(str(target))
+    # 旧 23 维模型（G-702 之前）在当前 25 维环境上评估：W1 右侧补零，旧特征留在原下标。
+    return load_for_obs_dim(str(target), OBS_DIM)
 
 
 def _write_json(directory: Path, name: str, payload: dict) -> Path:

@@ -14,8 +14,10 @@
 - ``v1``（默认，也是旧模型的形态）：**单头** Categorical，动作是 ``int``，
   参数名 ``W2`` / ``b2``；
 - ``v2``：**多离散头（factorized）**，``h = tanh(W1·x + b1)`` 共享，
-  每个头一套 ``W2_<head>`` / ``b2_<head>``，动作是长度 H=9 的 int 数组，
-  ``log π(a|s) = Σ_head log π_head(a_head|s)``，熵也是逐头求和。
+  每个头一套 ``W2_<head>`` / ``b2_<head>``，动作是长度 H 的 int 数组（当前 H=10，
+  见 ``spaces.ACTION_HEADS_V2``），``log π(a|s) = Σ_head log π_head(a_head|s)``，
+  熵也是逐头求和。头的数量与大小**一律从 ``head_sizes`` 推导**，本模块不假设具体头数：
+  G-707 加 ``sprint_reset`` 时把 H 从 9 改成 10，除了默认值之外不需要改这里的逻辑。
 
 v2 的头名与顺序来自 ``gladiator_env.spaces.ACTION_HEADS_V2``（延迟导入，
 避免策略模块在 import 期就拉起 gymnasium）。
@@ -74,7 +76,7 @@ class Policy:
     """单隐藏层 softmax 策略，参数名与 `save()/load()` 一致。
 
     ``action_space="v1"`` 时与旧实现逐字节一致（单头 ``W2``/``b2``、动作为 ``int``）；
-    ``action_space="v2"`` 时是 9 个离散头的因子化策略（每条 ``W2_<head>``/``b2_<head>``）。
+    ``action_space="v2"`` 时是 H 个离散头（当前 10）的因子化策略（每条 ``W2_<head>``/``b2_<head>``）。
     """
 
     #: 类上访问 → v1 参数名；实例上访问/调用 → 该实例的参数名（见 ``_ParamNamesDescriptor``）。
@@ -166,7 +168,7 @@ class Policy:
 
     # ------------------------------------------------------------ 头/参数名
     def head_names(self) -> List[str]:
-        """头名（v1 是 ``["action"]``，v2 是 9 个头）。"""
+        """头名（v1 是 ``["action"]``，v2 是 H 个头，当前 10 个）。"""
         return list(self._head_names)
 
     def head_sizes(self) -> List[int]:
@@ -222,7 +224,9 @@ class Policy:
     def _hidden_and_logits(self, x: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
         """返回 (hidden, **未除温度**的 logits)。**仅 v1**（v2 用 :meth:`logits_all`）。"""
         if self.is_v2:
-            raise ValueError("v2 是 9 个独立头，没有单一 logits：请用 logits_all()/log_prob()")
+            raise ValueError(
+                f"v2 是 {len(self._head_sizes)} 个独立头，没有单一 logits："
+                "请用 logits_all()/log_prob()")
         x = np.asarray(x, dtype=np.float64).reshape(self.obs_dim)
         h = np.tanh(self.params["W1"] @ x + self.params["b1"])
         return h, self.params["W2"] @ h + self.params["b2"]
@@ -443,7 +447,7 @@ class Policy:
         梯度却会被 softmax 压到接近 0（策略梯度消失），所以必须和权重范数一起看。
         经验阈值：``logitStd > 4`` 基本可以认为已经饱和。
 
-        v2 先按头算标准差再取平均：9 个头里有的很平（move）有的很尖（attack），
+        v2 先按头算标准差再取平均：各头里有的很平（move）有的很尖（attack），
         先平均会把尖的那个头的信息冲掉。
         """
         if len(observations) == 0:
@@ -789,7 +793,9 @@ class Policy:
           观测新增字段一律追加在 ``OBS_FIELDS`` 末尾（见 spaces.py），所以补零只能补在右侧；
           若补在左侧，旧特征会整体右移，权重语义会被破坏；
         - 旧 ``.npz`` 没有 ``actionSpace`` → 视为 ``v1``（v1 是历史默认）；
-          v2 模型带 ``actionSpace="v2"`` 与 ``headSizes``，加载时按它重建 9 个头。
+          v2 模型带 ``actionSpace="v2"`` 与 ``headSizes``，加载时按它重建这批头
+          （G-707 之后是 10 个；9 头的老 v2 模型按文件里的 ``headSizes`` 重建 9 个，
+          再由 :func:`adopt_weights` 增量接管到 10 头）。
         """
         with np.load(path, allow_pickle=True) as data:
             meta = json.loads(str(data["_meta"]))
@@ -823,6 +829,20 @@ class Policy:
         return policy
 
 
+def load_for_obs_dim(path: str, obs_dim: int) -> Policy:
+    """加载策略，并把**旧观测维度**右侧补零扩到 ``obs_dim``。
+
+    为什么需要单独一个入口：``Policy.load`` 默认保持文件里的 ``obs_dim``（续训语义），
+    于是 G-702 之前的 23 维模型直接拿来评估会在 ``forward`` 里 reshape 失败
+    （``cannot reshape array of size 25 into shape (23,)``）。评估脚本要的是「用当前
+    观测喂旧模型」，口径与 ``--init-policy`` 一致：旧特征留在原下标，新列补零。
+    """
+    loaded = Policy.load(path)
+    if loaded.obs_dim >= int(obs_dim):
+        return loaded
+    return Policy.load(path, obs_dim=int(obs_dim))
+
+
 def check_compat(policy: "Policy", *, obs_dim: int, n_actions: int, hidden: int,
                  action_space: str = "v1") -> List[str]:
     """返回不匹配项（空列表=兼容）。供 ``--init-policy`` 的启动校验复用，便于单测。"""
@@ -844,9 +864,16 @@ def check_compat(policy: "Policy", *, obs_dim: int, n_actions: int, hidden: int,
         # v2 的动作维度由头大小决定，n_actions 是求和值，只需确认头结构没变。
         from gladiator_env.spaces import ACTION_HEADS_V2
 
-        want_sizes = list(ACTION_HEADS_V2.values())
-        if policy.head_sizes() != want_sizes:
-            problems.append(f"v2 头大小 {policy.head_sizes()} != 当前 {want_sizes}（需重训）")
+        want = list(ACTION_HEADS_V2.items())
+        if policy.head_sizes() != [size for _name, size in want]:
+            if _heads_extend(want, _head_pairs(policy)):
+                # G-707：9 头的老 v2 模型可以增量接管到 10 头（新头 Xavier 初始化），
+                # 所以这里**不算**不兼容；真正无法合并的是「头更多 / 头名不同 / 改了大小」。
+                pass
+            else:
+                problems.append(
+                    f"v2 头结构 {_head_pairs(policy)} != 当前 {want}"
+                    "（不是可前缀扩展的结构，需重训）")
     elif int(policy.n_actions) != int(n_actions):
         problems.append(f"n_actions {policy.n_actions} != {n_actions}")
     return problems
@@ -881,16 +908,20 @@ def adopt_weights(policy: Policy, loaded: Policy) -> Policy:
 
     - ``v1 → v1`` / ``v2 → v2``：逐参数全量接管；
     - ``v1 → v2``：**允许**。``W1/b1``（表征）与 ``Wv/bv``（critic）继承，
-      ``W2/b2`` 丢弃并重新随机初始化——v1 的单头 logits 和 9 个头没有对应关系，
+      ``W2/b2`` 丢弃并重新随机初始化——v1 的单头 logits 和各头没有对应关系，
       硬塞只会得到垃圾动作分布，不如让新头从 Xavier 起点重新学；
-    - ``v2 → v1``：**拒绝**。9 个头无法压回一个 11 路 softmax（信息不可逆），
+    - ``v2(H=9) → v2(H=10)``：**允许**（G-707 的 ``sprint_reset`` 追加在末尾）。
+      只搬**同名**的头，新加的头保留构造函数里的 Xavier 初始化，因此「加一个头」不需要重训
+      已有部分；反过来（目标比模型少头，或头名对不上）仍然拒绝——那是真的结构不兼容；
+    - ``v2 → v1``：**拒绝**。H 个头无法压回一个 11 路 softmax（信息不可逆），
       报错让调用方显式重训。
     """
     source_space = str(getattr(loaded, "action_space", "v1"))
     target_space = str(getattr(policy, "action_space", "v1"))
     if source_space == "v2" and target_space == "v1":
         raise ValueError(
-            "不能把 v2（9 头）模型加载进 v1（单头）：9 个离散头无法合并成一个 11 路 softmax。"
+            f"不能把 v2（{len(getattr(loaded, '_head_sizes', []))} 头）模型加载进 v1（单头）："
+            f"{len(getattr(loaded, '_head_sizes', []))} 个离散头无法合并成一个 11 路 softmax。"
             "请用 --action-space v2 续训，或换一个 v1 模型。")
     if source_space == "v1" and target_space == "v2":
         for key in ("W1", "b1", "Wv", "bv"):
@@ -903,10 +934,13 @@ def adopt_weights(policy: Policy, loaded: Policy) -> Policy:
         policy.temperature = float(getattr(loaded, "temperature", 1.0) or 1.0)
         return policy
     if target_space == "v2" and policy.head_sizes() != loaded.head_sizes():
-        raise ValueError(
-            f"v2 头结构不一致：模型 {loaded.head_sizes()} vs 当前 {policy.head_sizes()}（需重训）")
+        if not _heads_extend(_head_pairs(policy), _head_pairs(loaded)):
+            raise ValueError(
+                f"v2 头结构不一致：模型 {loaded.head_sizes()} vs 当前 {policy.head_sizes()}"
+                "（只有「目标 = 模型头 + 追加在末尾的新头」才能增量接管，否则需重训）")
     for key in policy.param_names():
         if key not in loaded.params:
+            # 追加的新头（例如 G-707 的 sprint_reset）保留构造函数里的 Xavier 初始化。
             continue
         value = np.array(loaded.params[key], dtype=np.float64)
         if key == "W1" and value.shape[1] != policy.obs_dim:
@@ -915,6 +949,29 @@ def adopt_weights(policy: Policy, loaded: Policy) -> Policy:
     # P2.3：温度也随模型走（--logit-temp 显式给了的话，调用方会在 adopt 之后覆盖）。
     policy.temperature = float(getattr(loaded, "temperature", 1.0) or 1.0)
     return policy
+
+
+def _head_pairs(owner: "Policy") -> List[Tuple[str, int]]:
+    """``[(头名, 头大小), ...]``（顺序即头顺序）。"""
+    return list(zip(owner.head_names(), owner.head_sizes()))
+
+
+def _heads_extend(target: Sequence[Tuple[str, int]],
+                  source: Sequence[Tuple[str, int]]) -> bool:
+    """``source`` 是否是 ``target`` 的**严格前缀**（同名 + 同大小）。
+
+    G-707 的 9→10 就是这种情形：``[("move",5),…,("slot",9)]`` 是
+    ``[…, ("slot",9), ("sprint_reset",3)]`` 的前缀。前缀之外的排列（换头名、改大小、
+    目标比模型还少）都不接受——那些情况下「按名字搬」得到的语义是错的。
+    """
+    target = list(target)
+    source = list(source)
+    if len(source) >= len(target):
+        return False
+    for index, item in enumerate(source):
+        if target[index] != item:
+            return False
+    return True
 
 
 def act_with_mask(policy: "Policy", obs: Sequence[float], rng: np.random.Generator,

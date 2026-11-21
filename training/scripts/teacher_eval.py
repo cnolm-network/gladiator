@@ -9,9 +9,13 @@
     .venv\\Scripts\\python.exe scripts\\teacher_eval.py --policy ..\\dashboard\\var\\models\\dagger-1118b\\policy.npz \\
         --teacher v3 --episodes 8 --users Bot_V0A Bot_V0B --ports 8770 8771 --no-spawn
 
-``--teacher`` 可选 ``v1`` / ``v2`` / ``v3``（默认 ``v2``）：v1 是静态四条规则、v2 在 v1 之上
-加跳劈、v3 改成「冷却感知」（冷却没好不空砍，改用走位/跳劈/格挡）。同一份策略对三个老师
-各跑一遍，就能看出老师之间的强度差。
+``--teacher`` 可选 ``v1`` / ``v2`` / ``v3`` / ``v4``（默认 ``v2``）：v1 是静态四条规则、
+v2 在 v1 之上加跳劈、v3 改成「冷却感知」（冷却没好不空砍，改用走位/跳劈/格挡）、
+v4 跑在 **v2 动作空间（10 头）** 上、按 1.8 招式表做 wtap / block_hit 的组合。
+同一份策略对四个老师各跑一遍，就能看出老师之间的强度差。
+
+注意 v4 是**唯一**会向环境发 ``{type:"intent"}`` 的老师（其余三个发 v1 宏动作）：
+``GladiatorEnv`` 通过 ``opponent_policy.is_v2`` 识别，学习方仍然是原来的动作空间。
 
 输出：被评估策略对老师的胜率（Wilson 区间 + 精确二项），写 ``artifacts/evals/<时间>-vs-teacher.json``
 （JSON 里的 ``teacher`` 字段记录本局用的是哪个版本）。
@@ -30,12 +34,14 @@ if str(TRAINING_DIR) not in sys.path:
     sys.path.insert(0, str(TRAINING_DIR))
 
 from gladiator_env import ArenaConfig, BotConfig, GladiatorEnv  # noqa: E402
+from gladiator_env.spaces import OBS_DIM  # noqa: E402
 from gladiator_train.demos import (  # noqa: E402
     TEACHER_VERSION,
     heuristic_action,
     make_teacher,
     reset_teacher_v2,
     reset_teacher_v3,
+    reset_teacher_v4,
 )
 from gladiator_train.eval_suite import (  # noqa: E402
     SUITE_DEFAULT,
@@ -44,7 +50,7 @@ from gladiator_train.eval_suite import (  # noqa: E402
     run_suite,
     summarize,
 )
-from gladiator_train.policy import Policy  # noqa: E402
+from gladiator_train.policy import load_for_obs_dim  # noqa: E402
 
 
 class TeacherPolicy:
@@ -55,20 +61,32 @@ class TeacherPolicy:
     节拍会互相污染，也拿不到「谁一直在生效」的证据。
 
     v1 是无状态函数，直接调用即可（``teacher`` 为 ``None``，reason 统计为空）。
+
+    v4 是 v2 意图策略：它返回 10 头数组而不是动作编号，这里用 ``is_v2`` / ``action_space``
+    告诉 ``GladiatorEnv``（见 env 的 ``_opponent_v2``），让它走 ``decode_intent`` 那条路径。
     """
 
-    def __init__(self, version: str = TEACHER_VERSION) -> None:
+    def __init__(self, version: str = TEACHER_VERSION, **teacher_defaults) -> None:
         self.version = version
-        self.meta = {"actionSpace": "v1"}
         self.decisions = 0
-        #: v1 是无状态函数（``make_teacher("v1")`` 返回函数本身），只有 v2/v3 需要实例。
+        #: v1 是无状态函数（``make_teacher("v1")`` 返回函数本身），只有 v2/v3/v4 需要实例。
         self.teacher = None if version == "v1" else make_teacher(version)
+        #: v4 → True：env 据此把对手的动作当意图解释。
+        self.is_v2 = bool(getattr(self.teacher, "is_v2", False))
+        self.action_space = "v2" if self.is_v2 else "v1"
+        self.meta: dict = {"actionSpace": self.action_space, **teacher_defaults}
+        if self.is_v2 and hasattr(self.teacher, "defaults"):
+            self.teacher.defaults.update(teacher_defaults)
 
-    def act(self, vector, rng=None, greedy: bool = True) -> int:
+    def act(self, vector, rng=None, greedy: bool = True):
         self.decisions += 1
-        if self.teacher is not None:
-            return int(self.teacher(vector, self.meta))
-        return int(heuristic_action(vector))
+        if self.teacher is None:
+            return int(heuristic_action(vector))
+        value = self.teacher(vector, self.meta)
+        if self.is_v2:
+            # env 侧会把它交给 decode_intent；返回普通 list 便于 np.asarray 归一。
+            return [int(item) for item in value]
+        return int(value)
 
     def reset_episode(self) -> None:
         """环境每局 ``reset()`` 时回调：归档上一局的 reason 统计并清零跨帧状态。"""
@@ -99,7 +117,9 @@ class TeacherPolicy:
         但报告里记下来，才能解释别的脚本为什么节拍不对。
         """
         state = getattr(self.teacher, "state", None)
-        return getattr(state, "frame_seconds_est", None)
+        # v3 自校准出 `frame_seconds_est`；v4 直接记 `frame_seconds`（不做自校准）。
+        estimate = getattr(state, "frame_seconds_est", None)
+        return estimate if estimate is not None else getattr(state, "frame_seconds", None)
 
     # 自博弈统计里只用到 act；其余接口留空避免 AttributeError。
     def value(self, x):  # noqa: D401 - 兼容性占位
@@ -110,8 +130,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="评估脚本老师作为对手时的强度")
     parser.add_argument("--policy", required=True, help="被评估策略的 .npz 路径")
     parser.add_argument(
-        "--teacher", default="v2", choices=("v1", "v2", "v3"),
-        help="当对手的脚本老师版本（v1 静态四条 / v2 加跳劈 / v3 冷却感知，默认 v2）")
+        "--teacher", default="v2", choices=("v1", "v2", "v3", "v4"),
+        help="当对手的脚本老师版本（v1 静态四条 / v2 加跳劈 / v3 冷却感知 / "
+             "v4 招式表+wtap+block_hit，默认 v2）")
+    parser.add_argument(
+        "--teacher-no-sword", action="store_true",
+        help="让 v4 走「无剑」分支（只用 wtap、不按右键）。其它版本忽略这个开关。")
     parser.add_argument("--episodes", type=int, default=SUITE_DEFAULT["episodes"])
     parser.add_argument("--seed", type=int, default=SUITE_DEFAULT["seed"])
     parser.add_argument("--max-steps", type=int, default=SUITE_DEFAULT["maxSteps"])
@@ -142,10 +166,13 @@ def main(argv: list | None = None) -> int:
     policy_path = Path(args.policy)
     if not policy_path.is_file():
         raise SystemExit(f"策略文件不存在: {policy_path}")
-    policy = Policy.load(str(policy_path))
+    # 旧 23 维模型（dagger-1118b）必须能直接评估当前 25 维环境：右侧补零，
+    # 旧特征留在原下标（与 --init-policy 同口径）。
+    policy = load_for_obs_dim(str(policy_path), OBS_DIM)
     rcon = parse_rcon(args.rcon)
 
-    teacher = TeacherPolicy(args.teacher)
+    teacher = TeacherPolicy(
+        args.teacher, **({"has_sword": False} if args.teacher_no_sword else {}))
 
     def factory(_mode: str) -> GladiatorEnv:
         bots = [
@@ -161,6 +188,9 @@ def main(argv: list | None = None) -> int:
             rcon=rcon or None,
             opponent_mode="scripted",
             opponent_policy=teacher,
+            # G-710：被评估的策略可能是 v2（十头）——环境必须用同一个动作空间建，
+            # 否则 run_suite 的空间校验会直接拒绝（v2 策略 + Discrete 环境）。
+            action_space=str(getattr(policy, "action_space", "v1")),
         )
 
     config = SuiteConfig(
@@ -172,6 +202,7 @@ def main(argv: list | None = None) -> int:
     )
     reset_teacher_v2()
     reset_teacher_v3()
+    reset_teacher_v4()
     rows = run_suite(factory, policy, config)
     teacher.flush()
     reasons = teacher.reason_stats()

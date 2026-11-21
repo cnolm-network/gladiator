@@ -352,12 +352,31 @@ LOOK_PITCH_V2: tuple[float, ...] = (-15.0, -5.0, 0.0, 5.0, 15.0)
 USE_VALUES_V2: tuple[str | None, ...] = (None, "click", "hold")
 #: ``attack`` / ``jump`` / ``sneak`` / ``sprint``：0/1。
 BINARY_VALUES_V2: tuple[bool, ...] = (False, True)
+#: ``sprint_reset`` 头（G-707）：**重置疾跑**的三种做法，顺序固定。
+#:
+#: 背景见 ``docs/knowledge/pvp-1.8-mechanics.md`` §3–§4：1.8 的击退大小由「命中帧是否疾跑」
+#: 决定，而 v2 的 ``move`` 是**连续方向**（``forward`` 表示整帧按住），无法表达「松一帧 W」，
+#: 于是 wtap 这类动作在旧九头里根本没有对应取值——老师演示不了，模型也学不到。
+#:
+#: - ``none``：不重置（默认，行为与九头完全一致）；
+#: - ``release_w``：**同一帧内**先松 ``forward``、发出 attack、再按回 ``forward``
+#:   （wtap / double tap；无刀时的对刀手段）；
+#: - ``block_hit``：**同一帧内**先举剑（``use{sword,holdMs=300}``）再 attack
+#:   （防砍 / block-hit；有刀时的对刀手段，兼吃 0.5× 伤害）。
+#:
+#: 组合权在模型手里（ADR-020）：环境与运行时都不做「命中后自动 reset」的隐式行为。
+SPRINT_RESET_VALUES_V2: tuple[str, ...] = ("none", "release_w", "block_hit")
 #: 热键栏槽位数（``slot`` 头的取值个数）。
 HOTBAR_SLOTS = 9
 #: 协议观测里热键栏第一个槽位的原始槽号（36..44）；``slot`` 头的取值是 ``槽号 - 36``。
 HOTBAR_SLOT_BASE = 36
 
-#: 九个头的取值个数。顺序即 ``head_offsets`` 的拼接顺序，**改动会作废旧模型**。
+#: 十个头的取值个数。顺序即 ``head_offsets`` 的拼接顺序，**改动会作废旧模型**。
+#:
+#: G-707：末尾追加 ``sprint_reset``（3 档）→ nvec 从 9 头 / 37 维变成 10 头 / 40 维。
+#: 追加在**末尾**是刻意的：一是旧 9 头 v2 模型可以只接管同名的 9 个头（见
+#: ``gladiator_train.policy.adopt_weights``），二是 ``slot`` 的下标仍是 28，
+#: 已有日志/探针脚本里写死的头下标不会错位。
 ACTION_HEADS_V2: dict[str, int] = {
     "move": len(MOVE_VALUES_V2),          # 5
     "look_yaw": len(LOOK_YAW_V2),         # 7
@@ -368,6 +387,7 @@ ACTION_HEADS_V2: dict[str, int] = {
     "sneak": 2,                           # 2
     "sprint": 2,                          # 2
     "slot": HOTBAR_SLOTS,                 # 9
+    "sprint_reset": len(SPRINT_RESET_VALUES_V2),  # 3（G-707）
 }
 
 #: v2 动作向量总维度（各头取值个数之和）。
@@ -378,9 +398,10 @@ MULTI_DISCRETE_V2: tuple[int, ...] = tuple(ACTION_HEADS_V2.values())
 
 
 def head_offsets() -> dict[str, int]:
-    """每个头在 37 维 one-hot / 扁平编号里的起始下标（按声明顺序累加）。
+    """每个头在 ``ACTION_DIM_V2`` 维 one-hot / 扁平编号里的起始下标（按声明顺序累加）。
 
-    ``{"move": 0, "look_yaw": 5, "look_pitch": 12, ...}``，最后一项 ``slot`` 是 28。
+    ``{"move": 0, "look_yaw": 5, "look_pitch": 12, ...}``，最后一项 ``sprint_reset`` 是 37。
+    新增头一律追加在末尾，已发布的下标（例如 ``slot=28``）因此保持稳定。
     """
     offsets: dict[str, int] = {}
     cursor = 0
@@ -407,9 +428,9 @@ def decode_intent(flat: "int | Iterable[int] | np.ndarray") -> dict:
 
     三种输入都接受（都是「同一件事的三种写法」）：
 
-    - 长度 9 的序列：``MultiDiscrete`` 每个头一个数（**训练主路径**）；
-    - 长度 37 的序列：每个头一段的 one-hot / 二值展开（``ACTION_DIM_V2`` 就是它）；
-    - ``int``：37 维展开里唯一那个 1 的下标（日志/BC 里压缩成一个数的写法）。
+    - 长度 10 的序列：``MultiDiscrete`` 每个头一个数（**训练主路径**）；
+    - 长度 40 的序列：每个头一段的 one-hot / 二值展开（``ACTION_DIM_V2`` 就是它）；
+    - ``int``：40 维展开里唯一那个 1 的下标（日志/BC 里压缩成一个数的写法）。
 
     返回形态固定（键顺序也固定，方便直接序列化成 JSON）::
 
@@ -419,6 +440,10 @@ def decode_intent(flat: "int | Iterable[int] | np.ndarray") -> dict:
 
     注意 ``look`` 给的是**增量**（度），不是绝对朝向：v1 里「内部算朝向」的做法
     让策略学不到瞄准，v2 把瞄准交回给策略（规格 §2.2）。
+
+    G-707：``sprint_reset`` 为 ``none`` 时**不写** ``sprintReset`` 键，因此旧代码/旧日志
+    看到的 intent 形状与九头时代逐字节一致；只有真正要重置疾跑时才多出这个字段
+    （运行时的 ``normalizeIntent`` 同样按「缺省 = none」处理）。
     """
     heads = list(ACTION_HEADS_V2)
     offsets = head_offsets()
@@ -441,7 +466,7 @@ def decode_intent(flat: "int | Iterable[int] | np.ndarray") -> dict:
                 f"intent 需要 {len(heads)} 个头或 {ACTION_DIM_V2} 维展开，收到 {len(values)} 个")
 
     picked = {head: _head_value(head, ordered[index]) for index, head in enumerate(heads)}
-    return {
+    intent = {
         "move": MOVE_VALUES_V2[picked["move"]],
         "look": {
             "dyaw": LOOK_YAW_V2[picked["look_yaw"]],
@@ -454,10 +479,14 @@ def decode_intent(flat: "int | Iterable[int] | np.ndarray") -> dict:
         "sneak": BINARY_VALUES_V2[picked["sneak"]],
         "sprint": BINARY_VALUES_V2[picked["sprint"]],
     }
+    reset = SPRINT_RESET_VALUES_V2[picked["sprint_reset"]]
+    if reset != "none":
+        intent["sprintReset"] = reset
+    return intent
 
 
 def _split_one_hot(values: "Iterable[int]", heads: list[str], offsets: dict[str, int]) -> list[int]:
-    """把 37 维展开按头切段，取每段的 argmax（全 0 段视为 0）。
+    """把 ``ACTION_DIM_V2`` 维展开按头切段，取每段的 argmax（全 0 段视为 0）。
 
     二值头（attack/jump/…）的展开段只有两个元素，argmax 与「1 在不在」等价；
     多值头必须是 one-hot，否则取第一个最大值的下标——训练里由策略采样保证合法。
@@ -488,6 +517,10 @@ def action_mask(observation: dict, item_table: "Any | None" = None) -> dict[str,
       ``mode != none``——空手、材料、未知物品都会把这两档屏蔽掉；
     - 其余头（move / look / attack / jump / sneak / sprint）恒可用：v2 不做
       reach 屏蔽（那是运行时 attack-guard 的职责，环境侧不改 reward/termination）。
+    - ``sprint_reset``（G-707）恒定**全开**：三种取值都不依赖物品——
+      ``release_w`` 只动 ``forward`` 键；``block_hit`` 在运行时自己会先切剑，
+      而「手上有没有剑」此刻可能只是观测晚了一帧（协议没有攻击中状态），
+      在环境侧按物品屏蔽它只会让模型学到「有剑时才敢 reset」的伪相关。
 
     「手持物品」而不是「任意槽里的物品」是刻意的：意图里同时改槽与按右键时，
     运行时先选槽再按右键，但**本帧观测**只能看到旧手持物。保守一点不会让策略
@@ -520,4 +553,6 @@ def action_mask(observation: dict, item_table: "Any | None" = None) -> dict[str,
     mask["use"][0] = True
     mask["use"][1] = usable
     mask["use"][2] = usable
+    # --- sprint_reset：恒定全开（见 docstring；不引入物品条件） ---
+    mask["sprint_reset"] = [True] * ACTION_HEADS_V2["sprint_reset"]
     return mask

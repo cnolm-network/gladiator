@@ -32,7 +32,7 @@ if str(ROOT) not in sys.path:
 from gladiator_env import ArenaConfig, BotConfig, GladiatorEnv  # noqa: E402
 from gladiator_env.spaces import MOVE_VALUES_V2  # noqa: E402
 
-#: v2 九个头的取值下标（与 spaces.ACTION_HEADS_V2 的顺序一致）。
+#: v2 十个头的取值下标（与 spaces.ACTION_HEADS_V2 的顺序一致；G-707 追加了 sprint_reset）。
 HEAD_MOVE = 0
 HEAD_LOOK_YAW = 1
 HEAD_LOOK_PITCH = 2
@@ -42,6 +42,8 @@ HEAD_JUMP = 5
 HEAD_SNEAK = 6
 HEAD_SPRINT = 7
 HEAD_SLOT = 8
+#: G-707：第 10 个头。这个探针只测「同帧 jump+attack」，所以恒为 0（不重置疾跑）。
+HEAD_SPRINT_RESET = 9
 
 #: 掉血判据：普通 ≈1.60，暴击 ≈2.40（钻石剑 + 钻石甲）。≥2.2 只可能是暴击。
 CRIT_DAMAGE = 2.2
@@ -50,14 +52,14 @@ NORMAL_DAMAGE = 1.6
 
 def combo_action(slot: int, move: str = "forward", attack: bool = True,
                  jump: bool = True) -> list[int]:
-    """构造 `{move:'forward', jump:<bool>, attack:<bool>, use:0}` 的九头动作向量。
+    """构造 `{move:'forward', jump:<bool>, attack:<bool>, use:0, reset:none}` 的十头动作向量。
 
     ``jump`` 恒为 1 时：即使在半空下发也不会生效（原版只在着地时起跳），
     这正是「同一条意图里同时带 jump 与 attack」的写法——跳劈的组合权在模型手里。
     ``--no-jump`` 时把 jump 关掉，作为「同一距离、同一护甲」的落地对照组。
     """
     move_index = MOVE_VALUES_V2.index(move)
-    action = [0] * 9
+    action = [0] * 10
     action[HEAD_MOVE] = move_index
     action[HEAD_LOOK_YAW] = 3          # LOOK_YAW_V2 里的 0.0
     action[HEAD_LOOK_PITCH] = 2        # LOOK_PITCH_V2 里的 0.0
@@ -67,6 +69,7 @@ def combo_action(slot: int, move: str = "forward", attack: bool = True,
     action[HEAD_SNEAK] = 0
     action[HEAD_SPRINT] = 0
     action[HEAD_SLOT] = max(0, min(8, slot))
+    action[HEAD_SPRINT_RESET] = 0      # none：本探针不测 wtap（见 scripts/tmp_kb_probe.py）
     return action
 
 

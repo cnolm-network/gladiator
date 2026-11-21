@@ -43,7 +43,7 @@ class HeadStructureTest(unittest.TestCase):
         self.assertTrue(policy.is_v2)
         self.assertEqual(policy.head_names(), HEADS)
         self.assertEqual(policy.head_sizes(), SIZES)
-        self.assertEqual(policy.head_sizes(), [5, 7, 5, 2, 3, 2, 2, 2, 9])
+        self.assertEqual(policy.head_sizes(), [5, 7, 5, 2, 3, 2, 2, 2, 9, 3])
         self.assertEqual(policy.n_actions, sum(SIZES))
 
     def test_param_names_follow_head_names(self) -> None:
