@@ -132,7 +132,7 @@ function encodeBlockWindow(bot) {
  * 生成一帧观测。
  *
  * @param {object} bot      mineflayer Bot
- * @param {object} options  {tick, gameId, state, restrictions, chat, pendingNotices}
+ * @param {object} options  {tick, gameId, state, restrictions, chat, pendingNotices, crossFrame}
  */
 export function buildObservation(bot, {
   tick = 0,
@@ -141,6 +141,7 @@ export function buildObservation(bot, {
   restrictions = [],
   chat = [],
   pendingNotices = [],
+  crossFrame = null,
 } = {}) {
   const self = bot.entity || {};
   const position = self.position || new Vec3(0, 0, 0);
@@ -182,7 +183,7 @@ export function buildObservation(bot, {
   // 与 entities[].velocity 同一口径：缺失/非数一律填 0，保证字段恒存在——
   // 训练侧按名字取值，字段消失会让那一维悄悄变 0（模型以为「一直站着」）。
   const selfVelocity = self.velocity || { x: 0, y: 0, z: 0 };
-  return {
+  const frame = {
     tick,
     gameId,
     state,
@@ -210,4 +211,16 @@ export function buildObservation(bot, {
     chat: chat.slice(-20),
     pendingNotices: pendingNotices.slice(-10),
   };
+  // G-711：跨帧快照（可选）。训练侧自己维护这三个量，本地大脑也可以把它们挂在帧上
+  // 让 `features.encodeObservation` 直接读；缺省**不写这个键**，协议形状对旧读者不变。
+  if (crossFrame) {
+    frame.crossFrame = {
+      prevAction: Array.isArray(crossFrame.prevAction) ? crossFrame.prevAction.slice() : null,
+      framesSinceAttack: Number.isFinite(Number(crossFrame.framesSinceAttack))
+        ? Number(crossFrame.framesSinceAttack) : null,
+      framesSinceHit: Number.isFinite(Number(crossFrame.framesSinceHit))
+        ? Number(crossFrame.framesSinceHit) : null,
+    };
+  }
+  return frame;
 }

@@ -30,10 +30,10 @@ class P1ObservationTest(unittest.TestCase):
             raw["entities"][0]["velocity"] = velocity
         return raw
 
-    def test_obs_dim_is_25(self):
-        # G-702：23 → 25，两维只在末尾追加（0–22 不许动）。
-        self.assertEqual(OBS_DIM, 25)
-        self.assertEqual(len(__import__("gladiator_env.spaces", fromlist=["OBS_FIELDS"]).OBS_FIELDS), 25)
+    def test_obs_dim_is_37(self):
+        # G-702：23 → 25；G-711：25 → 37（都只在末尾追加，前面的索引不许动）。
+        self.assertEqual(OBS_DIM, 37)
+        self.assertEqual(len(__import__("gladiator_env.spaces", fromlist=["OBS_FIELDS"]).OBS_FIELDS), 37)
 
     def test_opponent_speed_components(self):
         vector = encode_observation(self._obs(2.0, {"x": 3.0, "y": -2.5, "z": 4.0}), "Glad_Bot_1")
@@ -192,9 +192,9 @@ class DecodeActionTest(unittest.TestCase):
         self.assertFalse(move["params"]["sprint"])
 
     def test_attack_respects_reach(self):
-        # 距离 3.5 在默认 reach(3.99) 内，在旧阈值 3.0 外
+        # G-708：默认 reach 是 3.0（原版），余量后 2.85 —— 2.5 格在射程内，reach=2.0 时在外。
         obs = make_observation(
-            "Glad_Bot_1", targets=[make_target(91, "Glad_Bot_2", x=3.5, z=0.0, distance=3.5)])
+            "Glad_Bot_1", targets=[make_target(91, "Glad_Bot_2", x=2.5, z=0.0, distance=2.5)])
         actions = decode_action(2, obs, "Glad_Bot_1")
         self.assertTrue(any(a["type"] == "attack" for a in actions))
         actions = decode_action(2, obs, "Glad_Bot_1", reach=2.0)
@@ -208,29 +208,31 @@ class DecodeActionTest(unittest.TestCase):
 
     def test_attack_boundary_uses_reach_tolerance(self):
         """A2：观测距离与运行时 eyeDistance 有偏差，边界上必须提前退化为靠近。"""
-        # 4.3 格：超出 reach 3.99（也超出 3.99-0.15），不发 attack
+        # 3.5 格：超出 reach 3.0（也超出 3.0-0.15），不发 attack
         obs = make_observation(
-            "Glad_Bot_1", targets=[make_target(91, "Glad_Bot_2", x=4.3, z=0.0, distance=4.3)])
+            "Glad_Bot_1", targets=[make_target(91, "Glad_Bot_2", x=3.5, z=0.0, distance=3.5)])
         actions = decode_action(2, obs, "Glad_Bot_1")
         self.assertFalse([a for a in actions if a["type"] == "attack"])
         self.assertEqual(actions[-1]["type"], "move")
         self.assertEqual(actions[-1]["params"]["direction"], "forward")
         self.assertTrue(actions[-1]["params"]["sprint"])
 
-        # 3.8 格：仍在 3.99-0.15 之内，正常攻击
+        # 2.8 格：仍在 3.0-0.15 之内，正常攻击
         obs = make_observation(
-            "Glad_Bot_1", targets=[make_target(91, "Glad_Bot_2", x=3.8, z=0.0, distance=3.8)])
+            "Glad_Bot_1", targets=[make_target(91, "Glad_Bot_2", x=2.8, z=0.0, distance=2.8)])
         actions = decode_action(2, obs, "Glad_Bot_1")
         self.assertTrue([a for a in actions if a["type"] == "attack"])
 
     def test_attack_boundary_scales_with_reach_parameter(self):
-        """reach=3.0 时 3.2 格不发 attack（否则运行时必然 OUT_OF_REACH）。"""
+        """边界随 reach 参数一起动：2.6 格在 reach=3.0 内、在 reach=2.5 外。"""
         obs = make_observation(
-            "Glad_Bot_1", targets=[make_target(91, "Glad_Bot_2", x=3.2, z=0.0, distance=3.2)])
-        actions = decode_action(2, obs, "Glad_Bot_1", reach=3.0)
-        self.assertFalse([a for a in actions if a["type"] == "attack"])
-        self.assertEqual(actions[-1]["type"], "move")
-        # 同一距离在默认 reach 下仍在射程内
+            "Glad_Bot_1", targets=[make_target(91, "Glad_Bot_2", x=2.6, z=0.0, distance=2.6)])
+        tight = decode_action(2, obs, "Glad_Bot_1", reach=2.5)
+        self.assertFalse([a for a in tight if a["type"] == "attack"])
+        self.assertEqual(tight[-1]["type"], "move")
+        loose = decode_action(2, obs, "Glad_Bot_1", reach=3.0)
+        self.assertTrue([a for a in loose if a["type"] == "attack"])
+        # G-708：默认 reach 就是 3.0，与显式 3.0 同结果
         self.assertTrue([a for a in decode_action(2, obs, "Glad_Bot_1") if a["type"] == "attack"])
 
     def test_use_rod_only_between_two_and_six(self):
@@ -299,7 +301,7 @@ class KitAndItemActionTests(unittest.TestCase):
         self.assertIn("autorod=on", args)
         self.assertIn("autoblock=off", args)
         self.assertIn("aimlock=on", args)
-        self.assertIn("reach=3.99", args)
+        self.assertIn("reach=3", args)
 
     def test_kit_has_diamond_armor_sword_gapple_rod(self):
         kit = dict(ArenaConfig().kit)

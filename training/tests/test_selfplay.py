@@ -53,10 +53,10 @@ def build_env(*, opponent_policy=None, opponent_epsilon: float = 0.0,
     links = links or [FakeLink("Glad_Bot_1"), FakeLink("Glad_Bot_2")]
     links[0].set_observation(make_observation(
         "Glad_Bot_1", x=-1.5, z=0.0,
-        targets=[make_target(2, "Glad_Bot_2", x=1.5, z=0.0, distance=3.0)]))
+        targets=[make_target(2, "Glad_Bot_2", x=1.5, z=0.0, distance=2.5)]))
     links[1].set_observation(make_observation(
         "Glad_Bot_2", x=1.5, z=0.0, health=health_bot2,
-        targets=[make_target(1, "Glad_Bot_1", x=-1.5, z=0.0, distance=3.0)]))
+        targets=[make_target(1, "Glad_Bot_1", x=-1.5, z=0.0, distance=2.5)]))
     env = GladiatorEnv(
         [BotConfig("Glad_Bot_1", "ws://127.0.0.1:8766"),
          BotConfig("Glad_Bot_2", "ws://127.0.0.1:8767")],

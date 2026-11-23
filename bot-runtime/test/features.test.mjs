@@ -1,5 +1,5 @@
 /**
- * `features.js` 单测：25 维编码逐项对齐 `spaces.py`，以及动作解码。
+ * `features.js` 单测：37 维编码逐项对齐 `spaces.py`，以及动作解码。
  */
 
 import assert from 'node:assert/strict';
@@ -70,19 +70,26 @@ function baseObservation(overrides = {}) {
 }
 
 test('观测字段与 spaces.py 同序同长度', () => {
-  assert.equal(OBS_DIM, 25);
-  assert.equal(OBS_FIELDS_JS.length, 25);
+  assert.equal(OBS_DIM, 37);
+  assert.equal(OBS_FIELDS_JS.length, 37);
   assert.equal(OBS_FIELDS_JS[0], 'self_health');
   assert.equal(OBS_FIELDS_JS[18], 'self_gapples');
   assert.equal(OBS_FIELDS_JS[22], 'in_reach');
   // G-702：只在末尾追加，0–22 一个都不许动
   assert.equal(OBS_FIELDS_JS[23], 'self_vertical_speed');
   assert.equal(OBS_FIELDS_JS[24], 'self_attack_cooldown');
+  // G-711：25–34 是上一帧十头动作（顺序 = ACTION_HEADS_V2），35/36 是两个帧计数
+  assert.deepEqual(OBS_FIELDS_JS.slice(25, 35), [
+    'prev_move', 'prev_look_yaw', 'prev_look_pitch', 'prev_attack', 'prev_use',
+    'prev_jump', 'prev_sneak', 'prev_sprint', 'prev_slot', 'prev_sprint_reset',
+  ]);
+  assert.equal(OBS_FIELDS_JS[35], 'frames_since_attack');
+  assert.equal(OBS_FIELDS_JS[36], 'frames_since_hit');
   assert.equal(ACTION_NAMES.length, 11);
   assert.equal(ACTION_NAMES[2], 'attack');
 });
 
-test('编码 25 维：逐项对齐 spaces.encode_observation', () => {
+test('编码 37 维：逐项对齐 spaces.encode_observation', () => {
   const vector = encodeObservation(baseObservation(), {
     username: 'Glad_Bot_1',
     stepFraction: 0.5,
@@ -90,7 +97,7 @@ test('编码 25 维：逐项对齐 spaces.encode_observation', () => {
     sinceAttack: 2.0,
     attackCooldownRemaining: 0.25,
   });
-  assert.equal(vector.length, 25);
+  assert.equal(vector.length, 37);
   const near = (index, expected) => assert.ok(
     Math.abs(vector[index] - expected) < 1e-9,
     `第 ${index} 维 ${vector[index]} != ${expected}`,
@@ -271,4 +278,65 @@ test('decodeAction：无目标待机，满血不浪费金苹果，越界报错',
   assert.deepEqual(eat[0].params, { item: 'gapple', holdMs: 1600 });
 
   assert.throws(() => decodeAction(11, observation, 'Glad_Bot_1'), /动作编号越界/);
+});
+
+// --- G-711：跨帧 12 维（25..36） -------------------------------------------
+
+test('G-711 缺省：prev_action 全 0（不知道），帧计数置饱和 1.0', () => {
+  const vector = encodeObservation(baseObservation(), { username: 'Glad_Bot_1' });
+  for (let index = 25; index <= 34; index += 1) {
+    assert.equal(vector[index], 0, `第 ${index} 维应为 0（没有上一帧动作）`);
+  }
+  assert.equal(vector[35], 1);
+  assert.equal(vector[36], 1);
+});
+
+test('G-711 prevAction 按 head_size 归一化，顺序 = ACTION_HEADS_V2', () => {
+  const vector = encodeObservation(baseObservation(), {
+    username: 'Glad_Bot_1',
+    // move=1/5, look_yaw=5/7, look_pitch=2/5, attack=1/2, use=0, jump=0,
+    // sneak=0, sprint=0, slot=0, sprint_reset=2/3
+    prevAction: [1, 5, 2, 1, 0, 0, 0, 0, 0, 2],
+  });
+  const expected = [1 / 5, 5 / 7, 2 / 5, 1 / 2, 0, 0, 0, 0, 0, 2 / 3];
+  expected.forEach((value, offset) => {
+    assert.ok(Math.abs(vector[25 + offset] - value) < 1e-12,
+      `第 ${25 + offset} 维 ${vector[25 + offset]} != ${value}`);
+  });
+});
+
+test('G-711 prevAction 可从 observation.crossFrame 缺省读取，显式参数优先', () => {
+  const observation = baseObservation({
+    crossFrame: { prevAction: [4, 0, 0, 0, 0, 0, 0, 0, 8, 0], framesSinceAttack: 10, framesSinceHit: 20 },
+  });
+  const fromFrame = encodeObservation(observation, { username: 'Glad_Bot_1' });
+  assert.ok(Math.abs(fromFrame[25] - 4 / 5) < 1e-12);
+  assert.ok(Math.abs(fromFrame[33] - 8 / 9) < 1e-12);
+  assert.ok(Math.abs(fromFrame[35] - 10 / 50) < 1e-12);
+  assert.ok(Math.abs(fromFrame[36] - 20 / 50) < 1e-12);
+
+  const explicit = encodeObservation(observation, {
+    username: 'Glad_Bot_1', prevAction: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0], framesSinceAttack: 0,
+  });
+  assert.ok(Math.abs(explicit[25] - 1 / 5) < 1e-12, '显式 prevAction 应覆盖帧里的值');
+  assert.equal(explicit[35], 0, '显式 framesSinceAttack 应覆盖帧里的值');
+});
+
+test('G-711 帧计数按 50 归一化并裁剪到 0..1', () => {
+  const cases = [[0, 0], [25, 0.5], [50, 1], [500, 1], [-3, 0]];
+  for (const [frames, expected] of cases) {
+    const vector = encodeObservation(baseObservation(), {
+      username: 'Glad_Bot_1', framesSinceAttack: frames, framesSinceHit: frames,
+    });
+    assert.ok(Math.abs(vector[35] - expected) < 1e-12, `${frames} 帧 → ${vector[35]} != ${expected}`);
+    assert.ok(Math.abs(vector[36] - expected) < 1e-12);
+  }
+});
+
+test('G-711 越界的 prevAction 被裁到 0（不让坏索引把观测推到负区间）', () => {
+  const vector = encodeObservation(baseObservation(), {
+    username: 'Glad_Bot_1', prevAction: [-1, 99, 0, 0, 0, 0, 0, 0, 0, 0],
+  });
+  assert.equal(vector[25], 0);
+  assert.equal(vector[26], 1);
 });

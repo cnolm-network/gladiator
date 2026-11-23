@@ -60,6 +60,10 @@ public class GladiatorCommandStatsTest {
                             return true;
                         case "getNoDamageTicks":
                             return 0;
+                        case "isDead":
+                            return false;
+                        case "getActivePotionEffects":
+                            return new java.util.ArrayList<org.bukkit.potion.PotionEffect>();
                         default:
                             return null;
                     }
@@ -69,7 +73,8 @@ public class GladiatorCommandStatsTest {
         assertEquals(
                 "name=Steve health=18.0 food=20 saturation=5.0 armor=4.0"
                         + " x=10.5 y=64.0 z=-3.3 yaw=45.0 pitch=0.0"
-                        + " sprinting=false blocking=false onGround=true hurt=0.0",
+                        + " sprinting=false blocking=false onGround=true hurt=0.0"
+                        + " dead=false effects=-",
                 line);
         // 单行、无前缀、无颜色：RCON 侧直接 split 即可。
         assertTrue(line.indexOf('\n') < 0);

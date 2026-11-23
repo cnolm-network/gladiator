@@ -16,10 +16,10 @@ def build_env(**kwargs) -> tuple[GladiatorEnv, list[FakeLink]]:
     links = [FakeLink("Glad_Bot_1"), FakeLink("Glad_Bot_2")]
     links[0].set_observation(make_observation(
         "Glad_Bot_1", x=-1.5, z=0.0,
-        targets=[make_target(2, "Glad_Bot_2", x=1.5, z=0.0, distance=3.0)]))
+        targets=[make_target(2, "Glad_Bot_2", x=1.5, z=0.0, distance=2.0)]))
     links[1].set_observation(make_observation(
         "Glad_Bot_2", x=1.5, z=0.0,
-        targets=[make_target(1, "Glad_Bot_1", x=-1.5, z=0.0, distance=3.0)]))
+        targets=[make_target(1, "Glad_Bot_1", x=-1.5, z=0.0, distance=2.0)]))
     options = dict(single_agent=True, opponent_mode="aimbot", control_hz=200.0, action_ticks=1)
     options.update(kwargs)
     env = GladiatorEnv(
@@ -101,7 +101,7 @@ class OpponentConfirmTest(unittest.TestCase):
         env.step(0)  # hold=1
         self.assertEqual(env._opponent_hold.get("Glad_Bot_2"), 1)
 
-        set_opponent_distance(env, links, 4.6)  # 第二 tick 被击退/拉开
+        set_opponent_distance(env, links, 3.6)  # 第二 tick 被击退/拉开（> 2.25 的对手射程）
         links[1].actions.clear()
         env.step(0)
 
@@ -122,7 +122,7 @@ class OpponentConfirmTest(unittest.TestCase):
         # 换一个目标：必须重新确认，不能拿上一次的确认直接出手。
         push_observation(env, links, make_observation(
             "Glad_Bot_2", x=1.5, z=0.0,
-            targets=[make_target(9, "Glad_Bot_1", x=-1.0, z=0.0, distance=2.5)]))
+            targets=[make_target(9, "Glad_Bot_1", x=-1.0, z=0.0, distance=2.0)]))
         links[1].actions.clear()
         env.step(0)
 

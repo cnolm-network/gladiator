@@ -27,7 +27,7 @@
 因此这两类永远不产生标签——训练数据只覆盖可观测的 9 种动作。这一点是刻意的：
 宁可少标，也不要把「没观察到」硬猜成某个动作。
 
-观测向量直接复用 `gladiator_env.spaces.encode_observation`（23 维），保证与在线
+观测向量直接复用 `gladiator_env.spaces.encode_observation`（当前 37 维，随 `OBS_DIM` 走），保证与在线
 运行时/训练环境逐位对齐：把每帧双方 stats 还原成一条 OBSERVATION 字典再编码。
 """
 
@@ -98,6 +98,21 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help=f"超出交手距离的样本权重（默认 {FAR_WEIGHT}）")
     parser.add_argument("--no-prefer-wins", action="store_true",
                         help="关闭择优权重（所有样本等权，等价旧行为）")
+    # --- G-705(c)：AWR（用价值头给样本加权） ---
+    parser.add_argument("--weighting", choices=["round", "contact", "awr"], default="contact",
+                        help="权重模式：round = 只用 (a) 结果过滤；"
+                             "contact = (a)×(b) 接触窗口（默认）；"
+                             "awr = 在 contact 之上再乘 (c) 价值加权（需要 --base-model）")
+    parser.add_argument("--awr-temperature", type=float, default=1.0,
+                        help="AWR 温度：w = exp((R − V)/T)，越小越尖（默认 1.0）")
+    parser.add_argument("--awr-clip", type=float, default=None,
+                        help="AWR 权重上界（默认不剪）；用于压住单帧主导")
+    parser.add_argument("--awr-strict", action="store_true",
+                        help="数据集没有 rewards 时直接报错（默认只在 stderr 提示，"
+                             "此时 AWR 退化为均匀权重、等于没开）")
+    parser.add_argument("--win-bonus", type=float, default=0.0,
+                        help="局末胜局额外加进 rewards 的量（默认 0 = 只用血量差；"
+                             "想让 AWR 更看重「赢」可给正数）")
     return parser.parse_args(argv)
 
 
@@ -144,6 +159,70 @@ def contact_window_weight(frame: dict, *, player_name: str, bot_name: str,
     dz = _num(player.get("z")) - _num(bot.get("z"))
     distance = math.hypot(dx, dz)
     return float(contact_weight if distance <= contact_range else far_weight)
+
+
+def compose_awr_weights(dataset: dict, policy, *, temperature: float,
+                        clip: Optional[float], strict: bool = False) -> tuple[np.ndarray, dict]:
+    """(c) AWR：把已有的 (a)×(b) 权重再乘上「价值优势」权重，并重新归一到均值 1。
+
+    <p>为什么乘而不是替换：AWR 回答的是「这一帧比预期好吗」，它对**局结果 / 距离**
+    一无所知；而 (a)(b) 恰好只管这两件事。两者是正交的筛选维度，相乘才不丢信息。
+
+    <p>***回报从哪来***：只认 ``dataset["rewards"]``（录制侧以后带上来才有）；
+    没有就按 0 处理——**绝不在这里发明奖励函数**（见 ``advantage_weights`` 的 docstring）。
+    全 0 时 ``A = −V``，负优势会被 ``positive_only`` 置 0。因此返回的 ``info`` 里会标出：
+
+    - ``awrReturns``：回报来源（``dataset.rewards`` / ``zeros（录制暂无 rewards）``）；
+    - ``awrEffective``：本次加权**是否真的改变了样本权重**。为 ``False`` 时说明
+      数据集里没有回报、且所有优势都被置 0 → 权重退化成均匀，``--weighting awr``
+      等价于不带 (c)。只看 ``awrReturns`` 会误判，必须看这个字段；
+    - ``awrDistinct``：归一化后不同权重值的个数（1 = 全等，等于没加权）；
+    - ``awrZeroed``：被置 0 的样本数。
+
+    <p>``strict=True`` 时，**没有回报就直接报错**——避免「以为开了 AWR、其实什么都没做」。
+
+    @returns ``(weights, info)``：``weights`` 与样本等长、均值 1；``info`` 直接并进
+    ``meta.weightRules``，便于复算。
+    """
+    from gladiator_train.demos import advantage_weights
+
+    base = np.asarray(dataset["weights"], dtype=np.float64)
+    returns = dataset.get("rewards")
+    if returns is None and strict:
+        raise ValueError(
+            "数据集里没有 rewards，AWR 无从计算（A = -V，负优势会被全部置 0，"
+            "等于没加权）。要么让录制侧带上单步回报，要么去掉 --awr-strict 接受"
+            "--weighting contact 的效果。")
+    samples = [(dataset["obs"][i], int(dataset["actions"][i]), 0.0)
+               for i in range(len(base))]
+    awr = advantage_weights(
+        policy, samples,
+        returns=None if returns is None else np.asarray(returns, dtype=np.float64),
+        temperature=temperature,
+        positive_only=True,
+        clip=None if clip is None else (0.0, float(clip)),
+    )
+    combined = base * awr
+    mean = float(combined.mean()) if combined.size else 0.0
+    if not np.isfinite(mean) or mean <= 1e-12:
+        # 理论上进不来（advantage_weights 已退化保护），留着防「总权重 0 的批次」。
+        combined = np.ones_like(base)
+    else:
+        combined = combined / mean
+    distinct = int(np.unique(np.round(awr, 9)).size) if awr.size else 0
+    info = {
+        "mode": "awr",
+        "awrTemperature": float(temperature),
+        "awrClip": None if clip is None else float(clip),
+        "awrReturns": "dataset.rewards" if returns is not None else "zeros（录制暂无 rewards）",
+        # 只有「有回报」时 A 才是 advantage。没有回报时 A = −V，权重**不是**噪声而是
+        # 系统性偏向 critic 认为差的状态（与 AWR 原意相反），所以这里必须为 False。
+        "awrEffective": returns is not None,
+        "awrDistinct": distinct,
+        "awrZeroed": int(np.sum(awr == 0.0)),
+        "awrMean": round(float(combined.mean()), 6),
+    }
+    return combined, info
 
 
 # --- 读取与标签 -------------------------------------------------------------
@@ -229,7 +308,7 @@ def infer_action(prev: dict, cur: dict, dt: float) -> int:
 
 def _observation(frame: dict, prev: Optional[dict], player_name: str, bot_name: str,
                  step_fraction: float, since_attack: float, reach: float) -> np.ndarray:
-    """把一帧 stats 还原成 OBSERVATION 字典，再交给官方编码器（保证 23 维一致）。"""
+    """把一帧 stats 还原成 OBSERVATION 字典，再交给官方编码器（维度随 OBS_DIM，逐位一致）。"""
     player = frame.get("player") or {}
     bot = frame.get("bot") or {}
     previous_bot = (prev or {}).get("bot") or bot
@@ -281,22 +360,32 @@ def _observation(frame: dict, prev: Optional[dict], player_name: str, bot_name: 
 
 
 def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
-                  round_seconds: float = 120.0, reach: float = 3.99,
+                  round_seconds: float = 120.0, reach: float = 3.0,
                   winners: Optional[dict[int, str]] = None,
                   win_weight: float = WIN_WEIGHT, loss_weight: float = LOSS_WEIGHT,
                   draw_weight: float = DRAW_WEIGHT, contact_range: float = CONTACT_RANGE,
                   contact_weight: float = CONTACT_WEIGHT,
-                  far_weight: float = FAR_WEIGHT) -> dict:
-    """返回 ``{"obs","actions","times","rounds","weights"}``（obs 为 23 维）。
+                  far_weight: float = FAR_WEIGHT, win_bonus: float = 0.0) -> dict:
+    """返回 ``{"obs","actions","times","rounds","weights","rewards"}``（obs 为 ``OBS_DIM`` 维）。
 
     ``weights`` 是 (a)(b) 两步择优的结果：``局结果权重 × 接触窗口权重``。
     全部参数取默认值时，赢局接触帧为 1.0、输局远处帧为 0.06，权重并未丢弃任何样本。
+    (c) AWR 不在这里做：它需要模型的价值头，由 :func:`compose_awr_weights` 在
+    ``--weighting awr`` 时叠加（见 ``docs/match.md`` §8.1）。
+
+    ``rewards`` 是**观测回报**，只由录制帧的血量差推出（不外挂 shaping）：
+    每步 ``(对手掉血 - 自己掉血)``，局末再加 ``win_bonus``（仅当该局赢，默认 0）。
+    它给 AWR 一个 ``A = R - V(s)`` 的 R；没有它时 AWR 只能退化成 ``A = -V``。
     """
     observations: list[np.ndarray] = []
     actions: list[int] = []
     times: list[float] = []
     rounds: list[int] = []
     weights: list[float] = []
+    rewards: list[float] = []
+    prev_bot_health: Optional[float] = None
+    prev_player_health: Optional[float] = None
+    prev_round: Optional[int] = None
     winners = winners or {}
     since_attack = 5.0
     previous: Optional[dict] = None
@@ -317,6 +406,19 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
         times.append(t)
         round_number = int(_num(frame.get("round"), 1))
         rounds.append(round_number)
+        bot = frame.get("bot") or {}
+        bot_health = _num(bot.get("health"), 20.0)
+        player_health = _num(player.get("health"), 20.0)
+        reward = 0.0
+        if prev_bot_health is not None and prev_player_health is not None:
+            reward += max(0.0, prev_bot_health - bot_health)  # 打出去的伤害
+            reward -= max(0.0, prev_player_health - player_health)  # 吃到的伤害
+        if prev_round is not None and round_number != prev_round:
+            # 上一局的收尾帧：按局结果补 terminal（默认 0，等于不加）。
+            if winners.get(prev_round) == "player":
+                reward += win_bonus
+        rewards.append(reward)
+        prev_bot_health, prev_player_health, prev_round = bot_health, player_health, round_number
         weights.append(
             round_weight(winners.get(round_number, "unknown"),
                          win_weight=win_weight, loss_weight=loss_weight,
@@ -335,6 +437,7 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
         "times": np.asarray(times, dtype=np.float32),
         "rounds": np.asarray(rounds, dtype=np.int64),
         "weights": np.asarray(weights, dtype=np.float32),
+        "rewards": np.asarray(rewards, dtype=np.float32),
     }
 
 
@@ -357,7 +460,14 @@ def run_bc(dataset: dict, *, base_model: Optional[str], epochs: int,
         return {"skipped": True, "reason": f"样本太少（{len(samples)} < {min_samples}）"}
 
     if base_model:
-        policy = Policy.load(base_model)
+        # 与 AWR 同一条口径：旧模型右侧补零到当前 OBS_DIM，否则现役 23/25 维模型
+        # 一律被「维度不一致」拒掉，真人录像 BC 根本跑不起来（走 model_io）。
+        from gladiator_train.model_io import ModelLoadError, load_model
+
+        try:
+            policy = load_model(base_model, obs_dim=OBS_DIM).policy
+        except (OSError, ValueError, ModelLoadError) as exc:
+            return {"skipped": True, "reason": f"模型加载失败: {exc}"}
         if policy.obs_dim != OBS_DIM:
             return {"skipped": True,
                     "reason": f"模型 obsDim={policy.obs_dim} 与数据集 {OBS_DIM} 不一致"}
@@ -417,10 +527,59 @@ def main(argv: Optional[list[str]] = None) -> int:
         winners=load_round_winners(record_dir),
         win_weight=args.win_weight, loss_weight=args.loss_weight,
         draw_weight=args.draw_weight, contact_range=args.contact_range,
-        contact_weight=1.0, far_weight=args.far_weight,
+        contact_weight=1.0,
+        # round 模式只要 (a)：把接触窗口关掉（远/近都按 1.0），不另写一条权重路径。
+        far_weight=1.0 if args.weighting == "round" else args.far_weight,
+        win_bonus=args.win_bonus,
     )
     if args.no_prefer_wins:
         dataset["weights"] = np.ones_like(dataset["weights"])
+    weight_rules: dict[str, Any] = {
+        "mode": "uniform" if args.no_prefer_wins else args.weighting,
+        "win": args.win_weight, "loss": args.loss_weight,
+        "draw": args.draw_weight, "contactRange": args.contact_range,
+        "contact": 1.0, "far": 1.0 if args.weighting == "round" else args.far_weight,
+        "winBonus": args.win_bonus,
+    }
+    if args.weighting == "awr" and not args.no_prefer_wins:
+        if not args.base_model:
+            print("[awr] 需要 --base-model（价值头来自模型，不能凭空造）", file=sys.stderr)
+            return 2
+        try:
+            # 旧模型（23/25 维）在 37 维数据集上算 V(s) 会 reshape 失败：走 model_io 统一
+            # 的「右侧补零到当前 OBS_DIM」口径（与 league/mirror 同一条规则，见 G-703）。
+            from gladiator_train.model_io import load_model
+
+            awr_record = load_model(args.base_model, obs_dim=OBS_DIM)
+            awr_policy = awr_record.policy
+        except (OSError, ValueError) as exc:
+            print(f"[awr] 模型加载失败: {exc}", file=sys.stderr)
+            return 2
+        if awr_policy.obs_dim != OBS_DIM:
+            print(f"[awr] 模型 obsDim={awr_policy.obs_dim} 与数据集 {OBS_DIM} 不一致"
+                  "（先用同名观测维度的模型算 V(s)）", file=sys.stderr)
+            return 2
+        try:
+            weights, awr_info = compose_awr_weights(
+                dataset, awr_policy,
+                temperature=args.awr_temperature, clip=args.awr_clip,
+                strict=args.awr_strict)
+        except ValueError as exc:
+            print(f"[awr] {exc}", file=sys.stderr)
+            return 2
+        dataset["weights"] = weights.astype(np.float32)
+        weight_rules.update(awr_info)
+        if not weight_rules["awrReturns"].startswith("dataset.rewards"):
+            print("[awr] 注意：数据集没有 rewards，A = -V；"
+                  "权重会系统性偏向 critic 认为**差**的状态（与 AWR 原意相反），"
+                  "先跑录制侧带 rewards 更可靠", file=sys.stderr)
+        if not weight_rules["awrEffective"]:
+            print("[awr] 警告：本次 AWR 不是真优势加权"
+                  f"（awrReturns={weight_rules['awrReturns']}、"
+                  f"distinct={weight_rules['awrDistinct']}、"
+                  f"zeroed={weight_rules['awrZeroed']}）——"
+                  "别拿它当「人类比模型强」的证据；要真开 AWR 得让数据里带 rewards",
+                  file=sys.stderr)
     out_path = Path(args.out) if args.out else record_dir / "dataset.npz"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     counts = {ACTION_NAMES[index]: int((dataset["actions"] == index).sum())
@@ -432,6 +591,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         times=dataset["times"],
         rounds=dataset["rounds"],
         weights=dataset["weights"],
+        rewards=dataset["rewards"],
         meta=np.array(json.dumps({
             "schema": "gladiator.human-match-dataset/v1",
             "recordDir": str(record_dir),
@@ -443,11 +603,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "actionNames": list(ACTION_NAMES),
             "labelRules": "见 import_human_match.py 模块 docstring",
             "preferWins": not args.no_prefer_wins,
-            "weightRules": {
-                "win": args.win_weight, "loss": args.loss_weight,
-                "draw": args.draw_weight, "contactRange": args.contact_range,
-                "contact": 1.0, "far": args.far_weight,
-            },
+            "weightRules": weight_rules,
         }, ensure_ascii=False)),
     )
 

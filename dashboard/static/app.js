@@ -2169,7 +2169,8 @@ function renderTrainingReport(report) {
 
 const MATCH_PHASE_TEXT = {
   idle: "空闲",
-  preparing: "摆位与发装备",
+  // G-715 起准备阶段 = 等玩家进服 + spawn Bot + 板子开局，dashboard 不再摆位。
+  preparing: "准备（板子开局）",
   countdown: "倒计时",
   fighting: "交战中",
   roundEnd: "本局结束",
@@ -2186,6 +2187,9 @@ const MATCH_REASON_TEXT = {
   "player-respawn": "玩家死亡重生",
   "bot-respawn": "Bot 死亡重生",
   budget: "采样预算耗尽",
+  // 板子只回报会话级 reason，逐局原因由比分增量推断，拿不到时记 unknown（见 docs/match.md §4.4）。
+  unknown: "板子未回报",
+  "rounds-finished": "局数打满",
 };
 
 function matchWinnerLabel(winner, match) {

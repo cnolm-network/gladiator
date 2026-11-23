@@ -71,6 +71,7 @@ export class RconClient {
     return new Promise((resolve, reject) => {
       const socket = net.createConnection({ host: this.host, port: this.port });
       this.socket = socket;
+      this.buffer = Buffer.alloc(0);
       socket.setTimeout(this.timeout);
       const onError = (error) => {
         cleanup();
@@ -81,10 +82,14 @@ export class RconClient {
         socket.destroy();
         reject(new Error(`RCON 连接超时（${this.host}:${this.port}）`));
       };
+      // 只解绑「建连阶段」的两个兜底监听器。
+      //
+      // **`data` 必须常驻**：曾经这里连 `data` 一起 removeListener，导致认证成功之后
+      // 所有帧都读不到 → `command()` 每次等满 3s 超时并 resolve 空串（真机 G-716：
+      // `oppHp` 恒为 null，策略把对手血量当 0，Bot 站着不出手）。
       const cleanup = () => {
         socket.removeListener('error', onError);
         socket.removeListener('timeout', onTimeout);
-        socket.removeListener('data', onData);
       };
       const onData = (chunk) => {
         this.buffer = Buffer.concat([this.buffer, chunk]);
@@ -93,7 +98,8 @@ export class RconClient {
       socket.on('data', onData);
       socket.on('error', onError);
       socket.on('timeout', onTimeout);
-      socket.on('close', () => {
+      socket.once('close', () => {
+        socket.removeListener('data', onData);
         this.ready = false;
         const waiting = this.pending.splice(0);
         for (const entry of waiting) {
@@ -110,6 +116,13 @@ export class RconClient {
         cleanup();
         this.ready = true;
         resolve(this);
+      };
+      // 密码错时服务端回 id=-1：必须把 connect() 拒掉，否则调用方永远 await 在这里
+      // （G-716 顺带修的第二个静默挂起点：认证失败只 destroy socket，promise 不 settle）。
+      this.onAuthFailed = (message) => {
+        cleanup();
+        this.ready = false;
+        reject(new Error(message));
       };
     });
   }
@@ -142,7 +155,14 @@ export class RconClient {
       if (kind === SERVERDATA_AUTH_RESPONSE) {
         if (id === -1) {
           this.ready = false;
-          this.socket.destroy();
+          if (typeof this.onAuthFailed === 'function') {
+            const failed = this.onAuthFailed;
+            this.onAuthFailed = null;
+            failed(`RCON 认证失败（${this.host}:${this.port}，密码不对？）`);
+          }
+          if (this.socket) {
+            this.socket.destroy();
+          }
           return;
         }
         if (typeof this.onAuthenticated === 'function') {
@@ -152,8 +172,10 @@ export class RconClient {
         }
         continue;
       }
-      const entry = this.pending.shift();
+      const entry = this.pending.find((item) => item.id === id);
       if (entry) {
+        // 按 id 匹配而不是 shift：并发/迟到的响应不会错位到别人的 promise 上。
+        this.pending = this.pending.filter((item) => item !== entry);
         entry.resolve(body);
       }
     }

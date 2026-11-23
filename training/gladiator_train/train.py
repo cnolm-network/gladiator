@@ -9,7 +9,8 @@
 
     python -m gladiator_train.train --stages idle:3,wander:3,random:3,scripted:3
 
-每个 Bot 的手感配置（G-507）默认 15±2 CPS / 220±40ms / 3.99 格：
+每个 Bot 的手感配置（G-507）默认 15±2 CPS / 220±40ms / **3.0 格**（G-708：3.99 是外挂级超限值，
+要跑对照实验用 `--cheat-reach <值>` 显式打开）：
 
     ... --cps 17 --cps-jitter 3 --reaction-ms 180 --reach 4.2 --model aggressive
 
@@ -169,7 +170,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cps-jitter", type=float, default=2.0)
     p.add_argument("--reaction-ms", type=float, default=220.0)
     p.add_argument("--reaction-jitter-ms", type=float, default=40.0)
-    p.add_argument("--reach", type=float, default=3.99)
+    p.add_argument("--reach", type=float, default=3.0,
+                   help="学习 Bot 攻击距离（默认 3.0 = 原版水平；>3 需 --cheat-reach）")
+    p.add_argument("--cheat-reach", type=float, default=None,
+                   help="作弊开关：显式指定超限攻击距离（同时对双方生效，仅对照实验）")
     p.add_argument("--model", default="default")
     # --- 战斗辅助（“外挂级”能力，默认关闭，按课程逐步打开） ---
     p.add_argument("--wtap", action="store_true", help="命中后 sprint reset（W-tap 控距）")
@@ -181,7 +185,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--opp-cps-jitter", type=float, default=2.0)
     p.add_argument("--opp-reaction-ms", type=float, default=260.0)
     p.add_argument("--opp-reaction-jitter-ms", type=float, default=50.0)
-    p.add_argument("--opp-reach", type=float, default=3.99)
+    p.add_argument("--opp-reach", type=float, default=3.0,
+                   help="对手攻击距离（默认 3.0；>3 需 --cheat-reach）")
     p.add_argument("--opp-model", default="default")
     p.add_argument("--opp-assist", action="store_true", help="对手开启全部战斗辅助（压力测试）")
     p.add_argument("--reward-preset", default=None,
@@ -361,6 +366,7 @@ def main(argv: List[str] | None = None) -> int:
     # 延迟导入：允许在没有 gymnasium 的环境里只跑 `python -m gladiator_train.policy` 之类
     try:
         from gladiator_env import ArenaConfig, BotConfig, GladiatorEnv
+        from gladiator_env.env import check_reach, cheat_reach_banner
         from gladiator_env.env import OPPONENT_PROFILES, OPPONENT_REACH_OFFSET
         from gladiator_env.reward_presets import load_preset
         from gladiator_env.spaces import NUM_ACTIONS, OBS_DIM
@@ -377,6 +383,14 @@ def main(argv: List[str] | None = None) -> int:
         print(f"[train] {init_error}", file=sys.stderr)
         return 2
 
+    # G-708：作弊开关一旦给了值，双方都按它来（对照实验的语义是「同一把超限尺子」）。
+    cheat_reach = args.cheat_reach is not None
+    reach_value = check_reach(args.cheat_reach if cheat_reach else args.reach, cheat=cheat_reach)
+    opp_reach_value = check_reach(args.cheat_reach if cheat_reach else args.opp_reach,
+                                  cheat=cheat_reach)
+    if cheat_reach:
+        print(cheat_reach_banner(reach_value), file=sys.stderr)
+
     bots = [BotConfig(
         username=user,
         env_url=f"ws://{args.env_host}:{port}",
@@ -384,7 +398,8 @@ def main(argv: List[str] | None = None) -> int:
         cps_jitter=args.cps_jitter,
         reaction_ms=args.reaction_ms,
         reaction_jitter_ms=args.reaction_jitter_ms,
-        reach=args.reach,
+        reach=reach_value,
+        cheat_reach=cheat_reach,
         model=args.model,
         wtap=args.wtap,
         auto_rod=args.auto_rod,
@@ -398,7 +413,8 @@ def main(argv: List[str] | None = None) -> int:
         bot.cps_jitter = args.opp_cps_jitter
         bot.reaction_ms = args.opp_reaction_ms
         bot.reaction_jitter_ms = args.opp_reaction_jitter_ms
-        bot.reach = args.opp_reach
+        bot.reach = opp_reach_value
+        bot.cheat_reach = cheat_reach
         bot.model = args.opp_model
         if args.opp_assist:
             bot.wtap = True

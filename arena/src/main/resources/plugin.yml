@@ -1,0 +1,11 @@
+name: Arena
+main: top.cnolm.arena.ArenaPlugin
+version: 0.1.0
+author: cnolm
+description: Gladiator 对局板子（平地 1v1）
+# 板子只依赖 Gladiator 的 API，必须等它先就绪。
+depend: [Gladiator]
+commands:
+  arena:
+    description: 板子管理命令
+    usage: /arena <start|quit|stop|status>

@@ -20,7 +20,7 @@
     table = ItemTable.load()                 # 默认读同目录 items.json
     table.category("diamond_sword")          # "sword"
     table.use_spec("golden_apple")           # {"mode": "hold", "ticks": 32}
-    table.reach("diamond_sword")             # 3.99
+    table.reach("diamond_sword")             # 3.0（1.8 原版水平）
     table.reach("golden_apple")              # None（不参与攻击距离）
 """
 

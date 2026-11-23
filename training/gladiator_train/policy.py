@@ -990,6 +990,10 @@ def _pad_obs_columns(matrix: np.ndarray, target_dim: int) -> np.ndarray:
     """把 ``W1``（hidden, old_dim）扩到（hidden, target_dim）：旧列保持原下标，右侧补零。
 
     新增观测字段追加在 ``OBS_FIELDS`` 末尾，所以旧列必须留在左侧。
+
+    G-711（25 → 37）走的就是这条路：**新列严格为 0**，等于「新输入维度的权重先关掉」，
+    旧模型续训时的输出与加维前逐位相同（``test_observation_v37`` 钉住了这一点）。
+    降维（模型比环境宽）直接报错而不是截断——截断会静默丢掉模型见过的特征。
     """
     hidden, old = matrix.shape
     if old == target_dim:

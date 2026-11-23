@@ -17,6 +17,9 @@ import top.cnolm.gladiator.api.PvpVerdict;
 import top.cnolm.gladiator.api.TrainingSession;
 import top.cnolm.gladiator.api.User;
 import top.cnolm.gladiator.api.Users;
+import top.cnolm.gladiator.api.board.BoardContext;
+import top.cnolm.gladiator.api.board.MatchOutcome;
+import top.cnolm.gladiator.api.board.RoundSpec;
 import top.cnolm.gladiator.bridge.LinkServer;
 import top.cnolm.gladiator.core.BotHandle;
 import top.cnolm.gladiator.core.BotRegistry;
@@ -96,10 +99,14 @@ public final class GladiatorCommand implements CommandExecutor {
             case "unspectate":
                 handleUnspectate(sender, label);
                 return true;
+            case "board":
+                handleBoard(sender, label, args);
+                return true;
             default:
                 sender.sendMessage("[Gladiator] 用法: /" + label
                         + " <status|spawn <username>|train <username>|list|game|analyze [session] [windowSec]"
-                        + "|pvp <x> <y> <z>|stats <player>|respawn <player>|spectate [bot]|unspectate|reload>");
+                        + "|pvp <x> <y> <z>|stats <player>|respawn <player>|spectate [bot]|unspectate"
+                        + "|board <status|start <boardId> <player> <bot> <rounds> <seconds> [6 个坐标] [kit=<id>]|stop>|reload>");
                 return true;
         }
     }
@@ -180,7 +187,8 @@ public final class GladiatorCommand implements CommandExecutor {
             sender.sendMessage("[Gladiator] 用法: /" + label
                     + " spawn <username> [cps=<n>] [jitter=<n>] [reaction=<ms>]"
                     + " [rjitter=<ms>] [reach=<n>] [model=<name>]"
-                    + " [wtap=on|off] [autorod=on|off] [autoblock=on|off] [aimlock=on|off]");
+                    + " [wtap=on|off] [autorod=on|off] [autoblock=on|off] [aimlock=on|off]"
+                    + " [cheat=on|off]（reach>3 必须 cheat=on）");
             return;
         }
         String username = args[1];
@@ -230,6 +238,10 @@ public final class GladiatorCommand implements CommandExecutor {
                     case "aimlock":
                         profile.aimLock(flag(value));
                         break;
+                    case "cheat":
+                    case "cheat.reach":
+                        profile.cheatReach(flag(value));
+                        break;
                     default:
                         sender.sendMessage("[Gladiator] 未知配置项: " + key);
                         return;
@@ -239,9 +251,21 @@ public final class GladiatorCommand implements CommandExecutor {
                 return;
             }
         }
+        BotProfile built;
+        try {
+            built = profile.build();
+        } catch (IllegalArgumentException ex) {
+            sender.sendMessage("[Gladiator] 配置非法: " + ex.getMessage());
+            return;
+        }
+        if (built.isCheatReach()) {
+            // 超限 reach 必须留痕：日志里出现这一行，任何“这个 Bot 真强”的结论都得打折。
+            plugin.getLogger().warning("[cheat] reach 超限=" + built.getReach()
+                    + "（仅对照实验）user=" + username);
+        }
         try {
             BotRequest request = api.spawnBot(
-                    BotSpec.of(username, "default", null, profile.build()));
+                    BotSpec.of(username, "default", null, built));
             sender.sendMessage("[Gladiator] spawn 已受理 request=" + request.getRequestId()
                     + " botId=" + request.getBotId() + " state=" + request.getState()
                     + " mode=" + plugin.getSpawnMode()
@@ -434,6 +458,154 @@ public final class GladiatorCommand implements CommandExecutor {
             return;
         }
         sender.sendMessage("[Gladiator] 已退出观战并还原游戏模式与位置");
+    }
+
+    /**
+     * `/gladiator board <status|start|stop>`：板子对局的观察与控制。
+     *
+     * <p>为什么放在 Gladiator 而不是让每块板子自己开命令：dashboard 只认一条命令通道，
+     * 而「当前是哪场对局」是注册表的状态；板子自己的命令只管自己的规则。
+     */
+    private void handleBoard(CommandSender sender, String label, String[] args) {
+        top.cnolm.gladiator.core.board.BoardRegistryImpl registry = plugin.getBoardRegistry();
+        if (registry == null) {
+            sender.sendMessage("[Gladiator] board 失败：板子注册表未启用");
+            return;
+        }
+        String action = args.length >= 2 ? args[1].toLowerCase(Locale.ROOT) : "status";
+        if ("status".equals(action)) {
+            sender.sendMessage("[Gladiator] "
+                    + boardStatusLine(registry.active(), registry.lastFinishedSession()));
+            return;
+        }
+        if ("stop".equals(action)) {
+            BoardContext session = registry.active();
+            if (session == null) {
+                sender.sendMessage("[Gladiator] board 无进行中对局");
+                return;
+            }
+            String sessionId = session.sessionId();
+            registry.stop("command");
+            sender.sendMessage("[Gladiator] board 已停止 session=" + sessionId + " reason=command");
+            return;
+        }
+        if (!"start".equals(action)) {
+            sender.sendMessage("[Gladiator] 用法: /" + label + " board <status|start|stop>");
+            return;
+        }
+        RoundSpec spec;
+        try {
+            spec = boardSpec(args);
+        } catch (IllegalArgumentException e) {
+            sender.sendMessage("[Gladiator] board 启动失败：" + e.getMessage());
+            sender.sendMessage("[Gladiator] 用法: /" + label
+                    + " board start <boardId> <player> <bot> <rounds> <seconds> [px py pz bx by bz] [kit=<id>]");
+            return;
+        }
+        try {
+            BoardContext session = registry.start(args[2], spec);
+            sender.sendMessage("[Gladiator] board 已开始 session=" + session.sessionId()
+                    + " rounds=" + spec.getRounds() + " seconds=" + spec.getSecondsPerRound()
+                    + " phase=" + session.phase());
+        } catch (IllegalArgumentException e) {
+            sender.sendMessage("[Gladiator] board 启动失败：" + e.getMessage());
+        } catch (IllegalStateException e) {
+            sender.sendMessage("[Gladiator] board 启动失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 拼 `/gladiator board status` 的单行状态：{@code key=value} 空格分隔，dashboard 直接按空格切开。
+     *
+     * <p>优先报进行中的对局；没有时退回「最近一场已结束」，这样外部在结束瞬间仍能读到最终比分
+     * （否则会读到 {@code session=none} 而丢掉胜负）。抽成静态便于单测。
+     */
+    static String boardStatusLine(BoardContext active, BoardContext lastFinished) {
+        BoardContext session = active != null ? active : lastFinished;
+        if (session == null) {
+            return "session=none board=- round=0 rounds=0 phase=idle score=0:0 draws=0"
+                    + " reason=none player=- bot=-";
+        }
+        MatchOutcome summary = session.summary();
+        RoundSpec spec = session.spec();
+        boolean ended = "ended".equals(session.phase());
+        // 结束时 round 已经自增到 rounds+1；对外报「打了几局」比报「下一局的局号」更直观。
+        int shownRound = ended ? Math.min(session.round() - 1, spec.getRounds()) : session.round();
+        return "session=" + session.sessionId()
+                + " board=" + session.boardId()
+                + " round=" + shownRound
+                + " rounds=" + spec.getRounds()
+                + " phase=" + session.phase()
+                + " score=" + summary.getPlayerRounds() + ":" + summary.getBotRounds()
+                + " draws=" + summary.getDraws()
+                + " reason=" + (ended ? session.lastReason() : "running")
+                + " player=" + safe(spec.extra("player", "-"))
+                + " bot=" + safe(spec.extra("bot", "-"));
+    }
+
+    /**
+     * 解析 {@code board start} 的参数：
+     * {@code args = [board, start, boardId, player, bot, rounds, seconds, (px py pz bx by bz)?, (key=value)*]}。
+     *
+     * <p>6 个坐标要么全给要么全不给（只给一半会被当成 {@code key=value} 报错），
+     * 这样不会出现「玩家传了、Bot 没传」的半配置状态。抽成静态便于单测。
+     */
+    static RoundSpec boardSpec(String[] args) {
+        if (args.length < 7) {
+            throw new IllegalArgumentException("缺少参数（需要 boardId player bot rounds seconds）");
+        }
+        int rounds = parseInt(args[5], "局数");
+        int seconds = parseInt(args[6], "每局秒数");
+        RoundSpec.Builder builder = RoundSpec.builder()
+                .rounds(rounds)
+                .secondsPerRound(seconds)
+                .extra("player", args[3])
+                .extra("bot", args[4]);
+        int index = 7;
+        if (args.length >= index + 6) {
+            builder.playerSpawn(parseDouble(args[index], "玩家 x"),
+                    parseDouble(args[index + 1], "玩家 y"),
+                    parseDouble(args[index + 2], "玩家 z"));
+            builder.botSpawn(parseDouble(args[index + 3], "Bot x"),
+                    parseDouble(args[index + 4], "Bot y"),
+                    parseDouble(args[index + 5], "Bot z"));
+            index += 6;
+        }
+        for (; index < args.length; index++) {
+            String token = args[index];
+            int eq = token.indexOf('=');
+            if (eq <= 0 || eq == token.length() - 1) {
+                throw new IllegalArgumentException("无法识别参数：" + token + "（要写成 key=value）");
+            }
+            String key = token.substring(0, eq);
+            String value = token.substring(eq + 1);
+            if ("kit".equalsIgnoreCase(key)) {
+                builder.kitId(value);
+            } else {
+                builder.extra(key, value);
+            }
+        }
+        return builder.build();
+    }
+
+    private static String safe(String value) {
+        return value == null || value.isEmpty() || value.indexOf(' ') >= 0 ? "-" : value;
+    }
+
+    private static int parseInt(String raw, String what) {
+        try {
+            return Integer.parseInt(raw);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(what + " 不是整数：" + raw);
+        }
+    }
+
+    private static double parseDouble(String raw, String what) {
+        try {
+            return Double.parseDouble(raw);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(what + " 不是数字：" + raw);
+        }
     }
 
     /** 优先返回训练会话里的 Bot，其次任意已就绪的 Bot。 */

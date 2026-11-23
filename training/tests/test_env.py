@@ -13,9 +13,9 @@ from gladiator_env.testing import FakeLink, make_observation, make_target
 def build_env(**kwargs) -> tuple[GladiatorEnv, list[FakeLink]]:
     links = [FakeLink("Glad_Bot_1"), FakeLink("Glad_Bot_2")]
     links[0].set_observation(make_observation(
-        "Glad_Bot_1", x=-1.5, z=0.0, targets=[make_target(2, "Glad_Bot_2", x=1.5, z=0.0, distance=3.0)]))
+        "Glad_Bot_1", x=-1.5, z=0.0, targets=[make_target(2, "Glad_Bot_2", x=1.5, z=0.0, distance=2.5)]))
     links[1].set_observation(make_observation(
-        "Glad_Bot_2", x=1.5, z=0.0, targets=[make_target(1, "Glad_Bot_1", x=-1.5, z=0.0, distance=3.0)]))
+        "Glad_Bot_2", x=1.5, z=0.0, targets=[make_target(1, "Glad_Bot_1", x=-1.5, z=0.0, distance=2.5)]))
     env = GladiatorEnv(
         [BotConfig("Glad_Bot_1", "ws://127.0.0.1:8766"),
          BotConfig("Glad_Bot_2", "ws://127.0.0.1:8767")],
@@ -70,7 +70,7 @@ class GymApiTest(unittest.TestCase):
         env.reset()
         links[1].set_observation(make_observation(
             "Glad_Bot_2", x=1.5, z=0.0, health=0.0, state="Dead",
-            targets=[make_target(1, "Glad_Bot_1", x=-1.5, z=0.0, distance=3.0)]))
+            targets=[make_target(1, "Glad_Bot_1", x=-1.5, z=0.0, distance=2.5)]))
         _, rewards, terminated, _, info = env.step({"bot_0": 2, "bot_1": 0})
         self.assertTrue(terminated)
         self.assertEqual(info["winner"], "Glad_Bot_1")

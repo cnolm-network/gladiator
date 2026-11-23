@@ -17,7 +17,8 @@ from .items import default_table
 
 # --- 观测 ---------------------------------------------------------------
 
-OBS_DIM = 25
+#: 观测总维数。G-711：25 → 37（**只在末尾追加** 12 维跨帧信息，索引 0–24 一动不动）。
+OBS_DIM = 37
 OBS_FIELDS = (
     "self_health",       # 0  自身血量 / 20
     "self_food",         # 1  饱食度 / 20
@@ -44,7 +45,28 @@ OBS_FIELDS = (
     "in_reach",               # 22 双方水平距离 ≤ 自己 reach
     "self_vertical_speed",    # 23 自身 vy，clip-5..5 后 /5（下落为负 → 跳劈时机）
     "self_attack_cooldown",   # 24 距上次 attack 还差多少到 0.5s，clip0–0.5 后 /0.5（1=刚打完）
+    # --- G-711：跨帧信息（25..36），顺序 = ACTION_HEADS_V2 ---
+    "prev_move",              # 25 上一帧 move 头 / 5
+    "prev_look_yaw",          # 26 上一帧 look_yaw 头 / 7
+    "prev_look_pitch",        # 27 上一帧 look_pitch 头 / 5
+    "prev_attack",            # 28 上一帧 attack 头 / 2
+    "prev_use",               # 29 上一帧 use 头 / 3
+    "prev_jump",              # 30 上一帧 jump 头 / 2
+    "prev_sneak",             # 31 上一帧 sneak 头 / 2
+    "prev_sprint",            # 32 上一帧 sprint 头 / 2
+    "prev_slot",              # 33 上一帧 slot 头 / 9
+    "prev_sprint_reset",      # 34 上一帧 sprint_reset 头 / 3
+    "frames_since_attack",    # 35 距上次 attack 的帧数，clip0–50 后 /50（0=本帧刚出手）
+    "frames_since_hit",       # 36 距上次受伤的帧数，clip0–50 后 /50（0=本帧刚挨打）
 )
+
+#: G-711：「上一帧十头动作」在观测里的起始下标（25..34，顺序 = ``ACTION_HEADS_V2``）。
+PREV_ACTION_OFFSET = 25
+#: G-711：``frames_since_attack`` / ``frames_since_hit`` 的下标。
+FRAMES_SINCE_ATTACK_INDEX = 35
+FRAMES_SINCE_HIT_INDEX = 36
+#: G-711：帧数特征的分母（50 帧 ≈ 20Hz 下的 2.5 秒；再久就该饱和，不必区分）。
+FRAMES_NORMALIZER = 50.0
 
 #: 观测裁剪范围：协议字段理论上有限，但 NaN/异常值不应该进网络。
 OBS_CLIP = 5.0
@@ -122,10 +144,13 @@ def encode_observation(
     step_fraction: float = 0.0,
     opponent_health: float | None = None,
     opponents: "set[str] | None" = None,
-    reach: float = 3.99,
+    reach: float = 3.0,
     since_attack: float = 5.0,
     self_velocity_y: float | None = None,
     attack_cooldown_remaining: float | None = None,
+    prev_action: "Iterable[int] | None" = None,
+    frames_since_attack: float | None = None,
+    frames_since_hit: float | None = None,
 ) -> np.ndarray:
     """把一条 OBSERVATION 编码成固定长度的 float32 向量。
 
@@ -137,6 +162,14 @@ def encode_observation(
     不传则回落读 ``observation.self.velocity.y``（运行时从 mineflayer 补的字段）。
     ``attack_cooldown_remaining`` 是距上次 attack 还差多少秒到 0.5s 无敌帧结束（G-702）；
     环境按 ``0.5 - 距上次下发 attack 的秒数`` 算好后传入，不传按 0（= 可以打）。
+
+    G-711（跨帧信息，索引 25–36）：
+
+    - ``prev_action``：上一帧的**十头下标**（顺序 = ``ACTION_HEADS_V2``），每维
+      ``idx / head_size``。``None`` 表示「不知道」（v1 策略/新开一局），10 维全 0；
+    - ``frames_since_attack`` / ``frames_since_hit``：距上次出手 / 受伤的**帧数**，
+      clip 到 0–50 再 /50。``None`` 视为「很久以前」（= 1.0，与 ``since_attack`` 缺省 5s
+      同口径），这样旧调用方不传时不会假装「刚打完」。
     """
     self_payload = observation.get("self") or {}
     pos = self_payload.get("pos") or {}
@@ -181,6 +214,31 @@ def encode_observation(
     # 在 0.5s 这个真正决定「这一刀有没有伤害」的尺度上分辨得开。
     remaining = 0.0 if attack_cooldown_remaining is None else _f(attack_cooldown_remaining)
     vector[24] = _clamp(remaining, 0.0, ATTACK_COOLDOWN_S) / ATTACK_COOLDOWN_S
+
+    # G-711（index 25..34）：上一帧的十头动作。BC 后 move/sprint 两个头一致率只有
+    # 0.85/0.87，因为「上一帧走了哪一步」不在观测里——单帧静力学推不出换向节拍。
+    # 归一化成 idx / head_size，落在 0..1，与其余维同量级。
+    if prev_action is not None:
+        picked = list(prev_action)
+        for offset, (head, size) in enumerate(ACTION_HEADS_V2.items()):
+            index = PREV_ACTION_OFFSET + offset
+            if offset >= len(picked):
+                break
+            try:
+                value = int(picked[offset])
+            except (TypeError, ValueError):
+                value = 0
+            vector[index] = _clamp(value / float(size), 0.0, 1.0)
+
+    # G-711（index 35/36）：跨帧计数。攻击/受伤都是「事件」，而 0.2s 一帧的采样
+    # 经常整帧跳过事件本身（1.8 的无敌帧 500ms、死亡→重生 2 tick），所以给「距上次
+    # 事件多少帧」，让策略能自己推断节拍。None = 不知道 → 按饱和值 1.0。
+    frames_attack = FRAMES_NORMALIZER if frames_since_attack is None else _f(frames_since_attack)
+    frames_hit = FRAMES_NORMALIZER if frames_since_hit is None else _f(frames_since_hit)
+    vector[FRAMES_SINCE_ATTACK_INDEX] = (
+        _clamp(frames_attack, 0.0, FRAMES_NORMALIZER) / FRAMES_NORMALIZER)
+    vector[FRAMES_SINCE_HIT_INDEX] = (
+        _clamp(frames_hit, 0.0, FRAMES_NORMALIZER) / FRAMES_NORMALIZER)
 
     if target is not None:
         tpos = target.get("pos") or {}
@@ -255,7 +313,7 @@ def decode_action(
     observation: dict,
     username: str,
     opponents: "set[str] | None" = None,
-    reach: float = 3.99,
+    reach: float = 3.0,
 ) -> list[dict]:
     """把离散动作编号翻译成有序的协议动作列表（复合动作 = 多帧）。
 
@@ -315,8 +373,8 @@ def decode_action(
     if name == "attack":
         entity_id = target.get("id")
         if entity_id is None or distance > effective_reach:
-            # 够不到时先靠近：攻击距离由 BotProfile.reach 决定（默认原版 3.99），硬打只会空挥
-            # （运行时回 OUT_OF_REACH，日志里大量 `目标距离 4.02 > reach 3.99` 就是这么来的）。
+            # 够不到时先靠近：攻击距离由 BotProfile.reach 决定（默认原版 3.0），硬打只会空挥
+            # （运行时回 OUT_OF_REACH，日志里大量 `目标距离 3.20 > reach 3.0` 就是这么来的）。
             return [look, {"type": "move", "params": {
                 "direction": "forward", "durationMs": MOVE_MS, "sprint": distance > 2.5}}]
         # 近身：先转向目标、挥击、再补一次朝向，减少击退后的背对空挥。

@@ -140,15 +140,20 @@ class StatisticsTest(unittest.TestCase):
         self.assertEqual(summary["ranking"][0]["winRate"], 0.0)
 
 
-class V2RejectionTest(unittest.TestCase):
-    def test_rejects_v2_policy(self):
+class ModelLoadingTest(unittest.TestCase):
+    """G-703：v1 / v2 都收（此前 v2 被硬拒），并把动作空间记进记录。"""
+
+    def test_accepts_v2_policy(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "policy-v2.npz"
             Policy(obs_dim=OBS_DIM, n_actions=37, hidden=8, seed=0,
                    action_space="v2").save(str(path))
-            with self.assertRaises(SystemExit) as caught:
-                load_policies([str(path)])
-            self.assertIn("v2", str(caught.exception))
+            loaded = load_policies([str(path)])
+            self.assertEqual(len(loaded), 1)
+            record = next(iter(loaded.values()))
+            self.assertEqual(record.action_space, "v2")
+            self.assertEqual(list(record.head_sizes), [5, 7, 5, 2, 3, 2, 2, 2, 9, 3])
+            self.assertEqual(record.path, str(path))
 
     def test_accepts_v1_policy(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -157,7 +162,16 @@ class V2RejectionTest(unittest.TestCase):
             loaded = load_policies([str(path)])
             self.assertEqual(len(loaded), 1)
             record = next(iter(loaded.values()))
-            self.assertEqual(record["path"], str(path))
+            self.assertEqual(record.path, str(path))
+            self.assertEqual(record.action_space, "v1")
+
+    def test_rejects_broken_npz(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "broken.npz"
+            path.write_bytes(b"not a real npz")
+            with self.assertRaises(SystemExit) as caught:
+                load_policies([str(path)])
+            self.assertIn("无法加载", str(caught.exception))
 
     def test_unique_labels_for_generic_stems(self):
         labels = unique_labels([

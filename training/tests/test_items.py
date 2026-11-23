@@ -37,7 +37,7 @@ class DefaultTableTest(unittest.TestCase):
         self.assertEqual(capability["category"], "sword")
         self.assertEqual(capability["use"], {"mode": "hold_block", "ticks": 5})
         self.assertEqual(capability["cooldownTicks"], 10)
-        self.assertAlmostEqual(self.table.reach("diamond_sword"), 3.99, places=2)
+        self.assertAlmostEqual(self.table.reach("diamond_sword"), 3.0, places=2)
 
     def test_glob_matches_other_swords(self):
         for name in ("iron_sword", "stone_sword", "minecraft:gold_sword"):

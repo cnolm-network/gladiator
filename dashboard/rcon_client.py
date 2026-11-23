@@ -9,6 +9,7 @@ Dashboard 需要读 `gladiator status`、`tps`，以及在「人机对战」里�
 from __future__ import annotations
 
 import re
+import select
 import socket
 import struct
 import time
@@ -83,18 +84,13 @@ class RconClient:
             raise RconError("RCON 尚未连接")
         self._request_id += 1
         self._write(SERVERDATA_EXECCOMMAND, self._request_id, command)
-        chunks: list[str] = []
-        deadline = time.monotonic() + self.timeout
-        while time.monotonic() < deadline:
-            try:
-                packet = self._read()
-            except socket.timeout:
-                break
-            chunks.append(packet.body)
-            if self._sock is not None:
-                self._sock.settimeout(0.15)
-        if self._sock is not None:
-            self._sock.settimeout(self.timeout)
+        # 收到第一包就返回，不再「再等 150ms 看有没有后续包」——旧写法让每条命令固定
+        # 多花 150ms（0.1s 采样周期下等于把帧率砍到 1.5Hz）。多包响应靠 select
+        # 非阻塞探测：数据已经在缓冲区里才继续读。
+        chunks: list[str] = [self._read().body]
+        sock = self._sock
+        while sock is not None and select.select([sock], [], [], 0)[0]:
+            chunks.append(self._read().body)
         return "".join(chunks)
 
     # --- 帧 -------------------------------------------------------------

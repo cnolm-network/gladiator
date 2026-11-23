@@ -159,9 +159,10 @@ GladiatorEnv(
 所以进服旁观的人、路过的玩家都不会被当成目标，也不会被 Bot 追打。
 观战方法见 [`spectating.md`](spectating.md)。
 
-#### 观测（25 维，`float32`，裁剪到 ±5）
+#### 观测（37 维，`float32`，裁剪到 ±5）
 
-> 维度演进：19 → 23（P1，加对手速度/出手间隔/能否打中）→ **25**（G-702，末尾追加自身竖直速度与出手冷却）。
+> 维度演进：19 → 23（P1，加对手速度/出手间隔/能否打中）→ 25（G-702，末尾追加自身竖直速度与出手冷却）
+> → **37**（G-711，末尾追加「上一帧十头动作」与两个帧计数）。
 > 新字段只在**末尾追加**，旧模型的 `W1` 右侧补零即可续训（`adopt_weights`）。
 
 | # | 字段 | 说明 |
@@ -188,9 +189,20 @@ GladiatorEnv(
 | 22 | `in_reach` | 双方水平距离 ≤ 自己 `reach` |
 | 23 | `self_vertical_speed` | **自身** vy，clip(−5,5) / 5（下落为负 = 跳劈窗口，`G-702`） |
 | 24 | `self_attack_cooldown` | 距上次 attack 还差多少到 0.5s，clip(0,0.5) / 0.5（1=刚打完、0=可以打，`G-702`） |
+| 25–34 | `prev_move` … `prev_sprint_reset` | **上一帧**十个头的选择，每维 `idx / head_size`（顺序 = `ACTION_HEADS_V2`；v1 / 新回合 → 全 0，`G-711`） |
+| 35 | `frames_since_attack` | 距上次下发 attack 的**帧数**，clip(0,50) / 50（0=本帧刚出手，`G-711`） |
+| 36 | `frames_since_hit` | 距上次自身受伤的**帧数**，clip(0,50) / 50（0=本帧刚挨打，`G-711`） |
+
+> **G-709 收口**：`opponent_vertical_speed` 自 P1 起就在索引 20（见上表），任务书里「25 维没有对手 vy」是旧语境。经用户确认按「已满足、不扩维」关闭，`OBS_DIM` 保持 37；不要追加同名第 38 维。防回归见 `training/tests/test_observation_g709.py`。
 
 缺失字段有默认值；`NaN`/`inf` 会被替换成 0，`G-402` 验收即此。
-第 23/24 维的语义与「为什么加」见 [`observation.md`](observation.md) §4.3。
+第 23/24 维的语义见 [`observation.md`](observation.md) §4.0；
+G-711 的 12 维跨帧信息见 §4.1（为什么需要跨帧 + 运行时如何算）与 §4（逐维归一化）。
+
+**运行时同口径**：`bot-runtime` 的本地大脑（`--brain`）用同一组参数编码——
+`BrainCrossFrame` 维护「上一帧十头动作 / 距上次出手帧数 / 距上次受伤帧数」，
+再交给 `encodeObservation({prevAction, framesSinceAttack, framesSinceHit})`，
+所以人机对战的 37 维输入与训练侧逐位同源（不是「后 12 维恒 0」的半盲输入）。
 
 #### 动作（11 个离散动作，`G-403` / `G-607`）
 

@@ -84,6 +84,12 @@ public class PlayerTelemetryTest {
                     if ("getNoDamageTicks".equals(called)) {
                         return noDamageTicks;
                     }
+                    if ("isDead".equals(called)) {
+                        return health <= 0.0D;
+                    }
+                    if ("getActivePotionEffects".equals(called)) {
+                        return new java.util.ArrayList<org.bukkit.potion.PotionEffect>();
+                    }
                     if ("toString".equals(called)) {
                         return "FakePlayer{" + name + "}";
                     }
@@ -109,7 +115,8 @@ public class PlayerTelemetryTest {
         assertEquals(
                 "name=Steve health=20.0 food=20 saturation=5.0 armor=20.0"
                         + " x=0.5 y=4.0 z=0.5 yaw=0.0 pitch=0.0"
-                        + " sprinting=false blocking=false onGround=true hurt=0.0",
+                        + " sprinting=false blocking=false onGround=true hurt=0.0"
+                        + " dead=false effects=-",
                 PlayerTelemetry.format(player));
     }
 

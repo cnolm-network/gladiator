@@ -1,18 +1,26 @@
 """人机对战编排器（块 C）。
 
-把一个「人类玩家 vs 指定 Bot」的对局跑起来并跑完：选/拉起运行时 → 经 RCON 让插件 spawn →
-每局摆位发装备 → 倒计时 → 采样判定 → 记分 → 可选录制与赛后导入训练。
+把一个「人类玩家 vs 指定 Bot」的对局跑起来并跑完。**判定归板子**：
 
-设计边界：
-- **规则不进 Java**：传送/清包/发装备/回血/判胜负全部在这里用 RCON 命令编排，
-  插件只提供观测（`/gladiator stats`）与生命周期（`spawn`/`list`）；
-- **不重复启动**：`attach` 模式优先复用已存在的运行时（含用户手动启动的外部进程），
-  只有需要大脑而进程没带 `--brain` 时才重启（外部进程不允许重启，直接报冲突）；
-- **可测试**：RCON、时钟、sleep 都可注入，单测用脚本化的假连接在毫秒级跑完一整场。
+    起运行时 → `/gladiator spawn` 让 Bot 上线 → `/gladiator board start` 开局
+    → 每 500ms 读 `/gladiator board status` 同步阶段 / 比分 / 逐局结果
+    → 录制帧（含 rewards）+ 赛后导入 → 只清理自己拉起的运行时
 
-状态机（`phase`）：
-``idle → preparing → countdown → fighting → roundEnd → … → finished``
-异常/取消落在 ``failed`` / ``stopped``。
+设计边界（G-715 之后）：
+
+- **规则不在 dashboard，也不在 RCON 命令里**：清场、套件、倒计时、摆位、死亡重生、判胜负、
+  计分全部由服务器侧的板子（`flat-1v1`，见 `arena/`）用 Bukkit 事件驱动（`PlayerDeathEvent`
+  → `ArenaKillEvent` → `RoundOutcome`）。dashboard 只发一条 start，然后**只读** status。
+- **判死不轮询血量**：1.8 死亡到重生只有约 2 tick，任何 1Hz/2Hz 采样都会跨过去（真机三局
+  全 `timeout` 收尾）。结束判定只认 status 的 `phase=ended`（或 `session=none`）+ 比分。
+- **玩家必须自己进服**：dashboard 只 spawn Bot；玩家由人自己登录（地址见 `commands.join`）。
+- **录制只做观测**：每 500ms 两条 `/gladiator stats` + 一帧 `frames.jsonl`（带本帧伤害回报）。
+- **可测试**：RCON、时钟、sleep 可注入，单测用脚本化的假连接在毫秒级跑完一整场。
+
+状态机（`phase`）是板子阶段的投影：
+
+``idle → preparing → countdown → fighting → finished``；异常/取消落在 ``failed`` / ``stopped``。
+板子的 `starting`/`idle` 映射为 `preparing`，`ended` 映射为 `finished`。
 """
 
 from __future__ import annotations
@@ -22,7 +30,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -37,36 +45,63 @@ from validation import (parse_bool, parse_center, parse_int, parse_soft_spec,
 
 _RE_LIST_BOT = re.compile(r"^\s*-\s+\S+\s+name=(\S+).*?ready=(true|false)", re.MULTILINE)
 
+#: `/gladiator board status` 的一行输出（键序固定，允许 `board=`/`player=`/`bot=` 为空）。
+_RE_BOARD_STATUS = re.compile(
+    r"session=(?P<session>\S*)\s+board=(?P<board>\S*)\s+round=(?P<round>\d+)"
+    r"\s+rounds=(?P<rounds>\d+)\s+phase=(?P<phase>\S+)"
+    r"\s+score=(?P<player_score>\d+)\s*:\s*(?P<bot_score>\d+)\s+draws=(?P<draws>\d+)"
+    r"\s+reason=(?P<reason>.*?)\s+player=(?P<player>\S*)\s+bot=(?P<bot>\S*)\s*$",
+)
+
 PHASES = ("idle", "preparing", "countdown", "fighting", "roundEnd", "finished", "stopped", "failed")
 
-#: 每局准备阶段的倒计时秒数（与训练场 `--prep-seconds` 的语义一致）。
-COUNTDOWN_SECONDS = 3
+#: 板子自己声明的阶段（`BoardContext#phase`）与 dashboard 阶段名的映射来源。
+BOARD_PHASES = ("idle", "starting", "countdown", "fighting", "ended")
 
-#: 采样周期：录制时 10Hz（任务要求的录制频率），不录制时 5Hz（足够抓住死亡瞬间）。
-RECORD_PERIOD = 0.1
-JUDGE_PERIOD = 0.2
+#: 对局板子的 id（服务器侧 `Board#id()`，见 `arena/src/.../FlatBoard.java`）。
+BOARD_ID = "flat-1v1"
 
-#: 套件（`give` 的参数；带空格表示数量）。
-KITS: dict[str, tuple[str, ...]] = {
-    "diamond": (
-        "diamond_sword",
-        "diamond_helmet",
-        "diamond_chestplate",
-        "diamond_leggings",
-        "diamond_boots",
-        "golden_apple 5",
-        "fishing_rod",
-    ),
-    "none": (),
+#: status 轮询周期（秒）：契约规定 500ms。同一节奏写一帧 frames.jsonl（≈2Hz）。
+STATUS_PERIOD = 0.5
+# 板子引擎的采样周期：RCON 修好之后单次往返是毫秒级（旧实现在认证后丢了 data 监听，
+# 每次 command() 都要等满 3s 超时），所以可以直接按 10Hz 采样——训练数据的帧密度
+# 取决于它，0.5s 一帧会让 20 秒的一局只剩 40 个样本。
+BOARD_STATUS_PERIOD = 0.1
+# status 探测周期：阶段/比分变化是秒级，不需要每帧都问。
+STATUS_PROBE_PERIOD = 0.5
+# 每帧之间让出一小口气，避免把 RCON 连接打满；实际帧率由 stats 往返决定（~9Hz）。
+FRAME_SLEEP = 0.02
+FRAME_PERIOD = STATUS_PERIOD
+
+#: 连续解析失败多少次后认为服务端没实现/输出坏了（12 × 500ms = 6s）。
+MAX_UNPARSED_STATUS = 12
+
+#: 刚 start 后允许 status 短暂报 `session=none` 的次数（宽限 2s，避免开局瞬间漏判为结束）。
+SESSION_GRACE = 4
+
+#: 服务端在对局中把 reason 填成 `running`（见 `GladiatorCommand#boardStatusLine`）：
+#: 它不是「这一局为什么结束」，记录逐局原因时要当噪声丢掉。
+RUNNING_REASON = "running"
+
+#: 等玩家进服的秒数（超过就失败并给出进服提示，而不是让板子 `start` 报一个含糊的错误）。
+PLAYER_JOIN_TIMEOUT = 30.0
+
+#:  watchdog 余量：每局多给 20s（板子自己的倒计时/换局），整场再多给 60s。
+ROUND_SLACK_SECONDS = 20.0
+MATCH_SLACK_SECONDS = 60.0
+
+#: `kit` 的请求体取值（旧前端只有 diamond/none），映射到板子的套件 id 后随 start 下发。
+KIT_IDS: tuple[str, ...] = ("diamond", "none", "classic", "gapple", "sword", "empty")
+
+#: 请求体的 kit → 板子 `kit=` 参数（`arena/ArenaKits#normalize` 认得这些名字）。
+BOARD_KIT_BY_KIT: dict[str, str] = {
+    "diamond": "classic",
+    "classic": "classic",
+    "gapple": "gapple",
+    "sword": "sword",
+    "none": "empty",
+    "empty": "empty",
 }
-
-#: 给双方回血/回饱食度用的原版效果 id（1.8：6=瞬间治疗，23=饱和）。
-HEAL_EFFECTS = ("6", "23")
-
-#: 倒计时免伤：1.8 的抗性（11）放大器 4 = 抗性 V = 完全免伤。
-SHIELD_EFFECT_ID = 11
-SHIELD_AMPLIFIER = 4
-SHIELD_SECONDS = COUNTDOWN_SECONDS + 2
 
 
 def parse_ready_bots(raw: str) -> dict[str, bool]:
@@ -98,205 +133,267 @@ def parse_stats_line(raw: str) -> Optional[dict]:
     return result if ("health" in result or "name" in result) else None
 
 
-def judge_round(player: Optional[dict], bot: Optional[dict], elapsed: float,
-                round_seconds: float, prev_player: Optional[dict] = None,
-                prev_bot: Optional[dict] = None) -> Optional[dict]:
-    """判定当前局是否结束；未结束返回 ``None``。
+def parse_board_status(raw: str) -> Optional[dict]:
+    """解析 ``/gladiator board status`` 的一行 key=value。
 
-    规则（全部是"读数→结论"，不含游戏规则）：
-    1. 某一方读不到 stats（离线/被踢）→ 对方胜；
-    2. 血量 ≤ 0 → 对方胜（kill）；
-    3. 血量从低位突然回到接近满值 → 判为"死亡后重生"，对方胜
-       （1.8 死亡到重生只有 2 tick，5~10Hz 采样会漏掉 health=0 的那一帧）；
-    4. 到达局时长 → 血量低者判负，相等为平局（timeout）。
+    契约（服务端 G-715 起）：
+
+    ```
+    session=<id|none> board=<id> round=<n> rounds=<n> phase=<idle|countdown|fighting|ended>
+    score=<player>:<bot> draws=<n> reason=<...> player=<名字> bot=<名字>
+    ```
+
+    返回::
+
+        {"session": str|None, "board": str, "round": int, "rounds": int,
+         "phase": str, "score": {"player": int, "bot": int, "draws": int},
+         "reason": str|None, "player": str, "bot": str}
+
+    ``session=none``（无对局）→ ``session`` 为 ``None``；``reason=none`` → ``reason`` 为
+    ``None``。输出不可解析时返回 ``None``（调用方据此判断服务端未支持/输出异常）。
     """
-    if player is None:
-        return {"winner": "bot", "reason": "player-offline"}
-    if bot is None:
-        return {"winner": "player", "reason": "bot-offline"}
-    player_health = float(player.get("health", 20.0))
-    bot_health = float(bot.get("health", 20.0))
-    if player_health <= 0:
-        return {"winner": "bot", "reason": "kill"}
-    if bot_health <= 0:
-        return {"winner": "player", "reason": "kill"}
-    if _looks_respawned(prev_player, player):
-        return {"winner": "bot", "reason": "player-respawn"}
-    if _looks_respawned(prev_bot, bot):
-        return {"winner": "player", "reason": "bot-respawn"}
-    if elapsed >= float(round_seconds):
-        if player_health > bot_health:
-            return {"winner": "player", "reason": "timeout"}
-        if bot_health > player_health:
-            return {"winner": "bot", "reason": "timeout"}
-        return {"winner": "draw", "reason": "timeout"}
+    text = strip_formatting(raw or "")
+    for line in text.splitlines():
+        parsed = _parse_board_status_line(line)
+        if parsed is not None:
+            return parsed
     return None
 
 
-def _looks_respawned(previous: Optional[dict], current: dict) -> bool:
-    if not previous:
-        return False
+def _parse_board_status_line(line: str) -> Optional[dict]:
+    match = _RE_BOARD_STATUS.search(line.strip())
+    if match is not None:
+        return {
+            "session": _empty_to_none(match.group("session")),
+            "board": _placeholder(match.group("board")),
+            "round": int(match.group("round")),
+            "rounds": int(match.group("rounds")),
+            "phase": (match.group("phase") or "").strip().lower(),
+            "score": {
+                "player": int(match.group("player_score")),
+                "bot": int(match.group("bot_score")),
+                "draws": int(match.group("draws")),
+            },
+            "reason": _empty_to_none(match.group("reason")),
+            "player": _placeholder(match.group("player")),
+            "bot": _placeholder(match.group("bot")),
+        }
+    # 兜底：键序变了也尽量读出来（reason 里有空格时会截断，只在前面的正则失败时才走这里）。
+    tokens: dict[str, str] = {}
+    for token in line.strip().split():
+        if "=" in token:
+            key, value = token.split("=", 1)
+            tokens.setdefault(key.lower(), value)
+    if "session" not in tokens or "phase" not in tokens:
+        return None
     try:
-        before = float(previous.get("health", 20.0))
-        after = float(current.get("health", 20.0))
+        score_raw = tokens.get("score", "0:0")
+        player_score, _, bot_score = score_raw.partition(":")
+        return {
+            "session": _empty_to_none(tokens.get("session", "")),
+            "board": _placeholder(tokens.get("board", "")),
+            "round": int(tokens.get("round") or 0),
+            "rounds": int(tokens.get("rounds") or 0),
+            "phase": (tokens.get("phase") or "").strip().lower(),
+            "score": {
+                "player": int(player_score or 0),
+                "bot": int(bot_score or 0),
+                "draws": int(tokens.get("draws") or 0),
+            },
+            "reason": _empty_to_none(tokens.get("reason", "")),
+            "player": _placeholder(tokens.get("player", "")),
+            "bot": _placeholder(tokens.get("bot", "")),
+        }
     except (TypeError, ValueError):
+        return None
+
+
+def _empty_to_none(value: Optional[str]) -> Optional[str]:
+    """``none`` / 空串 / ``-`` 统一成 ``None``（无对局、无 reason）。"""
+    text = str(value or "").strip()
+    if not text or text.lower() in ("none", "-", "null"):
+        return None
+    return text
+
+
+def _placeholder(value: Optional[str]) -> str:
+    """服务端用 ``-`` 占位（`board=-`、`player=-`、`bot=-`）：dashboard 侧统一成空串。"""
+    text = str(value or "").strip()
+    return "" if text == "-" else text
+
+
+def map_board_phase(phase: Optional[str]) -> str:
+    """板子阶段 → dashboard 阶段名（未知阶段原样透出，前端按原文显示）。"""
+    text = (phase or "").strip().lower()
+    if text in ("", "idle", "starting", "prepare", "preparing"):
+        return "preparing"
+    if text in ("countdown", "prep"):
+        return "countdown"
+    if text in ("fighting", "battle", "running"):
+        return "fighting"
+    if text in ("ended", "finished", "done"):
+        return "finished"
+    return text
+
+
+def board_finished(status: Optional[dict]) -> bool:
+    """对局是否已结束：只认 ``session=none`` 或 ``phase=ended``。"""
+    if not status:
         return False
-    return before <= 12.0 and after >= 19.5
+    if status.get("session") is None:
+        return True
+    return (status.get("phase") or "").strip().lower() in ("ended", "finished")
 
 
-#: 默认出生点相对中点的横向偏移：玩家 -4 格、Bot +4 格（面对面 8 格）。
-DEFAULT_SPAWN_OFFSET = 4.0
+def board_start_command(plan: "MatchPlan", board_id: str = BOARD_ID) -> str:
+    """拼 `/gladiator board start`（纯函数，单测直接断言）。
 
-#: 死亡后回到站位的判定半径（格）。1.8 的 tp 落点会有 ±0.5 的实体碰撞修正。
-SPAWN_TOLERANCE = 2.0
-
-#: 强制重生后最多等多久确认双方回到站位（秒）。
-RESPAWN_RECOVER_TIMEOUT = 5.0
-
-#: 恢复窗口内重发 ``tp`` 的间隔（秒）：客户端重生后的本地位置预测会覆盖一次 tp。
-RESPAWN_PLACE_REFRESH = 0.4
-
-#: 触发「强制重生 + 重新摆位」的判定原因（离线不属于此列：人不在线重生也没用）。
-DEATH_REASONS = ("kill", "player-respawn", "bot-respawn")
-
-#: 单局内最多强制重生几次：防止异常状态（一直掉血/一直读不到位置）把这一局拖死。
-MAX_RESPAWNS_PER_ROUND = 20
-
-
-def derive_default_spawns(player_name: str, player_stats: Optional[dict],
-                          bot_name: str, bot_stats: Optional[dict]) -> Optional[dict]:
-    """未指定 ``spawns`` 时按双方当前位置推导出生点。
-
-    规则（任务书 bug1-2）：中点 ``x/z`` 为场地中心、``y`` 取玩家当前 ``y``；
-    玩家落在中心 ``-4`` 格、Bot 落在 ``+4`` 格。任一方的 stats 读不到时返回 ``None``
-    （调用方记一条告警并放弃自动出生点，而不是拿 0,0,0 乱传）。
-
-    返回 ``{player_name: (x, y, z), bot_name: (x, y, z)}``，坐标保留 2 位小数，
-    与 RCON 命令里的格式一致。
+    ``spawns`` 两侧都有坐标时才带上 6 个数（``px py pz bx by bz``）；缺一侧就不带，
+    由板子自己决定出生点——摆位是板子的事，dashboard 不再替它猜。
     """
-    if not player_stats or not bot_stats:
-        return None
+    parts = ["gladiator", "board", "start", board_id, plan.player, plan.bot,
+             str(int(plan.rounds)), _seconds_arg(plan.round_seconds)]
+    spawns = plan.spawns or {}
+    player_point = spawns.get(plan.player)
+    bot_point = spawns.get(plan.bot)
+    if player_point and bot_point:
+        for point in (player_point, bot_point):
+            parts.extend(f"{float(value):.2f}" for value in point[:3])
+    board_kit = BOARD_KIT_BY_KIT.get((plan.kit or "").strip().lower())
+    if board_kit:
+        parts.append(f"kit={board_kit}")
+    return " ".join(parts)
+
+
+def _seconds_arg(seconds: float) -> str:
+    """局时长参数：服务端按整数解析（`GladiatorCommand#parseInt`），这里统一取整。"""
+    return str(int(round(float(seconds))))
+
+
+def _damage(before: Optional[dict], after: Optional[dict]) -> float:
+    """血量下降量（伤害，正值）；回血/重生/读不到 = 0。"""
+    if not before or not after:
+        return 0.0
     try:
-        px = float(player_stats["x"])
-        pz = float(player_stats["z"])
-        py = float(player_stats.get("y", 4.0))
-        bx = float(bot_stats["x"])
-        bz = float(bot_stats["z"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    center_x = (px + bx) / 2.0
-    center_z = (pz + bz) / 2.0
+        old = float(before.get("health"))
+        new = float(after.get("health"))
+    except (TypeError, ValueError, AttributeError):
+        return 0.0
+    return round(max(0.0, old - new), 2)
+
+
+def frame_rewards(previous_player: Optional[dict], previous_bot: Optional[dict],
+                  player: Optional[dict], bot: Optional[dict]) -> dict:
+    """用相邻两帧的血量差算「本帧对对方造成的伤害」（AWR 要的逐帧回报）。
+
+    返回 ``{"playerDamage": 本帧对 Bot 造成的伤害, "botDamage": 本帧对 Player 造成的伤害}``。
+    伤害记正值；血量上升（回血/重生/换局重置）或某一侧读不到 stats 时写 0。
+    """
     return {
-        player_name: (round(center_x - DEFAULT_SPAWN_OFFSET, 2), round(py, 2), round(center_z, 2)),
-        bot_name: (round(center_x + DEFAULT_SPAWN_OFFSET, 2), round(py, 2), round(center_z, 2)),
+        "playerDamage": _damage(previous_bot, bot),
+        "botDamage": _damage(previous_player, player),
     }
 
 
-def rekit_commands(names: list, kit: str) -> list[str]:
-    """死亡后的补装命令（只补死掉的那一方，不打扰还活着的对手）。
+def _infer_round_reason(winner: str, seconds: float, round_seconds: float,
+                        session_reason: Optional[str]) -> str:
+    """推断**逐局**结束原因（status 只给会话级 reason）。
 
-    1.8 死亡会清空背包并掉落物品；不补装的话，剩下半局只能用拳头，
-    而 brain 会因为「背包里没有剑」一直空挥（ITEM_MISSING）。
-    不含倒计时免伤（抗性 V）：重生后无敌 5 秒会破坏对局。
+    - 没有秒表（跨局被合并采样，`seconds<=0`）就不猜，回退到会话级原因；
+    - 有胜负且没打满时长 → ``kill``（板子里除「超时」就是「击杀」/掉线判负）；
+    - 平局且打满时长 → ``timeout``。
     """
-    commands: list[str] = []
-    for name in names:
-        commands.append(f"clear {name}")
-    for name in names:
-        commands.append(f"gamemode 0 {name}")
-    for name in names:
-        for item in KITS.get(kit, ()):
-            commands.append(f"give {name} {item}")
-    for name in names:
-        commands.append(f"effect {name} clear")
-    for name in names:
-        for effect in HEAL_EFFECTS:
-            commands.append(f"effect {name} {effect} 1 20 true")
-    return commands
+    if not round_seconds or seconds <= 0:
+        return session_reason or "unknown"
+    full = seconds >= float(round_seconds) - 1.5
+    if winner == "draw":
+        return "timeout" if full else (session_reason or "unknown")
+    return "kill" if not full else (session_reason or "eliminated")
 
 
-def _dead_sides(plan: MatchPlan, player: Optional[dict], bot: Optional[dict],
-                reason: Optional[str]) -> list:
-    """这一刀到底谁死了（用于只给死者补装）。
+@dataclass
+class BoardTracker:
+    """把连续的 status 采样聚合成「阶段 + 比分 + 逐局结果」。
 
-    血量能判断时以血量为准；「重生启发式」命中时血量已经回到满值，只能看判定原因。
+    板子的 status 只给**累计**比分（`score=<玩家>:<bot>` 与 `draws`），没有逐局历史，
+    因此逐局结果靠下面两条推断，并用 `docs/match.md` §4.4 写清楚：
+
+    - 赢家：相邻两次采样之间的比分增量（玩家 +1 / Bot +1 / 平局 +1）；
+    - `seconds`：该局从板子报 `round=N` 起算到比分变化为止的墙钟（500ms 轮询，
+      量化误差 ±0.5s）；跨局被合并采样时记 0；
+    - `reason`：取**最近一次**非 `running` / `none` 的 `reason`。服务端对局中固定填
+      `running`，只有结束那一刻才是 `lastReason()`（会话级，如 `rounds-finished`），
+      所以除末局可能拿到会话级原因外，其余记 `unknown`——逐局原因要服务端补字段。
     """
-    dead: list = []
-    player_health = 20.0 if player is None else float(player.get("health", 20.0))
-    bot_health = 20.0 if bot is None else float(bot.get("health", 20.0))
-    if reason == "player-respawn" or player_health <= 0:
-        dead.append(plan.player)
-    if reason == "bot-respawn" or bot_health <= 0:
-        dead.append(plan.bot)
-    return dead or [plan.player, plan.bot]
 
+    entries: list[dict] = field(default_factory=list)
+    score: dict = field(default_factory=lambda: {"player": 0, "bot": 0, "draws": 0})
+    round_no: int = 0
+    round_started: Optional[float] = None
+    reason: Optional[str] = None
+    seen_session: bool = False
+    # 每局时长上限（秒）：用来把「这一局到底是打死还是超时」判出来。
+    # 服务端 status 的 reason 是**会话级**的（只有末局能拿到 rounds-finished），
+    # 逐局原因只能靠时长推断——见 _entry。
+    round_seconds: float = 0.0
 
-def _at_spawn(stats: Optional[dict], point: Optional[tuple],
-              tolerance: float = SPAWN_TOLERANCE) -> bool:
-    """该玩家是否「活着且已经回到出生点」（只看水平距离，y 由服务器落地决定）。"""
-    if not stats or not point:
-        return False
-    if float(stats.get("health", 0.0)) <= 0:
-        return False
-    try:
-        dx = float(stats.get("x", 0.0)) - float(point[0])
-        dz = float(stats.get("z", 0.0)) - float(point[2])
-    except (TypeError, ValueError):
-        return False
-    return abs(dx) <= tolerance and abs(dz) <= tolerance
+    def update(self, status: dict, now: float) -> list[dict]:
+        """吸收一条 status，返回本次新增的逐局记录（0~n 条）。"""
+        if status.get("session"):
+            self.seen_session = True
+        # 服务端在对局中是 `reason=running`，只有结束时才是真正的 lastReason；
+        # 把 running 当噪声丢掉，否则整场每局都会被记成 running。
+        reason = status.get("reason")
+        if reason and reason.strip().lower() != RUNNING_REASON:
+            self.reason = reason
+        previous_started = self.round_started
+        round_no = int(status.get("round") or 0)
+        if round_no != self.round_no:
+            self.round_no = round_no
+            self.round_started = now if round_no >= 1 else None
+        raw_score = status.get("score") or {}
+        new_score = {
+            "player": int(raw_score.get("player") or 0),
+            "bot": int(raw_score.get("bot") or 0),
+            "draws": int(raw_score.get("draws") or 0),
+        }
+        deltas = (
+            ("player", max(0, new_score["player"] - int(self.score.get("player") or 0))),
+            ("bot", max(0, new_score["bot"] - int(self.score.get("bot") or 0))),
+            ("draw", max(0, new_score["draws"] - int(self.score.get("draws") or 0))),
+        )
+        created: list[dict] = []
+        for winner, count in deltas:
+            for _ in range(count):
+                started = previous_started if not created else self.round_started
+                created.append(self._entry(winner, now, started))
+        self.score = new_score
+        # 跨局合并采样：比分已记完但轮次号早就变到下一局了（`round_no > len(entries)`），
+        # 这时秒表要在**同一次采样**里补上新一局的起点，否则下一局会记成 0 秒。
+        if self.round_started is None and round_no >= 1 and len(self.entries) < round_no:
+            self.round_started = now
+        return created
 
+    def _entry(self, winner: str, now: float, started: Optional[float]) -> dict:
+        seconds = 0.0 if started is None else round(max(0.0, now - started), 1)
+        entry = {
+            "round": len(self.entries) + 1,
+            "winner": winner,
+            "reason": _infer_round_reason(winner, seconds, self.round_seconds, self.reason),
+            "seconds": seconds,
+            # 向后兼容：旧字段 duration 与 seconds 同义（前端表格与既有消费者读它）。
+            "duration": seconds,
+        }
+        self.entries.append(entry)
+        # 一局结束 → 下一局的秒表从下一次采样起算（板子可能已经在倒计时）。
+        self.round_started = None
+        return entry
 
-def round_place_commands(player: str, bot: str,
-                         spawns: Optional[dict]) -> list[str]:
-    """开局摆位命令：双方传送到起点、重生点设到起点、解除倒计时保护。
-
-    只在倒计时结束后执行：运行时大脑从启动就开始决策，若在准备阶段就把 Bot 放到
-    玩家身边，它会在倒计时里把玩家打死（真机冒烟 2026-11-18 22:28 就是这种情况）。
-    重生点一并设到起点，否则 1.8 的默认重生点是世界出生点，死后会跑到几千格外。
-    ``effect clear`` 必须无条件下发：倒计时里给的是抗性 V（免伤），不清就会整局无敌。
-    """
-    commands: list[str] = []
-    for name in (player, bot):
-        point = (spawns or {}).get(name)
-        if not point:
-            continue
-        commands.append(f"tp {name} {point[0]:.2f} {point[1]:.2f} {point[2]:.2f}")
-        commands.append(f"spawnpoint {name} {point[0]:.2f} {point[1]:.2f} {point[2]:.2f}")
-    for name in (player, bot):
-        commands.append(f"effect {name} clear")
-    return commands
-
-
-def round_setup_commands(player: str, bot: str, kit: str,
-                         spawns: Optional[dict], place: bool = True) -> list[str]:
-    """一局的全部准备命令（顺序固定，便于复盘与单测）。
-
-    ``place=True`` 时把 ``tp`` 放在最前面（历史行为）；对局编排用 ``place=False``，
-    摆位改由 :func:`round_place_commands` 在倒计时之后执行。
-    """
-    commands: list[str] = []
-    if spawns and place:
-        for name in (player, bot):
-            point = spawns.get(name)
-            if point:
-                commands.append(f"tp {name} {point[0]:.2f} {point[1]:.2f} {point[2]:.2f}")
-    for name in (player, bot):
-        commands.append(f"clear {name}")
-    for name in (player, bot):
-        commands.append(f"gamemode 0 {name}")
-    for name in (player, bot):
-        for item in KITS.get(kit, ()):
-            commands.append(f"give {name} {item}")
-    for name in (player, bot):
-        commands.append(f"effect {name} clear")
-    for name in (player, bot):
-        for effect in HEAL_EFFECTS:
-            commands.append(f"effect {name} {effect} 1 20 true")
-    # 倒计时期间的免伤：Bot 大脑从运行时启动就在决策，倒计时里可能已经把玩家打死。
-    # 抗性 V（放大器 4）在 1.8 里等于完全免伤；倒计时结束后由摆位命令 clear 掉。
-    for name in (player, bot):
-        commands.append(f"effect {name} {SHIELD_EFFECT_ID} {SHIELD_SECONDS} {SHIELD_AMPLIFIER} true")
-    return commands
+    def round_elapsed(self, now: float) -> float:
+        """当前局已进行的秒数（帧里的 `t`）。"""
+        if self.round_started is None:
+            return 0.0
+        return round(max(0.0, now - self.round_started), 2)
 
 
 def build_import_command(python_exe: str, script: Path, record_dir: Path,
@@ -381,13 +478,14 @@ class MatchPlan:
     player: str = ""
     rounds: int = 3
     round_seconds: float = 120.0
+    #: 套件标识：**仅记录**（G-715 后套件由板子按自身配置发放，dashboard 不再 `give`）。
     kit: str = "diamond"
     spawns: Optional[dict] = None
     brain: Optional[str] = None
     record: bool = True
     train_after: bool = False
     brain_path: Optional[str] = None
-    #: 强制重生后等多久再传送（毫秒）：等待客户端完成重生、实体重新进入世界。
+    #: 旧字段（G-715 前用于「强制重生后等多久再传送」）。重生归板子，保留只为请求体兼容。
     respawn_delay_ms: int = 800
     #: 软约束串（运行时参数，默认 "" = 全开）：``cps=12,noRod``。
     #: 只透传给 bot-runtime 的 ``--soft``，**不写进模型 / 模型清单**。
@@ -412,8 +510,8 @@ class MatchPlan:
         round_seconds = parse_int(payload.get("roundSeconds", 120), "每局时长（秒）",
                                   minimum=10, maximum=1800)
         kit = str(payload.get("kit") or "diamond").strip().lower()
-        if kit not in KITS:
-            raise BadRequest(f"kit 只能是 {'/'.join(sorted(KITS))}")
+        if kit not in KIT_IDS:
+            raise BadRequest(f"kit 只能是 {'/'.join(sorted(KIT_IDS))}")
         spawns = _parse_spawns(payload.get("spawns"), player, bot)
         brain = payload.get("brain")
         brain = str(brain).strip() if brain not in (None, "") else None
@@ -455,7 +553,7 @@ class MatchPlan:
 
 
 def _parse_spawns(value: Any, player: str, bot: str) -> Optional[dict]:
-    """``spawns`` 允许缺省/单侧；两侧都给时才真正传送。"""
+    """``spawns`` 允许缺省/单侧；两侧都给时才随 board start 带上坐标。"""
     if value in (None, "", {}):
         return None
     if not isinstance(value, dict):
@@ -521,6 +619,7 @@ class MatchRunner:
                     "roundsDetail": [],
                     "brain": None,
                     "defaultSpawns": None,
+                    "boardSession": None,
                     "error": None,
                     "log": [],
                     "startedAt": None,
@@ -642,8 +741,10 @@ class MatchRunner:
                 "countdown": None,
                 "recordDir": None,
                 "runtime": None,
-                # plan.spawns 为 null 时，开局会用双方的 stats 推导一组默认出生点写在这里。
+                # G-715 后不再推导出生点（摆位归板子）；字段保留为 null 以兼容前端。
                 "defaultSpawns": None,
+                # 板子会话 id（`/gladiator board status` 的 session）；开局后才有值。
+                "boardSession": None,
                 "error": None,
                 "strategyLabel": plan.brain or "脚本策略",
             },
@@ -657,13 +758,18 @@ class MatchRunner:
             "cancel": False,
             "started_runtime_ids": [],
             "frames_file": None,
+            "record_dir": None,
+            "meta": None,
+            "board_stopped": False,
             "training": None,
         }
         with self._lock:
             self._match = match
             self._cancel.clear()
         self._log(match, f"对局配置：{plan.player} vs {plan.bot}（{plan.rounds} 局 × "
-                         f"{int(plan.round_seconds)}s，kit={plan.kit}，模式={plan.mode}）")
+                         f"{int(plan.round_seconds)}s，模式={plan.mode}，板子={BOARD_ID}）")
+        self._log(match, "判定与摆位由服务器板子负责；请让玩家自己进入服务器 "
+                         f"{self.cfg.mc_host}:{self.cfg.mc_port}")
         self._thread = threading.Thread(target=self._worker, args=(match,), name="match", daemon=True)
         self._thread.start()
         return self.current()
@@ -691,13 +797,13 @@ class MatchRunner:
             if len(match["log"]) > 300:
                 del match["log"][:-300]
 
-    def _set_phase(self, match: dict, phase: str, round_no: Optional[int] = None,
-                   countdown: Optional[float] = None) -> None:
+    def _set_phase(self, match: dict, phase: str, round_no: Optional[int] = None) -> None:
         with self._lock:
             match["snapshot"]["phase"] = phase
             if round_no is not None:
                 match["snapshot"]["round"] = round_no
-            match["snapshot"]["countdown"] = countdown
+            # 板子不回报倒计时剩余秒数：字段保留（前端读它），恒为 null。
+            match["snapshot"]["countdown"] = None
 
     def _cancelled(self, match: dict) -> bool:
         return self._cancel.is_set() or bool(match.get("cancel"))
@@ -730,21 +836,12 @@ class MatchRunner:
             conn = self._connect()
             self._ensure_runtime(match, plan)
             self._ensure_spawned(match, plan, conn)
-            self._ensure_spawns(match, plan, conn)
+            self._ensure_player_online(match, plan, conn)
             self._begin_recording(match, plan)
-            for index in range(1, plan.rounds + 1):
-                if self._cancelled(match):
-                    raise _Cancelled()
-                self._set_phase(match, "preparing", index)
-                self._log(match, f"第 {index}/{plan.rounds} 局：摆位与发装备")
-                self._prepare_round(match, plan, conn)
-                self._countdown(match, plan, index)
-                self._set_phase(match, "fighting", index, countdown=None)
-                self._log(match, f"第 {index} 局开始")
-                result = self._fight_round(match, plan, index, conn)
-                self._set_phase(match, "roundEnd", index)
-                self._finish_round(match, plan, result)
-                self._sleep(1.0)
+            self._board_start(match, plan, conn)
+            self._follow_board(match, plan, conn)
+            # 板子自己收尾时不重复发（`_follow_board` 已置位）；watchdog 兜底退出时才真停。
+            self._board_stop(match, conn)
             self._set_phase(match, "finished")
             with self._lock:
                 match["snapshot"]["running"] = False
@@ -757,6 +854,7 @@ class MatchRunner:
             if plan.train_after:
                 self._start_import(match, plan)
         except _Cancelled:
+            self._board_stop(match, conn)
             self._close_recording(match)
             with self._lock:
                 match["snapshot"]["running"] = False
@@ -765,6 +863,8 @@ class MatchRunner:
                 match["finished_at"] = time.time()
             self._log(match, "对局已终止")
         except Exception as exc:  # noqa: BLE001 - 汇总为对局失败
+            # 失败时板子可能还在跑：先停板子，否则下一场 start 会被「已有对局」拒绝。
+            self._board_stop(match, conn)
             self._close_recording(match)
             with self._lock:
                 match["snapshot"]["running"] = False
@@ -844,7 +944,11 @@ class MatchRunner:
             self._sleep(0.25)
 
     def _ensure_spawned(self, match: dict, plan: MatchPlan, conn) -> None:
-        # 通道 A 会话数（spawn 前至少要有一个运行时连上来）
+        """让 Bot 上线并 ready（玩家不归 dashboard 管：人自己进服）。
+
+        板子的 `ctx.player(bot)` 要求 Bot 已是真实 `Player`，所以必须在 board start
+        之前把 Bot 拉起来并等到 ready，否则板子开局时找不到参与者。
+        """
         deadline = self._clock() + 20.0
         while self._clock() < deadline:
             if self._cancelled(match):
@@ -872,216 +976,162 @@ class MatchRunner:
             self._sleep(1.0)
         raise RuntimeError(f"等待 {plan.bot} 就绪超时（40s）；可查看运行时日志")
 
-    def _ensure_spawns(self, match: dict, plan: MatchPlan, conn) -> None:
-        """``plan.spawns`` 为空时，用开局第一次 stats 推导默认出生点。
+    def _ensure_player_online(self, match: dict, plan: MatchPlan, conn) -> None:
+        """等玩家自己进服：dashboard 不拉真玩家，人必须自己登录。
 
-        为什么要推导：真机自测（2026-11-18 22:53/22:56/22:58 三场）都没填 spawns，
-        结果整局没有摆位、也没有重生点，玩家死后回到世界出生点，Bot 连人都找不到。
+        板的 `start` 在玩家离线时只会回一句「启动失败」，所以这里先给出明确提示。
         """
-        if plan.spawns:
-            with self._lock:
-                match["snapshot"]["spawns"] = {name: list(point)
-                                               for name, point in plan.spawns.items()}
-            return
-        player_stats = bot_stats = None
-        for _ in range(4):
-            if self._cancelled(match):
-                raise _Cancelled()
-            player_stats = self._stats(conn, plan.player)
-            bot_stats = self._stats(conn, plan.bot)
-            if player_stats and bot_stats:
-                break
-            self._sleep(0.5)
-        spawns = derive_default_spawns(plan.player, player_stats, plan.bot, bot_stats)
-        if spawns is None:
-            self._log(match, "无法读取双方坐标，跳过自动出生点（死后可能回到世界出生点）", ok=False)
-            return
-        plan.spawns = spawns
-        with self._lock:
-            match["snapshot"]["spawns"] = {name: list(point) for name, point in spawns.items()}
-            match["snapshot"]["defaultSpawns"] = {name: list(point)
-                                                  for name, point in spawns.items()}
-        px, py, pz = spawns[plan.player]
-        bx, _, bz = spawns[plan.bot]
-        self._log(match, "未指定出生点，使用自动出生点："
-                         f"玩家({px:.1f}, {py:.1f}, {pz:.1f}) / Bot({bx:.1f}, {py:.1f}, {bz:.1f})")
-
-    # --- 每局 -----------------------------------------------------------
-    def _prepare_round(self, match: dict, plan: MatchPlan, conn) -> None:
-        for command in round_setup_commands(plan.player, plan.bot, plan.kit, plan.spawns,
-                                           place=False):
-            if self._cancelled(match):
-                raise _Cancelled()
-            output = strip_formatting(self._command(conn, command)).strip()
-            lowered = output.lower()
-            if output and ("unknown command" in lowered or "未知的命令" in output):
-                self._log(match, f"命令不可用（已跳过）：{command} → {output}", ok=False)
-        # 摆位/发装备是异步生效的，给服务器 1 秒把实体位置与背包同步到客户端。
-        self._sleep(1.0)
-
-    def _countdown(self, match: dict, plan: MatchPlan, index: int) -> None:
-        self._set_phase(match, "countdown", index, countdown=float(COUNTDOWN_SECONDS))
-        for remaining in range(COUNTDOWN_SECONDS, 0, -1):
-            if self._cancelled(match):
-                raise _Cancelled()
-            self._log(match, f"第 {index} 局倒计时 {remaining}")
-            self._set_phase(match, "countdown", index, countdown=float(remaining))
-            self._sleep(1.0)
-
-    def _period(self, plan: MatchPlan) -> float:
-        return RECORD_PERIOD if plan.record else JUDGE_PERIOD
-
-    def _place_sides(self, match: dict, plan: MatchPlan, conn) -> None:
-        """倒计时结束后再摆位，避免 Bot 在倒计时里就开打。"""
-        commands = round_place_commands(plan.player, plan.bot, plan.spawns)
-        if not commands:
-            return
-        for command in commands:
-            if self._cancelled(match):
-                raise _Cancelled()
-            output = strip_formatting(self._command(conn, command)).strip()
-            if output and "unknown command" in output.lower():
-                self._log(match, f"命令不可用（已跳过）：{command} → {output}", ok=False)
-        # 传送是异步生效的：等客户端位置回包，再取基线血量。
-        self._sleep(0.4)
-
-    def _recover_after_death(self, match: dict, plan: MatchPlan, conn,
-                             dead: Optional[list] = None) -> bool:
-        """死亡后：强制重生 → 补装 → 传送回出生点 → 确认站位。
-
-        1.8 的死亡界面必须客户端点「重生」，服务端用 `Player#spigot().respawn()` 代理这一步
-        （插件命令 `gladiator respawn <player>`）。对双方都发一次：活着的那一方返回「跳过」，
-        这是预期行为，不是错误。
-
-        ``dead`` 是确实死掉的一方（用于补装）：只补死者，不动还活着的对手。
-        返回 ``True`` 表示双方 5 秒内回到站位、本局可以继续；``False`` 表示按死亡判负。
-        """
-        spawns = plan.spawns or {}
-        targets = list(dead or [plan.player, plan.bot])
-        self._log(match, f"检测到死亡（{', '.join(targets)}）：已强制重生 + 重新摆位")
-        for name in (plan.player, plan.bot):
-            output = strip_formatting(self._command(conn, f"gladiator respawn {name}")).strip()
-            self._log(match, f"respawn {name}: {output or '(无输出)'}",
-                      ok=not output.startswith("respawn 失败"))
-        # 1.8 重生后客户端要重新加载世界，立刻 tp 会被拉回原位置。
-        self._sleep(max(0.0, plan.respawn_delay_ms / 1000.0))
-        # 死亡清空背包：补装，否则剩下半局只能空手，brain 会一直 ITEM_MISSING。
-        for command in rekit_commands(targets, plan.kit):
-            if self._cancelled(match):
-                raise _Cancelled()
-            self._command(conn, command)
-        for name in (plan.player, plan.bot):
-            point = spawns.get(name)
-            if not point:
-                continue
-            self._command(conn, f"tp {name} {point[0]:.2f} {point[1]:.2f} {point[2]:.2f}")
-            self._command(conn,
-                          f"spawnpoint {name} {point[0]:.2f} {point[1]:.2f} {point[2]:.2f}")
-        # 重生后的客户端会先做一次「回到世界出生点」的本地预测，再被服务端拉回：
-        # 只发一次 tp 很容易被这次本地预测覆盖，因此窗口内按 REFRESH 周期重发，
-        # 直到死者真的站在出生点。存活的一方不要求站定——它会自己追击，站定反而
-        # 会把正常对局判成恢复失败（真机 23:44 就是这样：bot 追出去 → 判负）。
-        deadline = self._clock() + RESPAWN_RECOVER_TIMEOUT
-        next_refresh = self._clock() + RESPAWN_PLACE_REFRESH
+        deadline = self._clock() + PLAYER_JOIN_TIMEOUT
+        hinted = False
         while self._clock() < deadline:
             if self._cancelled(match):
                 raise _Cancelled()
-            player = self._stats(conn, plan.player)
-            bot = self._stats(conn, plan.bot)
-            if (self._sides_recovered(plan, targets, spawns, player, bot)):
-                self._log(match, "双方已回到站位，本局继续")
-                return True
-            if self._clock() >= next_refresh:
-                next_refresh = self._clock() + RESPAWN_PLACE_REFRESH
-                for name in targets:
-                    point = spawns.get(name)
-                    if not point:
-                        continue
-                    self._command(
-                        conn, f"tp {name} {point[0]:.2f} {point[1]:.2f} {point[2]:.2f}")
-                    self._command(
-                        conn, f"spawnpoint {name} {point[0]:.2f} {point[1]:.2f} {point[2]:.2f}")
-            self._sleep(0.2)
-        self._log(match, f"{RESPAWN_RECOVER_TIMEOUT:.0f} 秒内未回到站位，按死亡判负", ok=False)
-        return False
+            if self._stats(conn, plan.player):
+                self._log(match, f"玩家 {plan.player} 已在线，准备开局")
+                return
+            if not hinted:
+                self._log(match, f"等待玩家 {plan.player} 进入服务器 "
+                                 f"{self.cfg.mc_host}:{self.cfg.mc_port}（{int(PLAYER_JOIN_TIMEOUT)}s 上限）",
+                          ok=False)
+                hinted = True
+            self._sleep(1.0)
+        raise RuntimeError(
+            f"玩家 {plan.player} 未在 {int(PLAYER_JOIN_TIMEOUT)} 秒内进入服务器"
+            f"（{self.cfg.mc_host}:{self.cfg.mc_port}）：请先自己进服再开始对战")
 
-    @staticmethod
-    def _sides_recovered(plan: MatchPlan, dead: list, spawns: dict,
-                         player: Optional[dict], bot: Optional[dict]) -> bool:
-        """死者必须「活着且站在出生点」；存活方只要求活着（它正在打，不该站定）。"""
-        for name, stats in ((plan.player, player), (plan.bot, bot)):
-            if name in dead:
-                if not _at_spawn(stats, spawns.get(name)):
-                    return False
-            elif not stats or float(stats.get("health", 0.0)) <= 0:
-                return False
-        return True
+    # --- 板子 -----------------------------------------------------------
+    def _board_start(self, match: dict, plan: MatchPlan, conn) -> None:
+        """发一条 `/gladiator board start`；套件/倒计时/摆位/判死从此全归板子。"""
+        command = board_start_command(plan)
+        text = strip_formatting(self._command(conn, command)).strip()
+        self._log(match, f"board start: {text or '(无输出)'}")
+        lowered = text.lower()
+        if not text:
+            raise RuntimeError("板子启动无输出：服务端可能未实现 /gladiator board（需要 G-715 起的版本）")
+        if "未知的命令" in text or "unknown command" in lowered or "不存在的命令" in text:
+            raise RuntimeError(f"服务端未实现 /gladiator board：{text}")
+        if "失败" in text:
+            raise RuntimeError(f"板子启动失败：{text}")
+        session = _parse_session_id(text)
+        with self._lock:
+            match["snapshot"]["boardSession"] = session
+        if session:
+            self._log(match, f"板子已开局（session={session}，{BOARD_ID}）")
+        else:
+            self._log(match, "板子已开局（未在输出里找到 session=，以 status 为准）", ok=False)
+        # meta.json 记录 boardSession：录制文件开工时板子还没开，这里补写一次。
+        self._update_meta(match)
 
-    def _fight_round(self, match: dict, plan: MatchPlan, index: int, conn) -> dict:
-        self._place_sides(match, plan, conn)
-        start_stats = {
-            "player": self._stats(conn, plan.player),
-            "bot": self._stats(conn, plan.bot),
-        }
-        started = self._clock()
-        previous = {"player": start_stats["player"], "bot": start_stats["bot"]}
-        # 防止时钟被冻结（例如测试注入的假时钟不前进）导致死循环。
-        max_iterations = int(plan.round_seconds / self._period(plan)) + 100
-        # 死亡不再直接结束这一局：强制重生 + 摆位后继续，直到时间上限或恢复失败。
-        recoveries = 0
-        verdict = None
-        for _ in range(max_iterations):
+    def _follow_board(self, match: dict, plan: MatchPlan, conn) -> None:
+        """跟一场板子对局：status 每 500ms 探一次，录制帧每次循环都采。
+
+        为什么分开：`gladiator stats` 在主线程算，一次往返约 50ms（20 TPS 的刻度），
+        一帧要采双方 = ~110ms。把 status 也塞进同一循环，帧密度就退化成 ~3Hz；
+        而 status 只需知道阶段/比分（0.5s 足够）。
+        """
+        tracker = BoardTracker()
+        tracker.round_seconds = float(plan.round_seconds or 0.0)
+        deadline = (self._clock() + plan.rounds * (plan.round_seconds + ROUND_SLACK_SECONDS)
+                    + MATCH_SLACK_SECONDS)
+        previous = {"round": 0, "player": None, "bot": None}
+        unparsed = 0
+        missing_session = 0
+        next_status_at = 0.0
+        status = None
+        while True:
             if self._cancelled(match):
                 raise _Cancelled()
-            player = self._stats(conn, plan.player)
-            bot = self._stats(conn, plan.bot)
-            elapsed = self._clock() - started
-            if plan.record:
-                self._write_frame(match, index, elapsed, player, bot)
-            verdict = judge_round(player, bot, elapsed, plan.round_seconds,
-                                  previous["player"], previous["bot"])
-            previous = {"player": player, "bot": bot}
-            if verdict is not None:
-                if (verdict.get("reason") in DEATH_REASONS
-                        and plan.spawns
-                        and recoveries < MAX_RESPAWNS_PER_ROUND):
-                    recoveries += 1
-                    dead = _dead_sides(plan, player, bot, verdict.get("reason"))
-                    if self._recover_after_death(match, plan, conn, dead):
-                        previous = {
-                            "player": self._stats(conn, plan.player),
-                            "bot": self._stats(conn, plan.bot),
-                        }
+            now = self._clock()
+            if now >= next_status_at:
+                raw = self._command(conn, "gladiator board status")
+                parsed = parse_board_status(raw)
+                next_status_at = now + STATUS_PROBE_PERIOD
+                if parsed is None:
+                    unparsed += 1
+                    if unparsed >= MAX_UNPARSED_STATUS:
+                        raise RuntimeError(
+                            "无法解析 /gladiator board status 的输出："
+                            f"{strip_formatting(raw).strip() or '(空)'}")
+                    self._sleep(BOARD_STATUS_PERIOD)
+                    continue
+                unparsed = 0
+                if parsed["session"] is None and not tracker.seen_session:
+                    # 刚 start 完的几百毫秒内可能还没进对局，宽限几次再判定结束。
+                    missing_session += 1
+                    if missing_session < SESSION_GRACE:
+                        self._sleep(BOARD_STATUS_PERIOD)
                         continue
-                verdict["elapsed"] = elapsed
+                self._apply_status(match, plan, tracker, parsed, now)
+                status = parsed
+            if plan.record and tracker.round_no >= 1:
+                player = self._stats(conn, plan.player)
+                bot = self._stats(conn, plan.bot)
+                same_round = tracker.round_no == previous["round"]
+                rewards = frame_rewards(
+                    previous["player"] if same_round else None,
+                    previous["bot"] if same_round else None,
+                    player, bot)
+                self._write_frame(match, tracker.round_no, tracker.round_elapsed(self._clock()),
+                                  player, bot, rewards)
+                previous = {"round": tracker.round_no, "player": player, "bot": bot}
+            if status is not None and board_finished(status):
+                # 面板/板子已经自己收尾：stop() 不必再发一次 board stop。
+                with self._lock:
+                    match["board_stopped"] = True
+                self._log(match, f"板子报对局结束（phase={status['phase'] or '-'}，"
+                                 f"比分 {tracker.score['player']}:{tracker.score['bot']}"
+                                 f"，平 {tracker.score['draws']}，"
+                                 f"reason={status['reason'] or '-'}）")
                 break
-            self._sleep(self._period(plan))
-        if verdict is None:
-            verdict = {"winner": "draw", "reason": "budget", "elapsed": self._clock() - started}
-        verdict["playerBefore"] = start_stats["player"]
-        verdict["playerAfter"] = previous["player"]
-        verdict["botBefore"] = start_stats["bot"]
-        verdict["botAfter"] = previous["bot"]
-        return verdict
+            if now >= deadline:
+                self._log(match, f"板子在 {int(deadline)}s 内未结束，按最后一次 status 收尾"
+                                 "（比分可能不是终局）", ok=False)
+                break
+            self._sleep(FRAME_SLEEP)
 
-    def _finish_round(self, match: dict, plan: MatchPlan, verdict: dict) -> None:
-        winner = str(verdict.get("winner") or "draw")
-        entry = {
-            "round": len(match["rounds"]) + 1,
-            "winner": winner,
-            "reason": verdict.get("reason"),
-            "duration": round(float(verdict.get("elapsed") or 0.0), 1),
-            "player": _health_view(verdict.get("playerBefore"), verdict.get("playerAfter")),
-            "bot": _health_view(verdict.get("botBefore"), verdict.get("botAfter")),
-        }
+    def _apply_status(self, match: dict, plan: MatchPlan, tracker: BoardTracker,
+                      status: dict, now: float) -> None:
+        """把一条 status 投影到快照，并把新增的逐局结果写进 roundsDetail。"""
+        entries = tracker.update(status, now)
+        phase = "finished" if status["session"] is None else map_board_phase(status["phase"])
         with self._lock:
-            match["rounds"].append(entry)
-            key = "draws" if winner == "draw" else winner
-            match["score"][key] = match["score"].get(key, 0) + 1
-        self._log(match, f"第 {entry['round']} 局结束：{_winner_label(winner, plan)}"
-                         f"（{entry['reason']}，{entry['duration']}s，玩家血量 "
-                         f"{entry['player']['healthAfter']:.1f} / Bot "
-                         f"{entry['bot']['healthAfter']:.1f}）")
+            snapshot = match["snapshot"]
+            snapshot["boardSession"] = status["session"]
+            snapshot["phase"] = phase
+            snapshot["round"] = int(status["round"])
+            if int(status["rounds"]) > 0:
+                snapshot["rounds"] = int(status["rounds"])
+            snapshot["score"] = dict(status["score"])
+            match["rounds"] = list(tracker.entries)
+            match["score"] = dict(status["score"])
+            # 板子一旦进入 countdown/fighting，对局就已经真的在跑：把顶层 status 从
+            # "starting" 推进到 "running"，否则前端整场都显示「准备中」。
+            if phase in ("countdown", "fighting") and match["snapshot"].get("status") == "starting":
+                match["snapshot"]["status"] = "running"
+        for entry in entries:
+            self._log(match, f"第 {entry['round']} 局结束：{_winner_label(entry['winner'], plan)}"
+                             f"（{entry['reason']}，{entry['seconds']}s）")
+
+    def _board_stop(self, match: dict, conn=None) -> None:
+        """发一条 `/gladiator board stop`（幂等；板子已收尾时不再发）。"""
+        with self._lock:
+            if match.get("board_stopped"):
+                return
+            match["board_stopped"] = True
+        own = conn is None
+        try:
+            if own:
+                conn = self._connect()
+            text = strip_formatting(self._command(conn, "gladiator board stop")).strip()
+            self._log(match, f"board stop: {text or '(无输出)'}")
+        except Exception as exc:  # noqa: BLE001 - 停板子是尽力而为
+            self._log(match, f"board stop 失败（已忽略）：{exc}", ok=False)
+        finally:
+            if own and conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     # --- 录制 -----------------------------------------------------------
     def _record_dir(self, plan: MatchPlan) -> Path:
@@ -1107,9 +1157,11 @@ class MatchRunner:
             "brainPath": plan.brain_path,
             "botRuntime": match["snapshot"].get("runtime"),
             "address": match["snapshot"]["address"],
-            "frameHz": round(1.0 / RECORD_PERIOD, 2),
+            "board": BOARD_ID,
+            # 板子还没开局：session 在 `_board_start` 之后补写（见 `_update_meta`）。
+            "boardSession": None,
+            "frameHz": round(1.0 / FRAME_PERIOD, 2),
         }
-        _write_json(directory / "meta.json", meta)
         try:
             handle = (directory / "frames.jsonl").open("a", encoding="utf-8")
         except OSError as exc:
@@ -1117,11 +1169,28 @@ class MatchRunner:
             return
         with self._lock:
             match["frames_file"] = handle
+            match["record_dir"] = directory
+            match["meta"] = meta
             match["snapshot"]["recordDir"] = str(directory)
-        self._log(match, f"录制中：{directory}（{int(1 / RECORD_PERIOD)}Hz）")
+        self._update_meta(match)
+        self._log(match, f"录制中：{directory}（{round(1 / FRAME_PERIOD, 1)}Hz）")
+
+    def _update_meta(self, match: dict) -> None:
+        """把内存里的 meta（含最新 boardSession）落盘。"""
+        directory = match.get("record_dir")
+        meta = match.get("meta")
+        if directory is None or meta is None:
+            return
+        with self._lock:
+            meta["boardSession"] = match["snapshot"].get("boardSession")
+        try:
+            _write_json(Path(directory) / "meta.json", meta)
+        except OSError as exc:
+            self._log(match, f"写 meta.json 失败：{exc}", ok=False)
 
     def _write_frame(self, match: dict, round_no: int, elapsed: float,
-                     player: Optional[dict], bot: Optional[dict]) -> None:
+                     player: Optional[dict], bot: Optional[dict],
+                     rewards: Optional[dict] = None) -> None:
         handle = match.get("frames_file")
         if handle is None:
             return
@@ -1130,11 +1199,12 @@ class MatchRunner:
             "round": round_no,
             "player": _frame_of(player),
             "bot": _frame_of(bot),
+            # 逐帧伤害回报（AWR 的输入）：本帧对对方造成的伤害，无伤害/读不到为 0。
+            "rewards": dict(rewards or {"playerDamage": 0.0, "botDamage": 0.0}),
         }
         try:
             handle.write(json.dumps(frame, ensure_ascii=False) + "\n")
-            if int(elapsed * 10) % 10 == 0:
-                handle.flush()
+            handle.flush()
         except OSError:
             with self._lock:
                 match["frames_file"] = None
@@ -1159,6 +1229,8 @@ class MatchRunner:
             "schema": "gladiator.match-summary/v1",
             "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "durationSeconds": round((match["finished_at"] or time.time()) - match["started_at"], 1),
+            "board": BOARD_ID,
+            "boardSession": match["snapshot"].get("boardSession"),
             "score": dict(match["score"]),
             "rounds": [dict(item) for item in match["rounds"]],
             "plan": match["plan"].to_dict(),
@@ -1226,6 +1298,9 @@ class MatchRunner:
         if thread is not None and thread.is_alive():
             thread.join(timeout=10)
         plan: MatchPlan = match["plan"]
+        # 编排线程已在 _Cancelled 分支里停过板子；线程卡住时这里兜底停一次（幂等）。
+        if not match.get("board_stopped"):
+            self._board_stop(match)
         ids = list(match.get("started_runtime_ids") or [])
         if ids:
             from concurrent.futures import ThreadPoolExecutor
@@ -1255,6 +1330,14 @@ class _Cancelled(Exception):
 
 # --- 纯函数辅助 -------------------------------------------------------------
 
+def _parse_session_id(text: str) -> Optional[str]:
+    """从 `board 已开始 session=<id> ...` 里取 session id；没有返回 None。"""
+    found = re.search(r"session=(\S+)", strip_formatting(text or ""))
+    if not found:
+        return None
+    return _empty_to_none(found.group(1))
+
+
 def _runtime_view(runtime: dict) -> dict:
     return {
         "id": runtime.get("id"),
@@ -1263,20 +1346,6 @@ def _runtime_view(runtime: dict) -> dict:
         "external": runtime.get("external"),
         "username": runtime.get("username"),
         "command": list(runtime.get("command") or []),
-    }
-
-
-def _health_view(before: Optional[dict], after: Optional[dict]) -> dict:
-    before_health = 20.0 if before is None else float(before.get("health", 20.0))
-    after_health = 0.0 if after is None else float(after.get("health", 0.0))
-    before_armor = 0.0 if before is None else float(before.get("armor", 0.0))
-    after_armor = 0.0 if after is None else float(after.get("armor", 0.0))
-    return {
-        "healthBefore": round(before_health, 1),
-        "healthAfter": round(after_health, 1),
-        "healthLost": round(max(0.0, before_health - after_health), 1),
-        "armorBefore": round(before_armor, 1),
-        "armorAfter": round(after_armor, 1),
     }
 
 

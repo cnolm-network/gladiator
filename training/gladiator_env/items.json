@@ -6,14 +6,14 @@
       "category": "sword",
       "use": { "mode": "hold_block", "ticks": 5 },
       "cooldownTicks": 10,
-      "reach": 3.99,
+      "reach": 3.0,
       "stackGoal": 1
     },
     "*_sword": {
       "category": "sword",
       "use": { "mode": "hold_block", "ticks": 5 },
       "cooldownTicks": 10,
-      "reach": 3.99,
+      "reach": 3.0,
       "stackGoal": 1
     },
     "minecraft:golden_apple": {

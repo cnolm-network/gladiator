@@ -20,6 +20,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { HEAD_ORDER_V2 } from './action-space-v2.js';
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 /** 允许的分类（与 Python 的 `items.CATEGORIES` 同序）。 */
@@ -251,21 +253,27 @@ export function matchingMask(bot, itemTable = null) {
   const name = heldItemName(bot);
   const usable = Boolean(name) && table.useSpec(name).mode !== 'none';
   const use = [true, usable, usable];
+  const heads = {
+    move: new Array(5).fill(true),
+    look_yaw: new Array(7).fill(true),
+    look_pitch: new Array(5).fill(true),
+    attack: [true, true],
+    use: [...use],
+    jump: [true, true],
+    sneak: [true, true],
+    sprint: [true, true],
+    slot: [...slot],
+    // G-707/G-712：第 10 头恒定全开（与 Python `action_mask` 一致）。三种取值都不依赖
+    // 物品：`release_w` 只动 forward 键，`block_hit` 由运行时自己先切剑。
+    sprint_reset: [true, true, true],
+  };
   return {
     slot,
     use,
-    // 与 Python 的 info["actionMask"] 同形（其余头恒可用）。
-    heads: {
-      move: new Array(5).fill(true),
-      look_yaw: new Array(7).fill(true),
-      look_pitch: new Array(5).fill(true),
-      attack: [true, true],
-      use: [...use],
-      jump: [true, true],
-      sneak: [true, true],
-      sprint: [true, true],
-      slot: [...slot],
-    },
+    // 与 Python 的 info["actionMask"] 同形（十个头，顺序 = ACTION_HEADS_V2）。
+    heads,
+    // 十头数组形式（顺序 = HEAD_ORDER_V2），可直接当 `policy.actWithMask(vec, array)` 的入参。
+    array: HEAD_ORDER_V2.map((head) => [...heads[head]]),
   };
 }
 

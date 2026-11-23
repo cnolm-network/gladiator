@@ -1,5 +1,5 @@
 /**
- * 25 维特征编码 + 离散动作解码（`spaces.py` 的 JS 镜像）。
+ * 37 维特征编码 + 离散动作解码（`spaces.py` 的 JS 镜像）。
  *
  * <p>**必须与 `training/gladiator_env/spaces.py::encode_observation` 逐项一致**：
  * 字段顺序、默认值、归一化尺度、clip 全部照抄。任何一侧改了观测定义，另一侧必须同步，
@@ -11,11 +11,35 @@
  * 运行时需要它才能在本地闭环决策，而不依赖 Layer 3 下发动作。
  */
 
-export const OBS_DIM = 25;
+import { HEAD_SIZES_V2 } from './action-space-v2.js';
+
+export const OBS_DIM = 37;
 export const NUM_ACTIONS = 11;
+
+/** G-711：跨帧特征在观测里的起始下标与分母（与 spaces.py 的 PREV_ACTION_OFFSET / FRAMES_NORMALIZER 一致）。 */
+export const PREV_ACTION_OFFSET = 25;
+export const FRAMES_SINCE_ATTACK_INDEX = 35;
+export const FRAMES_SINCE_HIT_INDEX = 36;
+export const CROSS_FRAME_NORMALIZER = 50.0;
 
 /** 观测裁剪范围（spaces.py:51 OBS_CLIP）。 */
 export const OBS_CLIP = 5.0;
+
+/** 默认攻击距离（= BotProfile.LEGIT_REACH_MAX；1.8 原版玩家约 3 格，不是 3.99）。 */
+export const DEFAULT_REACH = 3.0;
+
+/**
+ * G-711 帧计数的取值语义：`undefined` 退回去读帧里的值，`null` = 没有信息 → 饱和值。
+ * （Python 侧 `None` 也是这个意思：`frames / 50` 取 1.0。）
+ */
+function framesSince(explicit, fromFrame) {
+  const value = explicit !== undefined ? explicit : fromFrame;
+  if (value === null || value === undefined) {
+    return CROSS_FRAME_NORMALIZER;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : CROSS_FRAME_NORMALIZER;
+}
 
 /** 1.8 受击无敌帧（秒），`self_attack_cooldown` 的归一化分母（spaces.py:56）。 */
 export const ATTACK_COOLDOWN_S = 0.5;
@@ -53,6 +77,19 @@ export const OBS_FIELDS_JS = Object.freeze([
   'in_reach',               // 22
   'self_vertical_speed',    // 23 G-702：自身 vy，clip(-5,5) 后 /5
   'self_attack_cooldown',   // 24 G-702：距上次 attack 还差多少到 0.5s，clip(0,0.5) 后 /0.5
+  // --- G-711：跨帧信息（25..36），顺序 = ACTION_HEADS_V2 ---
+  'prev_move',              // 25 上一帧 move 头 / 5
+  'prev_look_yaw',          // 26 上一帧 look_yaw 头 / 7
+  'prev_look_pitch',        // 27 上一帧 look_pitch 头 / 5
+  'prev_attack',            // 28 上一帧 attack 头 / 2
+  'prev_use',               // 29 上一帧 use 头 / 3
+  'prev_jump',              // 30 上一帧 jump 头 / 2
+  'prev_sneak',             // 31 上一帧 sneak 头 / 2
+  'prev_sprint',            // 32 上一帧 sprint 头 / 2
+  'prev_slot',              // 33 上一帧 slot 头 / 9
+  'prev_sprint_reset',      // 34 上一帧 sprint_reset 头 / 3
+  'frames_since_attack',    // 35 距上次 attack 的帧数，clip(0,50) 后 /50
+  'frames_since_hit',       // 36 距上次受伤的帧数，clip(0,50) 后 /50
 ]);
 
 /** 动作名（spaces.py:49 ACTION_NAMES），下标即离散动作编号。 */
@@ -177,19 +214,23 @@ export function entityHealth(entity) {
 }
 
 /**
- * 编码一帧观测为 25 维特征（`spaces.py:113 encode_observation`）。
+ * 编码一帧观测为 37 维特征（`spaces.py encode_observation`）。
  *
  * @param {object} observation `buildObservation()` 的输出
  * @param {object} options
  * @param {string} options.username       自己
- * @param {number} [options.stepFraction] 当前步数 / 最大步数（spaces.py:116）
- * @param {number|null} [options.opponentHealth] 对手血量（优先于实体字段，spaces.py:116）
+ * @param {number} [options.stepFraction] 当前步数 / 最大步数
+ * @param {number|null} [options.opponentHealth] 对手血量（优先于实体字段）
  * @param {Iterable<string>|null} [options.allowed] 只把这些玩家当目标
- * @param {number} [options.reach]        自己的攻击距离（默认 3.99）
+ * @param {number} [options.reach]        自己的攻击距离（默认 3.0，1.8 原版水平）
  * @param {number} [options.sinceAttack]  距上次 attack 的秒数（默认 5）
  * @param {number|null} [options.selfVelocityY] 自身 vy（G-702；缺省回落读 `observation.self.velocity.y`）
  * @param {number|null} [options.attackCooldownRemaining] 距冷却结束还有多少秒（G-702；缺省 0）
- * @returns {Float64Array} 长度 25
+ * @param {ArrayLike<number>|null} [options.prevAction] 上一帧十头下标（G-711；缺省读
+ *   `observation.crossFrame.prevAction`，都没有则 10 维全 0 = 「不知道」）
+ * @param {number|null} [options.framesSinceAttack] 距上次出手的帧数（G-711；缺省 1.0 = 很久以前）
+ * @param {number|null} [options.framesSinceHit] 距上次受伤的帧数（G-711；同上）
+ * @returns {Float64Array} 长度 37
  *
  * <p>返回 float64（numpy 那边是 float32，逐项差 ≤1e-7，属 float32 舍入；
  * 策略前向一律按 float64 算，所以对最终概率无可见影响）。
@@ -199,10 +240,15 @@ export function encodeObservation(observation, {
   stepFraction = 0.0,
   opponentHealth = null,
   allowed = null,
-  reach = 3.99,
+  reach = DEFAULT_REACH,
   sinceAttack = 5.0,
   selfVelocityY = null,
   attackCooldownRemaining = null,
+  // 注意：这三项**没有默认值**（= undefined），因为 `undefined`（没传，可回落到帧）
+  // 与 `null`（明确「没有这个信息」）语义不同，默认成 null 会把回落路径关掉。
+  prevAction,
+  framesSinceAttack,
+  framesSinceHit,
 } = {}) {
   const selfPayload = (observation && observation.self) || {};
   const pos = selfPayload.pos || {};
@@ -250,6 +296,28 @@ export function encodeObservation(observation, {
     : num(attackCooldownRemaining);
   vector[24] = clamp(cooldown, 0.0, ATTACK_COOLDOWN_S) / ATTACK_COOLDOWN_S; // spaces.py:183
 
+  // G-711（index 25..36）：跨帧信息。与 spaces.encode_observation 同序同尺度。
+  //
+  // 三种取值语义（**不要混**，混了就会出现「明明没有上一帧动作却编码成上一帧选了 0 档」）：
+  // - `undefined`：调用方没提供 → 退回去读 `observation.crossFrame`；
+  // - `null`：明确「没有这个信息」→ prevAction 全 0 / 帧计数取饱和 1.0（= 与 Python 的 None 同义）；
+  // - 具体值：直接用。
+  const crossFrame = (observation && observation.crossFrame) || {};
+  const prev = prevAction !== undefined ? prevAction : crossFrame.prevAction;
+  if (prev && typeof prev.length === 'number') {
+    for (let offset = 0; offset < HEAD_SIZES_V2.length && offset < prev.length; offset += 1) {
+      const size = HEAD_SIZES_V2[offset];
+      const value = Math.trunc(num(prev[offset]));
+      vector[PREV_ACTION_OFFSET + offset] = clamp(size > 0 ? value / size : 0.0, 0.0, 1.0);
+    }
+  }
+  vector[FRAMES_SINCE_ATTACK_INDEX] =
+    clamp(framesSince(framesSinceAttack, crossFrame.framesSinceAttack),
+      0.0, CROSS_FRAME_NORMALIZER) / CROSS_FRAME_NORMALIZER;
+  vector[FRAMES_SINCE_HIT_INDEX] =
+    clamp(framesSince(framesSinceHit, crossFrame.framesSinceHit),
+      0.0, CROSS_FRAME_NORMALIZER) / CROSS_FRAME_NORMALIZER;
+
   if (target !== null) {
     const tpos = target.pos || {};
     const dx = num(tpos.x) - sx;                             // spaces.py:160
@@ -273,7 +341,7 @@ export function encodeObservation(observation, {
     const vz = num(velocity.z);
     vector[19] = clamp(Math.sqrt(vx * vx + vz * vz), 0.0, 10.0) / 10.0; // spaces.py:179
     vector[20] = clamp(vy, -5.0, 5.0) / 5.0;                 // spaces.py:180
-    vector[22] = horizontal <= num(reach, 3.99) ? 1.0 : 0.0;  // spaces.py:183
+    vector[22] = horizontal <= num(reach, DEFAULT_REACH) ? 1.0 : 0.0;  // spaces.py:183
   }
 
   for (let index = 0; index < OBS_DIM; index += 1) {
@@ -319,7 +387,7 @@ const IDLE_ACTION = Object.freeze({ type: 'idle', params: { durationMs: MOVE_MS 
  * @param {object} [options] `{allowed, reach}`
  * @returns {Array<{type:string, params:object}>}
  */
-export function decodeAction(index, observation, username, { allowed = null, reach = 3.99 } = {}) {
+export function decodeAction(index, observation, username, { allowed = null, reach = DEFAULT_REACH } = {}) {
   const actionIndex = Number(index);
   if (!Number.isInteger(actionIndex) || actionIndex < 0 || actionIndex >= NUM_ACTIONS) {
     throw new Error(`动作编号越界: ${index}（合法范围 0..${NUM_ACTIONS - 1}）`);
@@ -354,7 +422,7 @@ export function decodeAction(index, observation, username, { allowed = null, rea
   }
 
   const look = lookAt(target, selfPos);                                            // spaces.py:265
-  const effectiveReach = Math.max(0.0, num(reach, 3.99) - REACH_TOLERANCE);        // spaces.py:269
+  const effectiveReach = Math.max(0.0, num(reach, DEFAULT_REACH) - REACH_TOLERANCE);        // spaces.py:269
   if (name === 'approach') {
     const sprint = distance > 2.5;                                                 // spaces.py:272
     const duration = distance <= 4.0 ? MOVE_MS : MOVE_MS * 2;                      // spaces.py:273

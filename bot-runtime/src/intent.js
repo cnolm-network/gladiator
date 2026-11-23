@@ -18,6 +18,12 @@
 
 import { DEFAULT_ATTACK_COOLDOWN_MS, needsSwordSwap, shouldThrottleAttack } from './attack-guard.js';
 import { selectItem } from './items.js';
+import {
+  ACTION_HEADS_V2,
+  HEAD_ORDER_V2,
+  LOOK_PITCH_VALUES,
+  LOOK_YAW_VALUES,
+} from './action-space-v2.js';
 
 /** 意图里合法的移动取值（与 `spaces.py::MOVE_VALUES_V2` 同序）。 */
 export const MOVE_VALUES = Object.freeze(['idle', 'forward', 'back', 'left', 'right']);
@@ -161,6 +167,55 @@ export function normalizeIntent(raw) {
     normalized.sprintReset = resetRaw;
   }
   return normalized;
+}
+
+/**
+ * 把 v2 的**十头下标**翻成 intent 字典（= `spaces.py::decode_intent` 的运行时版）。
+ *
+ * <p>为什么要在这里而不是在调用方：`move`/`use`/`sprintReset` 的取值表、`slot` 边界、
+ * `look` 的度数都在本模块手里，调用方（本地大脑）只该说「我选了 [1,5,2,…]」。
+ * 两处各写一份解码，迟早会分叉（教学模型发 `release_w`、执行端认不出来）。
+ *
+ * <p>产出的形状与 `normalizeIntent` 的返回一致，可直接喂 `applyIntent`：
+ * `sprintReset` 只在不是 `none` 时出现（与 Python 的「缺省 = none」逐字段兼容）。
+ *
+ * @param {ArrayLike<number>} heads 长度 10 的下标数组（顺序 = HEAD_ORDER_V2）
+ * @returns {{move:string, look:{dyaw:number,dpitch:number}, attack:boolean, use:string|null,
+ *            slot:number, jump:boolean, sneak:boolean, sprint:boolean, sprintReset?:string}}
+ */
+export function decodeIntentVector(heads) {
+  const values = Array.from(heads || []).map((value) => Number(value));
+  if (values.length !== HEAD_ORDER_V2.length) {
+    throw new Error(`十头动作需要 ${HEAD_ORDER_V2.length} 个下标，收到 ${values.length} 个`);
+  }
+  const picked = {};
+  for (let index = 0; index < HEAD_ORDER_V2.length; index += 1) {
+    const head = HEAD_ORDER_V2[index];
+    const size = ACTION_HEADS_V2[head];
+    const value = values[index];
+    if (!Number.isInteger(value) || value < 0 || value >= size) {
+      throw new Error(`${head} 头下标越界：${values[index]}（合法 0..${size - 1}）`);
+    }
+    picked[head] = value;
+  }
+  const intent = {
+    move: MOVE_VALUES[picked.move],
+    look: {
+      dyaw: LOOK_YAW_VALUES[picked.look_yaw],
+      dpitch: LOOK_PITCH_VALUES[picked.look_pitch],
+    },
+    attack: picked.attack === 1,
+    use: USE_VALUES[picked.use],
+    slot: picked.slot,
+    jump: picked.jump === 1,
+    sneak: picked.sneak === 1,
+    sprint: picked.sprint === 1,
+  };
+  const reset = SPRINT_RESET_VALUES[picked.sprint_reset];
+  if (reset !== 'none') {
+    intent.sprintReset = reset;
+  }
+  return intent;
 }
 
 /** 一行紧凑回显（运行时日志 / 复盘用）。 */

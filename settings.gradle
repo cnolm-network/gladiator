@@ -2,3 +2,7 @@ rootProject.name = 'gladiator'
 
 // G-506：示例调用方是独立插件，仅用于验收"换插件只改调用方"。
 include 'caller-sample'
+
+// 对局板子：真正的服务器玩法插件（平地 1v1 等），编译期只依赖 Gladiator 的 API。
+// 它不是 Gladiator 的一部分，产物独立成 jar，换玩法只换这块板。
+include 'arena'

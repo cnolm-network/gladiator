@@ -16,7 +16,10 @@ function item(name, slot) {
 }
 
 /** 记录所有控制状态与交互调用。 */
-function fakeBot({ position = { x: 0, y: 4, z: 0 }, entityPosition = { x: 0, y: 4, z: 3 } } = {}) {
+// G-708：reach 默认 3.0（原版水平），所以「够得着的目标」放在 2.6 格
+// （eye 偏移后 ≈2.68，既在 reach 内、又在鱼竿的 2.5–4.5 带里）。
+// 需要「超出射程」的用例自己显式传更远的坐标。
+function fakeBot({ position = { x: 0, y: 4, z: 0 }, entityPosition = { x: 0, y: 4, z: 2.6 } } = {}) {
   const calls = [];
   const inventoryItems = [
     item('diamond_sword', 36),
@@ -69,7 +72,7 @@ function fakeBot({ position = { x: 0, y: 4, z: 0 }, entityPosition = { x: 0, y: 
 
 function profile(overrides = {}) {
   return normalizeProfile({
-    cps: 15, cpsJitter: 2, reactionMs: 0, reactionJitterMs: 0, reach: 3.99,
+    cps: 15, cpsJitter: 2, reactionMs: 0, reactionJitterMs: 0, reach: 3.0,
     ...overrides,
   });
 }

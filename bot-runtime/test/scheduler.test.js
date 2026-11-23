@@ -51,7 +51,7 @@ test('重复 seq 回放缓存结果并标记 deduped', async () => {
 test('动作自带结果时原样透传（OUT_OF_REACH_CHASED）', async () => {
   const scheduler = new ActionScheduler({ maxPerSecond: 10, dedupeCapacity: 8 });
   const result = await scheduler.run(1, async () => ({
-    ok: true, code: 'OUT_OF_REACH_CHASED', distance: 4.4, reach: 3.99,
+    ok: true, code: 'OUT_OF_REACH_CHASED', distance: 4.4, reach: 3.0,
   }));
   assert.equal(result.ok, true);
   assert.equal(result.code, 'OUT_OF_REACH_CHASED');

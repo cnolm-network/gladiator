@@ -9,6 +9,8 @@ import { ActionDispatcher } from '../src/actions.js';
 import {
   ClickGate,
   DEFAULT_PROFILE,
+  LEGIT_REACH_MAX,
+  MAX_REACH,
   ReactionDelay,
   normalizeProfile,
   usesReactionDelay,
@@ -29,13 +31,45 @@ function fakeBot({ position = { x: 0, y: 64, z: 0 }, entityPosition = { x: 2, y:
   };
 }
 
-test('默认配置是 15±2 CPS / 220±40ms / 3.99 格', () => {
+test('默认配置是 15±2 CPS / 220±40ms / 3.0 格（原版水平，非 3.99）', () => {
   assert.equal(DEFAULT_PROFILE.cps, 15);
   assert.equal(DEFAULT_PROFILE.cpsJitter, 2);
   assert.equal(DEFAULT_PROFILE.reactionMs, 220);
   assert.equal(DEFAULT_PROFILE.reactionJitterMs, 40);
-  assert.equal(DEFAULT_PROFILE.reach, 3.99);
+  assert.equal(DEFAULT_PROFILE.reach, 3.0);
+  assert.equal(DEFAULT_PROFILE.cheatReach, false);
   assert.equal(DEFAULT_PROFILE.model, 'default');
+  assert.equal(LEGIT_REACH_MAX, 3.0);
+  assert.equal(MAX_REACH, 6.0);
+});
+
+test('reach 超限但没开 cheat：降回 3.0 并告警（不静默接受）', () => {
+  const warnings = [];
+  const profile = normalizeProfile({ reach: 3.99 }, { warn: (m) => warnings.push(m), error: () => {} });
+  assert.equal(profile.reach, 3.0);
+  assert.equal(profile.cheatReach, false);
+  assert.ok(warnings.some((m) => m.includes('3.99')), warnings.join('|'));
+});
+
+test('显式 cheatReach 才允许超限，并打 [cheat] 标记', () => {
+  const warnings = [];
+  const profile = normalizeProfile({ reach: 3.5, cheatReach: true }, { warn: (m) => warnings.push(m) });
+  assert.equal(profile.reach, 3.5);
+  assert.equal(profile.cheatReach, true);
+  assert.ok(warnings.some((m) => m.startsWith('[cheat] reach 超限=3.5')), warnings.join('|'));
+});
+
+test('reach 越界回落默认；>3 但 ≤6 只有 cheat 才保住', () => {
+  const logger = { warn: () => {} };
+  // 低于下限 / 高于硬上限：一律回落默认
+  assert.equal(normalizeProfile({ reach: 0.5 }, logger).reach, 3.0);
+  assert.equal(normalizeProfile({ reach: 7 }, logger).reach, 3.0);
+  // 合法区间内
+  assert.equal(normalizeProfile({ reach: 1.0 }, logger).reach, 1.0);
+  assert.equal(normalizeProfile({ reach: 2.95 }, logger).reach, 2.95);
+  // 3~6 需要 cheat：没有就降回 3.0，有就保留
+  assert.equal(normalizeProfile({ reach: 6 }, logger).reach, 3.0);
+  assert.equal(normalizeProfile({ reach: 6, cheatReach: true }, logger).reach, 6.0);
 });
 
 test('normalizeProfile 对脏值回落到默认并告警', () => {
@@ -47,7 +81,7 @@ test('normalizeProfile 对脏值回落到默认并告警', () => {
   assert.equal(profile.cps, 15);
   assert.equal(profile.cpsJitter, 2);
   assert.equal(profile.reactionMs, 220);
-  assert.equal(profile.reach, 3.99);
+  assert.equal(profile.reach, 3.0);
   assert.equal(profile.model, 'default');
   assert.ok(warnings.length >= 4);
 });

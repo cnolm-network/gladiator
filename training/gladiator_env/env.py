@@ -31,6 +31,7 @@ from .shaping import ShapingReward, ShapingWeights
 from .spaces import (
     ACTION_NAMES,
     ATTACK_COOLDOWN_S,
+    FRAMES_NORMALIZER,
     MULTI_DISCRETE_V2,
     MOVE_MS,
     NUM_ACTIONS,
@@ -42,6 +43,39 @@ from .spaces import (
     nearest_player,
 )
 from .items import default_table
+
+#: G-711：跨帧帧数计数器的饱和值（= spaces 里的分母）。超过它之后不再区分「多久以前」。
+CROSS_FRAME_CAP = int(FRAMES_NORMALIZER)
+
+# --- reach 口径（G-708）：默认原版水平，超限必须显式作弊 -------------------
+#: 合法（非作弊）攻击距离上限：1.8 原版玩家约 3 格。
+LEGIT_REACH_MAX = 3.0
+#: 配置下限 / 硬上限（格）。
+MIN_REACH = 1.0
+MAX_REACH = 6.0
+
+
+def check_reach(value: float, *, cheat: bool = False) -> float:
+    """校验 reach 并返回 float；超过 ``LEGIT_REACH_MAX`` 时必须 ``cheat=True``。
+
+    与 Java ``BotProfile`` / 运行时 ``normalizeProfile`` 同一条口径：
+    非法值直接报错（不要静默夹住，否则「3.99 被悄悄改成 3.0」没人会发现），
+    超限值要求显式开关，调用方负责打 ``[cheat] reach 超限=…（仅对照实验）``。
+    """
+    reach = float(value)
+    if reach < MIN_REACH or reach > MAX_REACH:
+        raise ValueError(f"reach 必须在 [{MIN_REACH}, {MAX_REACH}] 内，收到 {reach}")
+    if reach > LEGIT_REACH_MAX and not cheat:
+        raise ValueError(
+            f"reach={reach} 超限：1.8 原版玩家约 {LEGIT_REACH_MAX} 格。"
+            "要跑对照实验请显式开 cheat（`cheat_reach=True` / `--cheat-reach <值>`）")
+    return reach
+
+
+def cheat_reach_banner(reach: float) -> str:
+    """作弊开关的日志行（格式固定，日志/报告里 grep 这一个串就能找出超限实验）。"""
+    return f"[cheat] reach 超限={float(reach):g}（仅对照实验）"
+
 
 #: 背包/护甲校验必需项（剑、金苹果、鱼竿）；护甲另外按 4 个槽位统计。
 KIT_MUST_HAVE: tuple[tuple[str, int], ...] = (
@@ -148,7 +182,12 @@ class BotConfig:
     """单个 Bot 的连接信息 + 行为配置（G-507）。
 
     行为配置与 Java 侧 ``BotProfile`` 同义：CPS（含抖动）、反应延时（含抖动）、
-    攻击距离、训练模型标签。默认值即“原版手感”：15±2 CPS / 220±40ms / 3.99 格。
+    攻击距离、训练模型标签。默认值即“原版手感”：15±2 CPS / 220±40ms / **3.0 格**。
+
+    G-708：``reach`` 默认 3.0（1.8 原版玩家约 3 格）。3.99 这类超限值必须显式
+    ``cheat_reach=True``（对应 Java 的 ``cheat.reach``）——否则训练出来的距离感
+    在真人面前是假的；打开后 ``spawn_args()`` 会带 ``cheat=on``，日志里也会打
+    ``[cheat] reach 超限=…（仅对照实验）``。
     """
 
     username: str
@@ -158,7 +197,9 @@ class BotConfig:
     cps_jitter: float = 2.0
     reaction_ms: float = 220.0
     reaction_jitter_ms: float = 40.0
-    reach: float = 3.99
+    reach: float = 3.0
+    #: 显式 reach 作弊开关（默认关）：只有它为 True 时 ``reach`` 才能超过 3.0。
+    cheat_reach: bool = False
     model: str = "default"
     #: 头顶标签角色（BetterNameTag）：trained = 被训练方，其它见 code 驱动的策略名。
     role: str = "trained"
@@ -171,6 +212,8 @@ class BotConfig:
     def __post_init__(self) -> None:
         if self.bot_id is None:
             self.bot_id = f"glad-{self.username.lower()}"
+        # G-708：reach 口径与 Java BotProfile 一致（非法值直接报错，不要静默夹住）。
+        self.reach = check_reach(self.reach, cheat=self.cheat_reach)
 
     def spawn_args(self) -> str:
         """拼成 ``/gladiator spawn`` 的 key=value 参数串。"""
@@ -182,6 +225,7 @@ class BotConfig:
             f"autorod={'on' if self.auto_rod else 'off'} "
             f"autoblock={'on' if self.auto_block else 'off'} "
             f"aimlock={'on' if self.aim_lock else 'off'}"
+            + (" cheat=on" if self.cheat_reach else "")
         )
         return args
 
@@ -375,6 +419,11 @@ class GladiatorEnv(gym.Env):
         self._last_distance: dict[str, float | None] = {}
         #: 上次下发 attack 动作的时刻（P1：观测 self_since_attack 用，初始视为已冷却）。
         self._last_attack_at: dict[str, float] = {}
+        #: G-711 跨帧观测：上一帧策略选中的十头动作（v1 / 无意图 = ``None``，观测填 0）。
+        self._prev_action: dict[str, tuple[int, ...] | None] = {}
+        #: G-711：距上次出手 / 上次受伤的帧数（0 = 本帧刚发生；饱和值见 ``_CROSS_FRAME_CAP``）。
+        self._frames_since_attack: dict[str, int] = {}
+        self._frames_since_hit: dict[str, int] = {}
         #: 重生后的「观察档」：这段时间内代码驱动的对手只观察不出手（旧坐标会被传送打飞）。
         self._respawn_grace: dict[str, int] = {}
         #: 对手「出手前先确认」：本 tick 判到 attack 但还没确认时记 1，下一 tick 复核后才真出手。
@@ -481,6 +530,11 @@ class GladiatorEnv(gym.Env):
         self._restock_gives.clear()
         self._last_attack_at.clear()
         self._opponent_last_attack_at.clear()
+        # G-711：跨帧观测从「不知道」开始——上一帧动作没有（None → 观测全 0），
+        # 两个帧计数置饱和（= 很久以前，等价于 since_attack 的缺省 5s）。
+        self._prev_action = {bot.username: None for bot in self.bots}
+        self._frames_since_attack = {bot.username: CROSS_FRAME_CAP for bot in self.bots}
+        self._frames_since_hit = {bot.username: CROSS_FRAME_CAP for bot in self.bots}
         self._ensure_connected()
 
         if self._rcon is not None and not self._rcon.is_connected():
@@ -522,6 +576,8 @@ class GladiatorEnv(gym.Env):
 
         dispatch: list[list[dict]] = []
         labels: list[str] = []
+        #: G-711：本帧每个 Bot 的策略选择了哪 10 个头（v1 / 宏动作 → None）。
+        picked_intents: dict[str, tuple[int, ...] | None] = {}
         if len(self._last_active_at) != len(self.bots):
             self._last_active_at = [time.monotonic() for _ in self.bots]
         opponents = self._opponent_names()
@@ -539,10 +595,18 @@ class GladiatorEnv(gym.Env):
                 active = (label != "idle"
                           or intent["look"]["dyaw"] != 0.0
                           or intent["look"]["dpitch"] != 0.0)
+                # G-711：记「策略这一帧选了什么」（而不是执行成什么）。跨帧特征要回答的是
+                # 「我上一帧往哪走」，被补装/节流改成 idle 的执行结果会把节拍抹平。
+                try:
+                    picked_intents[bot.username] = tuple(
+                        int(item) for item in np.asarray(value, dtype=np.int64).reshape(-1))
+                except (TypeError, ValueError):
+                    picked_intents[bot.username] = None
             else:
                 index = int(value)
                 label = ACTION_NAMES[index] if 0 <= index < len(ACTION_NAMES) else "idle"
                 active = index != 0
+                picked_intents[bot.username] = None
             labels.append(label)
             if active:  # 只有真正下发动作才算“活跃”
                 self._last_active_at[i] = time.monotonic()
@@ -612,6 +676,8 @@ class GladiatorEnv(gym.Env):
         # 兜底体检：局内「死→活」可能整个被刷新跳过（is_out 看不到），这里只看现状。
         if _RESTOCK_CHECK_EVERY > 0 and self._steps % _RESTOCK_CHECK_EVERY == 0:
             self._periodic_loadout_check()
+        # G-711：跨帧计数必须在**观测生成之前**推进，这样策略看到的是「本帧刚发生的事」。
+        self._update_cross_frame(previous, dispatch, picked_intents)
         observation = self._encode_all()
 
         terminated = any(is_out(obs) for obs in self._raw)
@@ -928,6 +994,21 @@ class GladiatorEnv(gym.Env):
             return 6
         return int(self.np_random.integers(NUM_ACTIONS))
 
+    def _opponent_act(self, vector, *, greedy: bool):
+        """按**对手自己的动作空间**取一帧动作（G-703）。
+
+        老师（``TeacherV4``）和 v2 策略快照都返回 10 个头，但只有老师实现了 ``act()``：
+        ``Policy.act()`` 是 v1 的接口，在 v2 上会主动抛错（防止调用方把 10 个头当动作编号用）。
+        所以这里必须分叉——此前统一走 ``act()``，v2 **策略**对手会每帧抛异常、被下面的
+        ``except`` 吞成「随机动作」，表面能跑、实则全程乱打（联赛排出来的序也就没意义了）。
+
+        ``TeacherV4`` 有 ``is_v2=True`` 但没有 ``sample()``，仍走 ``act()``，行为不变。
+        """
+        policy = self.opponent_policy
+        if getattr(policy, "is_v2", False) and hasattr(policy, "sample"):
+            return policy.sample(vector, self.np_random, greedy=greedy)
+        return policy.act(vector, self.np_random, greedy=greedy)
+
     def _policy_opponent_action(self, index: int) -> int:
         """策略驱动的对手动作（自博弈）。
 
@@ -941,8 +1022,9 @@ class GladiatorEnv(gym.Env):
         10 头数组（v2 策略，见 ``_opponent_v2``），decode + 发送沿用 ``step()`` 里
         与学习方相同的那条路径。
 
-        ``opponent_epsilon``：以该概率把动作**换成随机动作**（``act`` 仍会被调用一次，
-        统计里能对上步数，也便于观察策略到底想干什么）。
+        ``opponent_epsilon``：以该概率把动作**换成随机动作**（策略仍会被调用一次——
+        见 :meth:`_opponent_act`，v2 走 ``sample()``、v1 走 ``act()``——统计里能对上步数，
+        也便于观察策略到底想干什么）。
         """
         bot = self.bots[index]
         stats = self.opponent_policy_stats
@@ -965,10 +1047,14 @@ class GladiatorEnv(gym.Env):
             opponents=self._opponent_names(),
             reach=float(bot.reach),
             since_attack=since_attack,
+            # G-711：对手策略的观测与学习方同口径（同一份跨帧状态，按自己的用户名取）。
+            prev_action=self._prev_action.get(bot.username),
+            frames_since_attack=self._frames_since_attack.get(bot.username),
+            frames_since_hit=self._frames_since_hit.get(bot.username),
         )
         explore = float(self.np_random.random()) < self.opponent_epsilon
         try:
-            action = self.opponent_policy.act(vector, self.np_random, greedy=not explore)
+            action = self._opponent_act(vector, greedy=not explore)
         except Exception as exc:  # noqa: BLE001 - 坏快照不该打断整局采样
             stats["errors"] += 1
             if stats["errors"] == 1:
@@ -1709,8 +1795,45 @@ class GladiatorEnv(gym.Env):
                 since_attack=since_attack,
                 self_velocity_y=self_velocity_y,
                 attack_cooldown_remaining=cooldown_remaining,
+                # G-711：跨帧信息（上一帧十头动作 + 距上次出手/受伤的帧数）。
+                prev_action=self._prev_action.get(bot.username),
+                frames_since_attack=self._frames_since_attack.get(bot.username),
+                frames_since_hit=self._frames_since_hit.get(bot.username),
             )
         return encoded
+
+    def _update_cross_frame(
+        self,
+        previous: list[dict],
+        dispatch: list[list[dict]],
+        picked_intents: dict[str, tuple[int, ...] | None],
+    ) -> None:
+        """G-711：推进跨帧状态（``_prev_action`` / ``_frames_since_*``）。
+
+        两条计数器的规则：
+
+        - **出手**：本帧真的下发了 attack（``_has_attack``，与奖励/节流判定同一口径）
+          就清零，否则 +1 到饱和；
+        - **受伤**：本帧自身血量下降就清零，否则 +1 到饱和。用血量差而不是
+          ``ENTITY_DAMAGE`` 事件，是因为观测只由 ``_raw`` 刷新，两者必须同一份数据
+          （否则会出现「事件说挨打了、血量没掉」的相位差）。
+
+        饱和值 50 帧 ≈ 20Hz 下的 2.5 秒：再久就没有分辨意义了，也让归一化落在 0..1。
+        """
+        cap = CROSS_FRAME_CAP
+        for index, bot in enumerate(self.bots):
+            name = bot.username
+            attacked = index < len(dispatch) and self._has_attack(dispatch[index])
+            current_attack = self._frames_since_attack.get(name, cap)
+            self._frames_since_attack[name] = 0 if attacked else min(cap, current_attack + 1)
+
+            before = self_health(previous[index]) if index < len(previous) else None
+            after = self_health(self._raw[index]) if index < len(self._raw) else None
+            hurt = before is not None and after is not None and (before - after) > 1e-3
+            current_hit = self._frames_since_hit.get(name, cap)
+            self._frames_since_hit[name] = 0 if hurt else min(cap, current_hit + 1)
+
+            self._prev_action[name] = picked_intents.get(name)
 
     def _opponent_names(self) -> set[str]:
         """本环境内的参赛 Bot 用户名：观测/动作只把彼此当目标。

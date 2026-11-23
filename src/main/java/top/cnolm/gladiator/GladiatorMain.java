@@ -51,6 +51,7 @@ public final class GladiatorMain extends JavaPlugin {
     private Runnable spawnShutdown;
     private String spawnMode = "runtime";
     private SpectatorService spectatorService;
+    private top.cnolm.gladiator.core.board.BoardRegistryImpl boardRegistry;
     private LinkServer linkServer;
 
     @Override
@@ -70,6 +71,20 @@ public final class GladiatorMain extends JavaPlugin {
         getServer().getPluginManager().registerEvents(
                 new top.cnolm.gladiator.core.guard.DenialFeedbackListener(service), this);
         registerPvpListener();
+        // 板子（对局玩法插件）接入点：调用方通过 Boards.registry() 注册 Board，
+        // 由 Gladiator 驱动对局生命周期、事件流与 10Hz tick，板子只观察、不发动作。
+        // 参与者解析交给 BotRegistry：mineflayer Bot / 真实玩家由 Bukkit 找得到，
+        // golem 的假玩家不在 PlayerList，只有这里能把它的 Player 交出来。
+        final top.cnolm.gladiator.core.BotRegistry botRegistry = service.getBotRegistry();
+        boardRegistry = new top.cnolm.gladiator.core.board.BoardRegistryImpl(
+                this, service, new top.cnolm.gladiator.api.board.ParticipantResolver() {
+                    @Override
+                    public org.bukkit.entity.Player resolve(String username) {
+                        top.cnolm.gladiator.core.BotHandle handle = botRegistry.findByUsername(username);
+                        return handle == null ? null : handle.asPlayer();
+                    }
+                });
+        boardRegistry.enable();
 
         // 只读观战：玩家进服后可用 /gladiator spectate 旁观 Bot 训练。
         spectatorService = new SpectatorService(this, getConfig().getBoolean("spectate.enabled", true));
@@ -104,6 +119,11 @@ public final class GladiatorMain extends JavaPlugin {
         if (spectatorService != null) {
             spectatorService.shutdown();
             spectatorService = null;
+        }
+        // 板子必须无条件关：它持有 ticker 与当前会话，漏关会让下一场对局被判成「已在进行中」。
+        if (boardRegistry != null) {
+            boardRegistry.disable();
+            boardRegistry = null;
         }
         // 再停 spawn：取消超时任务并静默丢弃 pending，避免停服过程中派发 Ready/Failed。
         if (spawnService != null) {
@@ -269,6 +289,11 @@ public final class GladiatorMain extends JavaPlugin {
     /** 通道 A 链路；未成功监听时为 null。 */
     public SpectatorService getSpectatorService() {
         return spectatorService;
+    }
+
+    /** 板子注册表；插件未 enable 时为 null。命令用它读写对局状态。 */
+    public top.cnolm.gladiator.core.board.BoardRegistryImpl getBoardRegistry() {
+        return boardRegistry;
     }
 
     public LinkServer getLinkServer() {

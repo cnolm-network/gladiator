@@ -1,0 +1,47 @@
+// ---------------------------------------------------------------------------
+// arena：对局板子（服务器侧玩法插件）
+//
+// 边界（见 OVERVIEW.md「形式化表达」）：
+//   板子 = 服务器逻辑：清场、摆位、发套件、死亡/重生、计分、超时、判定。
+//   板子 != Bot 的动作来源：动作由 bot-runtime（Node）或 golem 下发，板子只 observe。
+//
+// 编译期只依赖 Gladiator 的 classes 目录与 Spigot API；运行期由服务端加载，
+// 通过 plugin.yml 的 depend 保证 Gladiator 先就绪。
+//
+// 产物：arena/build/libs/arena.jar，放 server/plugins/ 即可。
+// ---------------------------------------------------------------------------
+plugins {
+    id 'java'
+}
+
+group = 'top.cnolm.arena'
+version = '0.1.0'
+description = 'Gladiator 对局板子（平地 1v1 参考实现）'
+
+repositories {
+    maven { url = 'https://maven.aliyun.com/repository/public' }
+    maven { url = 'https://hub.spigotmc.org/nexus/content/repositories/snapshots/' }
+    maven { url = 'https://repo.cnolm.top' }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(8)
+    }
+}
+
+dependencies {
+    compileOnly('org.spigotmc:spigot-api:1.8.8-R0.1-SNAPSHOT') {
+        exclude group: 'net.md-5'
+    }
+    implementation 'top.cnolm.betterNameTag:BetterNameTag:1.0.0'
+    // 与 caller-sample 同理：依赖主工程 classes 目录，避免 jar 同名输出重叠。
+    compileOnly rootProject.files(rootProject.layout.buildDirectory.dir('classes/java/main'))
+}
+
+compileJava.dependsOn ':classes'
+
+jar {
+    archiveBaseName = 'arena'
+    archiveVersion = ''
+}

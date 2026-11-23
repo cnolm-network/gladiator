@@ -117,6 +117,9 @@ test('mask 形状与 Python 的 ACTION_HEADS_V2 一致', () => {
   const mask = matchingMask(makeBot(), loadItemTable());
   assert.deepEqual(Object.keys(mask.heads), [
     'move', 'look_yaw', 'look_pitch', 'attack', 'use', 'jump', 'sneak', 'sprint', 'slot',
+    // G-712：第 10 头（G-707 加的 sprint_reset）也要进运行时 mask，否则 v2 大脑的
+    // actWithMask 拿到的 mask 比模型少一头。
+    'sprint_reset',
   ]);
   assert.deepEqual(mask.heads.move.length, 5);
   assert.deepEqual(mask.heads.look_yaw.length, 7);
@@ -127,6 +130,9 @@ test('mask 形状与 Python 的 ACTION_HEADS_V2 一致', () => {
   assert.deepEqual(mask.heads.sneak.length, 2);
   assert.deepEqual(mask.heads.sprint.length, 2);
   assert.deepEqual(mask.heads.slot.length, HOTBAR_SLOTS);
+  assert.deepEqual(mask.heads.sprint_reset, [true, true, true]);
+  // 数组形式按 HEAD_ORDER_V2 排（`policy.actWithMask` 直接吃它）
+  assert.deepEqual(mask.array.map((row) => row.length), [5, 7, 5, 2, 3, 2, 2, 2, 9, 3]);
 });
 
 test('空背包：所有槽位被屏蔽，use 只剩「不按」', () => {

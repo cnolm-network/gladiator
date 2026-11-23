@@ -73,3 +73,5 @@ models/*.gmod
 !models/default.gmod
 !models/release.gmod
 !models/flash.gmod
+bot-runtime/tmp-*
+dashboard/var/

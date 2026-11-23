@@ -1,4 +1,4 @@
-"""联赛评估：多模型循环赛（在 ``mirror_eval`` 的单对镜像机制上扩展）。
+r"""联赛评估：多模型循环赛（在 ``mirror_eval`` 的单对镜像机制上扩展）。
 
 为什么需要它：镜像评估只能回答「新模型是否强于旧模型」，一次一对、人工挑选对手。
 当模型有 3 个以上（BC 分支 / DAgger 各轮 / 自博弈快照）时，真正想知道的是**全局序**：
@@ -10,21 +10,32 @@
 - 每对打 ``--episodes-per-pair`` 局，**奇偶局交换左右位**（偶数局 A 在 bots[0]）；
 - 每对输出 A 视角的胜/负/平、胜率、Wilson 95% 区间；
 - 用**精确二项检验**（p=0.5，双侧）判断「A 是否显著强于 B」——小样本不做正态近似；
-- 全局按总胜率排名，并打印 markdown 表格（可直接贴进 TASKS/HANDOVER）；
+- 全局按总胜率排名，并打印 markdown 表格（可直接贴进 TASKS/HANDOVER；带 ``actionSpace`` 列）；
 - 结果写 ``artifacts/evals/<YYYYMMDD-HHMM>-league.json``。
 
-与 ``mirror_eval`` 一致：**v2 动作空间的模型直接拒绝**。v2 的对手动作需要环境侧按
-9 个头解码，env 的 ``opponent_policy`` 路径目前只会取 v1 的单头下标（int），
-硬跑会把 9 头动作静默当成宏动作编号。
+**动作空间（G-703）**：v1 / v2 模型可以同场混打，按**各自**的 ``_meta.actionSpace`` 分发：
+
+- 学习者的动作空间决定 ``GladiatorEnv(action_space=...)``（v1 → ``Discrete(11)``，
+  v2 → ``MultiDiscrete``）；
+- 对手的动作空间由 env 自己读 ``opponent_policy.is_v2`` 判定，走 ``decode_intent`` 那条路径，
+  不需要额外参数；
+- 取动作用 ``gladiator_train.model_io.policy_action_for_env``：v1 → ``int`` 宏动作，
+  v2 → 10 个头下标（带 action mask）。
+
+因此「v1 学习者 + v2 对手」「v2 学习者 + v1 对手」「v2 + v2」都能跑，表格里的
+``actionSpace`` 列会标出每个模型属于哪一边——混打的胜率必须带着这个上下文看。
 
 用法::
 
-    .venv\\Scripts\\python.exe scripts\\league.py \\
-        --policies artifacts/branches/selfplay-final/policy.npz \\
-                   artifacts/policy.npz \\
-                   ..\\dashboard\\var\\models\\dagger-1118b\\policy.npz \\
+    .venv\Scripts\python.exe scripts\league.py \\
+        --policies ..\dashboard\var\models\v2-v4-dagger3\policy.npz \\
+                   ..\dashboard\var\models\v2-v4-dagger2\policy.npz \\
+                   ..\dashboard\var\models\dagger-1118b\policy.npz \\
         --episodes-per-pair 4 --seed 1200 --max-steps 400 --no-spawn \\
         --users Bot_V0A Bot_V0B --ports 8770 8771
+
+    # 只校验参数与模型（服务器没开时先跑这个）
+    .venv\Scripts\python.exe scripts\league.py --policies A.npz B.npz C.npz --dry-run
 """
 
 from __future__ import annotations
@@ -40,6 +51,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gladiator_env import ArenaConfig, BotConfig, GladiatorEnv  # noqa: E402
 from gladiator_train.eval_suite import SIGNIFICANCE, SUITE_DEFAULT, wilson_interval  # noqa: E402
+from gladiator_train.model_io import (  # noqa: E402
+    ModelLoadError,
+    ModelRecord,
+    env_action_space,
+    load_model,
+    model_label,
+    normalize_action_mask,
+    policy_action_for_env,
+)
 
 try:  # 复用 mirror_eval 的口径（同一份二项检验 / rcon 解析），避免两处漂移
     from scripts.mirror_eval import binom_p_two_sided, parse_rcon
@@ -69,12 +89,7 @@ def unique_labels(paths: list[str]) -> list[str]:
     ``.../branches/selfplay-final/policy.npz`` 这类路径的 stem 全是 ``policy``，
     直接拿 stem 会撞车；因此 stem 太通用时改用父目录名。
     """
-    generic = {"policy", "model", "weights", "final", "best"}
-    labels: list[str] = []
-    for path in paths:
-        p = Path(path)
-        label = p.stem if p.stem.lower() not in generic else p.parent.name or p.stem
-        labels.append(label)
+    labels: list[str] = [model_label(path) for path in paths]
     seen: dict[str, int] = {}
     unique: list[str] = []
     for label in labels:
@@ -84,22 +99,20 @@ def unique_labels(paths: list[str]) -> list[str]:
     return unique
 
 
-def load_policies(paths: list[str]) -> dict[str, dict]:
-    """加载模型并拒绝 v2（与 ``mirror_eval`` 同一条理由）。返回 ``label -> 记录``。"""
-    from gladiator_train.policy import Policy
+def load_policies(paths: list[str]) -> dict[str, "ModelRecord"]:
+    """加载模型（v1/v2 都收），返回 ``label -> ModelRecord``。
 
+    v2 的拒绝在 G-703 去掉：动作空间由每个模型自己的 ``_meta.actionSpace`` 决定，
+    学习者按它建 env，对手由 env 自己按 ``is_v2`` 分流（见模块 docstring）。
+    加载失败一律 ``SystemExit``（带路径与原因），不要跑到一半才发现有个坏文件。
+    """
     labels = unique_labels(paths)
-    loaded: dict[str, dict] = {}
+    loaded: dict[str, ModelRecord] = {}
     for label, path in zip(labels, paths):
-        if not Path(path).exists():
-            raise SystemExit(f"模型不存在: {path}")
-        policy = Policy.load(path)
-        if getattr(policy, "action_space", "v1") != "v1":
-            raise SystemExit(
-                f"league 目前只支持 v1 模型作联赛对比：{path} 是 v2（9 头）动作空间，"
-                "对手动作需要环境侧支持 v2 解码（本块未实现）。"
-                "请改用 eval_suite.py --policy A --policy-b B。")
-        loaded[label] = {"label": label, "path": str(path), "policy": policy}
+        try:
+            loaded[label] = load_model(path, label=label)
+        except ModelLoadError as exc:
+            raise SystemExit(str(exc)) from exc
     return loaded
 
 
@@ -127,16 +140,23 @@ def build_schedule(labels: list[str], episodes_per_pair: int) -> list[dict]:
 
 def run_league(paths: dict[str, str], episodes_per_pair: int, play_episode, seed: int,
                max_steps: int = LEAGUE_DEFAULT["maxSteps"],
-               greedy: bool = False, verbose: bool = True) -> dict:
+               greedy: bool = False, verbose: bool = True,
+               models: dict[str, "ModelRecord"] | None = None) -> dict:
     """跑完整个循环赛并汇总。
 
     ``play_episode(left_path, right_path, seed, max_steps, greedy)`` 返回
     ``"left"`` / ``"right"`` / ``"draw"``（**按座位**，不是按模型名）——
     这个注入点让单测可以不连服务端就能验证矩阵/排名/统计口径。
+
+    ``models``（可选）只用于把 ``actionSpace`` / 头结构带进输出：**对局本身只看路径**，
+    所以单测可以给假路径 + 不给 ``models``，统计口径完全一致。
     """
     labels = list(paths)
     if len(labels) < 2:
         raise ValueError("联赛至少需要 2 个模型")
+    if models is not None and set(models) != set(labels):
+        raise ValueError(
+            f"models 的标签 {sorted(models)} 与 paths 的标签 {sorted(labels)} 不一致")
     schedule = build_schedule(labels, episodes_per_pair)
     rows: list[dict] = []
     for index, item in enumerate(schedule):
@@ -170,7 +190,18 @@ def run_league(paths: dict[str, str], episodes_per_pair: int, play_episode, seed
         "seed": int(seed),
         "maxSteps": int(max_steps),
         "greedy": bool(greedy),
-        "policies": [{"label": label, "path": paths[label]} for label in labels],
+        # G-703：动作空间进输出，混打的胜率必须带着这个上下文看。
+        "actionSpaces": ({label: models[label].action_space for label in labels}
+                         if models is not None else {}),
+        "policies": [
+            ({"label": label, "path": models[label].path,
+              "actionSpace": models[label].action_space,
+              "headSizes": list(models[label].head_sizes),
+              "obsDim": models[label].obs_dim}
+             if models is not None and label in models
+             else {"label": label, "path": paths[label]})
+            for label in labels
+        ],
         "rows": rows,
     })
     return summary
@@ -257,20 +288,37 @@ def _fmt_ci(interval) -> str:
     return f"{_fmt_pct(interval[0])}–{_fmt_pct(interval[1])}"
 
 
+def _space_of(summary: dict, label: str) -> str:
+    """``label`` 的动作空间；没带（单测/旧 JSON）时返回 ``""``，表格里就不显示。"""
+    return str((summary.get("actionSpaces") or {}).get(label) or "")
+
+
+def _tagged(summary: dict, label: str) -> str:
+    """``dagger3 [v2]`` 这种带动作空间的标签（矩阵/对阵表用）。"""
+    space = _space_of(summary, label)
+    return f"{label} [{space}]" if space else label
+
+
 def format_markdown(summary: dict) -> str:
-    """把汇总渲染成 markdown 表格（排名 / 对阵 / 胜负矩阵）。"""
+    """把汇总渲染成 markdown 表格（排名 / 对阵 / 胜负矩阵）。
+
+    G-703：三张表都带动作空间——混打（v1/v2 同场）时，「谁更强」必须和「各自什么动作空间」
+    一起看，否则同一个胜率会被读成「参数量差异」或「动作空间差异」。
+    """
     labels = [item["label"] for item in summary["ranking"]]
     lines: list[str] = []
     lines.append(f"## 联赛结果（每对 {summary['episodesPerPair']} 局，seed={summary['seed']}）")
     lines.append("")
     lines.append("### 排名")
     lines.append("")
-    lines.append("| # | 策略 | 胜 | 负 | 平 | 胜率 | Wilson 95% |")
-    lines.append("|---:|------|---:|---:|---:|---:|:-----------|")
+    lines.append("| # | 策略 | 动作空间 | 胜 | 负 | 平 | 胜率 | Wilson 95% |")
+    lines.append("|---:|------|:--:|---:|---:|---:|---:|:-----------|")
     for item in summary["ranking"]:
+        space = _space_of(summary, item["label"]) or "—"
         lines.append(
-            f"| {item['rank']} | {item['label']} | {item['wins']} | {item['losses']} | "
-            f"{item['draws']} | {_fmt_pct(item['winRate'])} | {_fmt_ci(item['winRateCI'])} |")
+            f"| {item['rank']} | {item['label']} | {space} | {item['wins']} | "
+            f"{item['losses']} | {item['draws']} | {_fmt_pct(item['winRate'])} | "
+            f"{_fmt_ci(item['winRateCI'])} |")
     lines.append("")
     lines.append("### 对阵（A 视角，精确二项检验 p=0.5）")
     lines.append("")
@@ -279,13 +327,14 @@ def format_markdown(summary: dict) -> str:
     for pair in summary["pairs"]:
         verdict = (f"{pair['stronger']} 显著更强" if pair["stronger"] else "无显著差异")
         lines.append(
-            f"| {pair['a']} | {pair['b']} | {pair['aWins']} | {pair['bWins']} | "
+            f"| {_tagged(summary, pair['a'])} | {_tagged(summary, pair['b'])} | "
+            f"{pair['aWins']} | {pair['bWins']} | "
             f"{pair['draws']} | {_fmt_pct(pair['aWinRate'])} | "
             f"{_fmt_ci(pair['aWinRateCI'])} | {pair['p']:.4f} | {verdict} |")
     lines.append("")
     lines.append("### 胜负矩阵（行视角：胜-负-平）")
     lines.append("")
-    header = "| A \\ B | " + " | ".join(labels) + " |"
+    header = "| A \\ B | " + " | ".join(_tagged(summary, label) for label in labels) + " |"
     lines.append(header)
     lines.append("|:------|" + "|".join([":--:" for _ in labels]) + "|")
     matrix = summary["matrix"]
@@ -297,7 +346,7 @@ def format_markdown(summary: dict) -> str:
             else:
                 cell = matrix[row][column]
                 cells.append(f"{cell['wins']}-{cell['losses']}-{cell['draws']}")
-        lines.append(f"| **{row}** | " + " | ".join(cells) + " |")
+        lines.append(f"| **{_tagged(summary, row)}** | " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 
@@ -320,22 +369,39 @@ def write_summary(summary: dict, out_dir: str | Path, when: time.struct_time | N
 
 
 def make_env_play_episode(args) -> callable:
-    """构造真机对局函数（口径与 ``mirror_eval`` 一致：左位当学习者，右位当对手策略）。"""
-    from gladiator_train.policy import Policy
+    """构造真机对局函数（口径与 ``mirror_eval`` 一致：左位当学习者，右位当对手策略）。
 
+    G-703：左右两边的动作空间**各按自己的模型**来——
+    - 学习者（``bots[0]``）：``action_space=`` 用左模型的（v1 → Discrete，v2 → MultiDiscrete），
+      取动作走 :func:`policy_action_for_env`，v2 时带上 ``info['actionMask']``；
+    - 对手（``bots[1]``）：交给 ``GladiatorEnv(opponent_policy=...)``，env 自己按
+      ``is_v2`` 决定走 ``decode_intent`` 还是 v1 宏动作。
+
+    因此「v1 学习者 + v2 对手」「v2 学习者 + v1 对手」「v2 + v2」都能跑，无需额外开关。
+    """
     bots = [
         BotConfig(args.users[0], f"ws://{args.host}:{args.ports[0]}"),
         BotConfig(args.users[1], f"ws://{args.host}:{args.ports[1]}"),
     ]
     rcon = parse_rcon(args.rcon)
     left_name = bots[0].username
+    #: 每个模型只加载一次：一次联赛会重复用到同一个 npz（N 对 × 局数），
+    #: 重复 Policy.load 既慢又会把补零后的权重再拷一遍。
+    cache: dict[str, ModelRecord] = {}
+
+    def _model(path: str) -> "ModelRecord":
+        record = cache.get(path)
+        if record is None:
+            record = load_model(path)
+            cache[path] = record
+        return record
 
     def play_episode(left_path: str, right_path: str, seed: int, max_steps: int,
                      greedy: bool = False) -> str:
         import numpy as np
 
-        policy = Policy.load(left_path)
-        opponent = Policy.load(right_path)
+        left = _model(left_path)
+        right = _model(right_path)
         env = GladiatorEnv(
             bots,
             ArenaConfig(center=(0.5, 4.0, 0.5), spacing=6.0),
@@ -343,18 +409,22 @@ def make_env_play_episode(args) -> callable:
             max_steps=max_steps,
             auto_spawn=not args.no_spawn,
             rcon=rcon,
-            opponent_policy=opponent,
+            opponent_policy=right.policy,
             opponent_epsilon=0.0,
+            action_space=env_action_space(left),
         )
         rng = np.random.default_rng(seed)
         try:
             observation, info = env.reset(seed=seed)
+            mask = normalize_action_mask(left.policy, (info or {}).get("actionMask"))
             done = False
             steps = 0
             final_info = info
             while not done and steps < max_steps:
-                action = policy.act(observation, rng, greedy=greedy)
+                action = policy_action_for_env(left.policy, observation, mask, rng,
+                                               greedy=greedy)
                 observation, _reward, terminated, truncated, final_info = env.step(action)
+                mask = normalize_action_mask(left.policy, (final_info or {}).get("actionMask"))
                 done = bool(terminated or truncated)
                 steps += 1
             winner = (final_info or {}).get("winner")
@@ -384,7 +454,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--greedy", action="store_true", help="两边都用 argmax 动作（去掉随机性）")
     parser.add_argument("--out", default=LEAGUE_DEFAULT["out"],
                         help="产物目录（默认 artifacts/evals，即 training/artifacts/evals）")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="只做参数解析 + 模型加载 + 赛程校验，不开对局（服务器没开时用）")
     return parser
+
+
+def dry_run_report(loaded: dict[str, "ModelRecord"], episodes_per_pair: int,
+                   seed: int) -> str:
+    """``--dry-run`` 的输出：模型表 + 赛程条数（**不连服务器**）。"""
+    labels = list(loaded)
+    schedule = build_schedule(labels, episodes_per_pair)
+    lines = [f"[league] dry-run：{len(labels)} 个模型，"
+             f"{len(loaded) * (len(loaded) - 1) // 2} 对 × {episodes_per_pair} 局 "
+             f"= {len(schedule)} 局（seed={seed}）"]
+    lines.append("")
+    lines.append("| 策略 | 动作空间 | 头结构 | obsDim | 路径 |")
+    lines.append("|:--|:--:|:--|---:|:--|")
+    for label in labels:
+        record = loaded[label]
+        sizes = "/".join(str(size) for size in record.head_sizes)
+        lines.append(f"| {label} | {record.action_space} | {sizes} | {record.obs_label()} "
+                     f"| {record.path} |")
+    lines.append("")
+    fixed = sum(1 for index, item in enumerate(schedule) if item["episode"] % 2 == 0)
+    lines.append(f"赛程校验：左右位交替（偶局 A 在左）{fixed}/{len(schedule)}，"
+                 f"所有对局均为「学习者 + 对手策略」单智能体模式")
+    return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -393,14 +488,19 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--policies 至少给 2 个模型")
     if args.episodes_per_pair < 1:
         raise SystemExit("--episodes-per-pair 至少为 1")
-    # 先加载（顺便拒绝 v2），再开局：不要跑到一半才发现动作空间不对。
+    # 先加载（v1/v2 都收，坏文件在这里就报），再开局：不要跑到一半才发现模型不对。
     loaded = load_policies(args.policies)
-    paths = {label: record["path"] for label, record in loaded.items()}
+    paths = {label: record.path for label, record in loaded.items()}
     print(f"[league] {len(paths)} 个模型，每对 {args.episodes_per_pair} 局："
-          f"{', '.join(paths)}", flush=True)
+          + ", ".join(f"{label}({loaded[label].action_space})" for label in paths), flush=True)
+    if args.dry_run:
+        print(dry_run_report(loaded, args.episodes_per_pair, args.seed))
+        print("[league] dry-run 结束（未开对局）")
+        return 0
 
     summary = run_league(paths, args.episodes_per_pair, make_env_play_episode(args),
-                         seed=args.seed, max_steps=args.max_steps, greedy=args.greedy)
+                         seed=args.seed, max_steps=args.max_steps, greedy=args.greedy,
+                         models=loaded)
     markdown = format_markdown(summary)
     print()
     print(markdown)

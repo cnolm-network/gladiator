@@ -661,6 +661,9 @@ TEACHER_V3_CLOCK_MIN_SAMPLES = 4
 TEACHER_V3_CLOCK_MIN_SECONDS = 0.02
 TEACHER_V3_CLOCK_MAX_SECONDS = 0.35
 #: 自己的攻击距离（格）。与 ``BotProfile.reach`` 一致，``meta={"reach": ...}`` 可覆盖。
+#: 老师假定的射程（**冻结**）：v3/v4 老师与现有蒸馏标签都是按 3.99 训练的，
+#: 改成 3.0 会改变标签分布 → 必须先重训再换。G-708 只改 BotProfile / BotConfig 的默认值，
+#: 这里留 3.99 并在报告里标为「待重训后回调」。
 TEACHER_V3_REACH = 3.99
 #: 出手余量（格）：观测的 ``in_reach`` 用的是**水平**距离，解码用的是实体 3D 距离，
 #: 在空中时两者会差 0.2~0.4 格。贴边出手会被解码/运行时降级成「追击」，
@@ -750,7 +753,7 @@ TEACHER_V3_CRIT_ARM_SLACK = 0.0
 TEACHER_V3_CRIT_COOLDOWN_SECONDS = 0.1
 
 #: w-tap：每次 attack 之后这么多 tick 内不发 approach / forward（以 20Hz 为基准换算成秒）。
-#: 疾跑攻击的击退更大，会把对手推出 3.99 格；松一下 W 再压上去能让对手留在射程内。
+#: 疾跑攻击的击退更大，会把对手推出 3 格；松一下 W 再压上去能让对手留在射程内。
 #: **只在「已经够得着」时生效**：被击退到 4 格外时压上去比摆架势重要得多。
 TEACHER_V3_WTAP_TICKS = 2
 #: w-tap 的真实时长（秒）。按 20Hz 的 2 tick 折算，因此换成 10Hz 也不会变成 0.2s。
@@ -1361,7 +1364,7 @@ def _decide_v3(obs: np.ndarray, options: dict) -> tuple[int, dict]:
             return _v3_finish(state, ACTION_IDLE, view, reason="eating")
 
     # --- 4.5 贴脸被压：先退出跳劈距离（优先级高于格挡） ---
-    # 1.6 格以内站着挡是没有意义的：对手的每一刀必中，而我们的 3.99 格射程优势完全用不上。
+    # 1.6 格以内站着挡是没有意义的：对手的每一刀必中，而我们的 3 格射程优势完全用不上。
     # 退一步既拉开到交战线、又让它的暴击落空，比原地格挡（只减伤不减节奏）更好。
     if view["too_close"] and view["swinging"]:
         return _v3_finish(state, ACTION_RETREAT, view, reason="retreat_too_close")
@@ -2352,6 +2355,100 @@ def behavior_clone(
     result["teacherEntropy"] = round(entropy_sum / max(1e-9, weight_sum), 6)
     policy.updates += int(result["epochs"])  # 与 PPO 的更新计数分开记，但保持单调
     return result
+
+
+# --- G-705(c) AWR：用价值头给样本加权 ---------------------------------------
+
+#: ``advantage_weights`` 里指数的上限：``exp(50) ≈ 5.2e21``，再大就没有数值意义，
+#: 而且一条样本会在批内彻底吃掉梯度。超限时钳在边界（等比例缩放，不改变符号）。
+AWR_EXP_LIMIT = 50.0
+
+
+def advantage_weights(
+    policy,
+    samples: Sequence[tuple[np.ndarray, Any, float]],
+    *,
+    returns: Optional[Sequence[float]] = None,
+    temperature: float = 1.0,
+    positive_only: bool = True,
+    clip: "Optional[float | tuple[float, float]]" = None,
+) -> np.ndarray:
+    """G-705(c)：按「这步比价值头的预期好多少」给样本加权（AWR 的权重口径）。
+
+    仅用**价值头** ``V(s)``，不改任何权重、不参与反向传播——它只是「同一批人类样本里
+    哪几帧更值得学」的筛选器。三种加权模式的关系（见 ``docs/match.md`` §8.1）：
+
+    - (a) 结果过滤：赢的局整局加权；
+    - (b) 接触窗口：贴身的帧加权；
+    - **(c) AWR**：不再按「局/距离」粗筛，而是问 critic「这一帧的即时收益比预期高吗」。
+
+    口径（刻意写得死板，避免各处自己发明奖励）：
+
+    - ``R`` 只来自调用方：``returns`` 与样本等长（``None`` → 全 0，即「没有回报」）；
+    - ``A = R - V(s)``；``w = exp(A / temperature)``；
+    - ``positive_only=True``（默认）把 ``A < 0`` 的样本权重置 0——AWR 的思想是
+      「只向比平均更好的动作学」，负优势样本不该被当成正样本；
+    - 整体按**均值归一到 1**（这样换模式不会悄悄改变 BC 的有效学习率）；
+      若归一化前权重全为 0（例如全部样本都是负优势），退化为**全 1 均匀权重**
+      ——否则 BC 会拿到一个总权重 0 的批次，等于这一轮什么都没学；
+    - ``clip``：单个数字视为上界 ``(0, clip)``，也可给 ``(lo, hi)``；作用在**归一化之前**
+      的原始权重上（目的是压住单点主导），因此归一化之后的具体数值可能略越界。
+
+    :param policy: ``Policy``（v1/v2 都行；v2 用策略头之前的共享隐层 + ``Wv/bv``）
+    :param samples: ``[(obs, action, weight), ...]``；第三字段此处不使用
+    :param returns: 每条样本的单步回报 ``R``；``None`` 表示没有（按 0 处理）
+    :param temperature: ``exp(A/T)`` 的温度；越小越尖（只留最优势的样本）
+    :param positive_only: 负优势样本是否置 0
+    :param clip: 权重上下界（见上）
+    :returns: ``(N,)`` 的 float64 权重，均值 ≈ 1
+
+    示例（与 (a)(b) 组合，脚本里的用法）::
+
+        base = round_w * contact_w          # 已有的 (a)×(b)
+        w = advantage_weights(policy, samples, returns=returns, temperature=1.0)
+        weights = base * w
+        weights *= len(weights) / weights.sum()   # 复合后重新归一到均值 1
+    """
+    count = len(samples)
+    if count == 0:
+        return np.zeros(0, dtype=np.float64)
+    raw_temperature = float(temperature)
+    if not np.isfinite(raw_temperature) or raw_temperature <= 0:
+        raise ValueError(f"temperature 必须为正的有限数，收到 {temperature}")
+
+    if returns is None:
+        rewards = np.zeros(count, dtype=np.float64)
+    else:
+        rewards = np.asarray(list(returns), dtype=np.float64).reshape(-1)
+        if rewards.size != count:
+            raise ValueError(f"returns 长度 {rewards.size} 与样本数 {count} 不一致")
+        if not np.all(np.isfinite(rewards)):
+            raise ValueError("returns 里有 NaN/Inf：先把数据修好再加权")
+
+    values = np.asarray([float(policy.value(x)) for x, _action, _w in samples],
+                        dtype=np.float64)
+    advantage = rewards - values
+
+    exponent = np.clip(advantage / raw_temperature, -AWR_EXP_LIMIT, AWR_EXP_LIMIT)
+    weights = np.exp(exponent)
+
+    if positive_only:
+        weights = np.where(advantage < 0.0, 0.0, weights)
+
+    if clip is not None:
+        if isinstance(clip, (int, float)):
+            lower, upper = 0.0, float(clip)
+        else:
+            lower, upper = float(clip[0]), float(clip[1])
+        if not (np.isfinite(lower) and np.isfinite(upper)) or upper < lower:
+            raise ValueError(f"clip 非法: {clip}")
+        weights = np.clip(weights, lower, upper)
+
+    mean = float(weights.mean()) if weights.size else 0.0
+    if not np.isfinite(mean) or mean <= 1e-12:
+        # 全负 / 全被剪成 0：退化为均匀，绝不让整批样本失去权重。
+        return np.ones(count, dtype=np.float64)
+    return weights / mean
 
 
 def teacher_agreement(policy, samples: Iterable[tuple[np.ndarray, Any, float]]):

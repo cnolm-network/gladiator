@@ -2,7 +2,12 @@
  * 每个 Bot 独立的行为配置（G-507）。
  *
  * <p>配置来源优先级：SPAWN.payload.profile &gt; CLI 参数 &gt; 内置默认值
- * （15±2 CPS、220±40ms 反应、3.99 格攻击距离、default 模型）。
+ * （15±2 CPS、220±40ms 反应、**3.0 格**攻击距离、default 模型）。
+ *
+ * <p><b>reach 口径（G-708）</b>：1.8 原版玩家攻击距离约 3 格，所以默认 3.0；
+ * 3.99 这类超限值只能通过显式作弊开关打开（SPAWN profile 的 `cheatReach` 或
+ * 运行时 CLI `--cheat-reach <值>`），打开后必须打一行
+ * `[cheat] reach 超限=…（仅对照实验）`——否则「这个 Bot 很强」的结论会被误读成正常陪练。
  * 这里只做“手感”建模：CPS 限制点击节奏、反应延时给动作加排队延迟、
  * attack 距离用于本地预检（服务端仍会自行校验）。
  */
@@ -12,7 +17,9 @@ export const DEFAULT_PROFILE = Object.freeze({
   cpsJitter: 2,
   reactionMs: 220,
   reactionJitterMs: 40,
-  reach: 3.99,
+  reach: 3.0,
+  //: `cheat.reach` 开关（默认关）；只有它显式为 true 时 reach 才能超过 3.0。
+  cheatReach: false,
   model: 'default',
   /**
    * 战斗辅助（“外挂级”开关，默认全关，训练里逐步打开）：
@@ -28,6 +35,12 @@ export const DEFAULT_PROFILE = Object.freeze({
     aimLock: false,
   }),
 });
+
+/** 合法（非作弊）reach 上限：1.8 原版玩家约 3 格。 */
+export const LEGIT_REACH_MAX = 3.0;
+/** 配置下限 / 硬上限（格）。超过硬上限连作弊开关也不接受。 */
+export const MIN_REACH = 1.0;
+export const MAX_REACH = 6.0;
 
 function num(value, fallback) {
   const n = Number(value);
@@ -61,7 +74,17 @@ export function normalizeProfile(raw, logger = null) {
   const reactionJitterMs = pick(
     "reactionJitterMs", base.reactionJitterMs, (v) => v >= 0 && v <= 5000,
   );
-  const reach = pick("reach", base.reach, (v) => v > 0 && v <= 6);
+  const cheatReach = src.cheatReach === true;
+  let reach = pick("reach", base.reach, (v) => v >= MIN_REACH && v <= MAX_REACH);
+  if (reach > LEGIT_REACH_MAX && !cheatReach) {
+    // 不抛异常（运行时不因为脏配置启动失败），但**一定**要降回合法值并告警：
+    // 悄悄接受 3.99 会让「陪练距离感」整体失真，而且没人会注意到。
+    warnings.push(`reach=${reach} 超限（原版约 ${LEGIT_REACH_MAX} 格），未开 cheat.reach → 回落 ${LEGIT_REACH_MAX}`);
+    reach = LEGIT_REACH_MAX;
+  }
+  if (cheatReach && reach > LEGIT_REACH_MAX && logger) {
+    logger.warn(`[cheat] reach 超限=${reach}（仅对照实验）`);
+  }
 
   let model = base.model;
   if ("model" in src) {
@@ -90,6 +113,7 @@ export function normalizeProfile(raw, logger = null) {
     reactionMs,
     reactionJitterMs,
     reach,
+    cheatReach,
     model,
     assist,
   });

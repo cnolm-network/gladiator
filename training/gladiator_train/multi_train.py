@@ -36,6 +36,7 @@ from typing import List
 import numpy as np
 
 from gladiator_env import ArenaConfig, BotConfig, GladiatorEnv
+from gladiator_env.env import check_reach, cheat_reach_banner
 from gladiator_env.reward_presets import load_preset
 from gladiator_env.spaces import NUM_ACTIONS, OBS_DIM
 
@@ -176,6 +177,12 @@ def run_pair(args, pair: int, results: list[PairResult]) -> None:
     result = PairResult(pair=pair, users=users)
     results.append(result)
     try:
+        # G-708：reach 默认 3.0；超限只能走 --cheat-reach（双方同一把尺子）。
+        cheat_reach = args.cheat_reach is not None
+        reach_value = check_reach(args.cheat_reach if cheat_reach else args.reach,
+                                  cheat=cheat_reach)
+        if cheat_reach:
+            print(cheat_reach_banner(reach_value), file=sys.stderr)
         bots = [
             BotConfig(
                 username=users[0],
@@ -184,7 +191,8 @@ def run_pair(args, pair: int, results: list[PairResult]) -> None:
                 cps_jitter=args.cps_jitter,
                 reaction_ms=args.reaction_ms,
                 reaction_jitter_ms=args.reaction_jitter_ms,
-                reach=args.reach,
+                reach=reach_value,
+                cheat_reach=cheat_reach,
                 model=args.model,
                 wtap=args.wtap,
                 auto_rod=args.auto_rod,
@@ -198,7 +206,8 @@ def run_pair(args, pair: int, results: list[PairResult]) -> None:
                 cps_jitter=args.opp_cps_jitter,
                 reaction_ms=args.opp_reaction_ms,
                 reaction_jitter_ms=args.opp_reaction_jitter_ms,
-                reach=args.reach,
+                reach=reach_value,
+                cheat_reach=cheat_reach,
                 model="opponent",
                 wtap=args.opp_assist,
                 auto_rod=args.opp_assist,
@@ -294,7 +303,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cps-jitter", type=float, default=2.0)
     p.add_argument("--reaction-ms", type=float, default=220.0)
     p.add_argument("--reaction-jitter-ms", type=float, default=40.0)
-    p.add_argument("--reach", type=float, default=3.99)
+    p.add_argument("--reach", type=float, default=3.0)
+    p.add_argument("--cheat-reach", type=float, default=None,
+                   help="作弊开关：显式超限攻击距离（仅对照实验）")
     p.add_argument("--model", default="default")
     p.add_argument("--mc-port", type=int, default=25566, help="服务器端口（运行时已自行连接，仅记录）")
     p.add_argument("--wtap", action="store_true")

@@ -1,5 +1,9 @@
 """G-702：观测 23 → 25 维（`self_vertical_speed` / `self_attack_cooldown`）。
 
+G-711 起 ``OBS_DIM`` 已经是 37：本文件保留为「**前 25 个字段的冻结快照**」，
+维度断言一律走 ``OBS_DIM`` 而不是写死 25——再往上加维不该让这份历史判据失效。
+（25 → 37 的新增部分由 ``test_observation_v37.py`` 覆盖。）
+
 三件事必须同时成立，否则「旧模型右侧补零续训」会在无人察觉的情况下失效：
 
 1. **只在末尾追加**：索引 0–22 的名字、顺序、语义一个都不许动；
@@ -126,9 +130,10 @@ def math_pi_over(divisor: int) -> float:
 class ObservationV25LayoutTest(unittest.TestCase):
     """维度、字段顺序与裁剪边界。"""
 
-    def test_dim_is_25(self) -> None:
-        self.assertEqual(OBS_DIM, 25)
-        self.assertEqual(len(OBS_FIELDS), 25)
+    def test_dim_matches_fields(self) -> None:
+        # G-711：维度跟着 OBS_DIM 走，这里只锁定「至少有 25 个字段」与二者自洽。
+        self.assertGreaterEqual(len(OBS_FIELDS), 25)
+        self.assertEqual(OBS_DIM, len(OBS_FIELDS))
 
     def test_first_23_fields_are_untouched(self) -> None:
         self.assertEqual(tuple(OBS_FIELDS[:23]), FROZEN_FIELDS_V23)
@@ -142,7 +147,7 @@ class ObservationV25LayoutTest(unittest.TestCase):
 
     def test_vector_length_and_dtype(self) -> None:
         vector = encode_observation(rich_observation(), "Glad_Bot_1")
-        self.assertEqual(vector.shape, (25,))
+        self.assertEqual(vector.shape, (OBS_DIM,))
         self.assertEqual(vector.dtype, np.float32)
 
     def test_vertical_speed_comes_from_self_payload(self) -> None:
@@ -207,12 +212,13 @@ class OldPolicyAdoptionTest(unittest.TestCase):
             fresh = Policy(obs_dim=OBS_DIM, n_actions=1, hidden=16, seed=12, action_space="v2")
             adopt_weights(fresh, loaded)
 
-            self.assertEqual(fresh.obs_dim, 25)
-            self.assertEqual(fresh.params["W1"].shape, (16, 25))
+            self.assertEqual(fresh.obs_dim, OBS_DIM)
+            self.assertEqual(fresh.params["W1"].shape, (16, OBS_DIM))
             # 关键断言：左侧 23 列逐位相等
             self.assertTrue(np.array_equal(fresh.params["W1"][:, :23],
                                            np.asarray(old.params["W1"], dtype=np.float64)))
-            np.testing.assert_array_equal(fresh.params["W1"][:, 23:], np.zeros((16, 2)))
+            np.testing.assert_array_equal(
+                fresh.params["W1"][:, 23:], np.zeros((16, OBS_DIM - 23)))
 
     def test_saving_and_reloading_keeps_obs_dim(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -220,8 +226,8 @@ class OldPolicyAdoptionTest(unittest.TestCase):
             policy = Policy(obs_dim=OBS_DIM, n_actions=1, hidden=8, seed=5, action_space="v2")
             policy.save(str(path))
             loaded = Policy.load(str(path))
-            self.assertEqual(loaded.obs_dim, 25)
-            self.assertEqual(loaded.params["W1"].shape, (8, 25))
+            self.assertEqual(loaded.obs_dim, OBS_DIM)
+            self.assertEqual(loaded.params["W1"].shape, (8, OBS_DIM))
 
 
 class NodePythonCrossCheckTest(unittest.TestCase):
@@ -264,7 +270,7 @@ class NodePythonCrossCheckTest(unittest.TestCase):
         }
         js = self._encode_in_node(observation, options)
         py = encode_observation(observation, username, **kwargs).astype(np.float64)
-        self.assertEqual(js.shape, (25,))
+        self.assertEqual(js.shape, (OBS_DIM,))
         max_diff = float(np.max(np.abs(js - py)))
         self.assertLess(max_diff, 1e-6, f"最大偏差 {max_diff}")
         return max_diff

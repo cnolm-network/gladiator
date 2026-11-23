@@ -5,7 +5,12 @@ import org.bukkit.Material;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
+import org.bukkit.potion.PotionEffect;
 
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -27,6 +32,7 @@ import java.util.Locale;
  * name=&lt;名字&gt; health=&lt;血量&gt; food=&lt;饱食度&gt; saturation=&lt;饱和度&gt; armor=&lt;护甲点数&gt;
  * x=&lt;X&gt; y=&lt;Y&gt; z=&lt;Z&gt; yaw=&lt;偏航角&gt; pitch=&lt;俯仰角&gt;
  * sprinting=&lt;bool&gt; blocking=&lt;bool&gt; onGround=&lt;bool&gt; hurt=&lt;受击剩余无敌秒数&gt;
+ * dead=&lt;bool&gt; effects=&lt;NAME:level|…|-&gt;
  * </pre>
  *
  * <p>{@code hurt} 取 {@code Entity#getNoDamageTicks() / 10.0}：受击后原版会给 10 tick（0.5s）
@@ -59,6 +65,8 @@ public final class PlayerTelemetry {
         private final boolean blocking;
         private final boolean onGround;
         private final double hurt;
+        private final boolean dead;
+        private final String effects;
 
         Snapshot(Player player, Location location) {
             this.name = player.getName();
@@ -75,6 +83,8 @@ public final class PlayerTelemetry {
             this.blocking = player.isBlocking();
             this.onGround = player.isOnGround();
             this.hurt = player.getNoDamageTicks() / TICKS_PER_SECOND;
+            this.dead = player.isDead() || player.getHealth() <= 0.0D;
+            this.effects = describeEffects(player);
         }
 
         public String getName() {
@@ -133,6 +143,14 @@ public final class PlayerTelemetry {
             return hurt;
         }
 
+        public boolean isDead() {
+            return dead;
+        }
+
+        public String getEffects() {
+            return effects;
+        }
+
         /** 单行文本（字段顺序固定，供 RCON 解析）。 */
         public String toLine() {
             return "name=" + name
@@ -148,7 +166,9 @@ public final class PlayerTelemetry {
                     + " sprinting=" + sprinting
                     + " blocking=" + blocking
                     + " onGround=" + onGround
-                    + " hurt=" + decimal(hurt);
+                    + " hurt=" + decimal(hurt)
+                    + " dead=" + dead
+                    + " effects=" + effects;
         }
 
         @Override
@@ -225,6 +245,41 @@ public final class PlayerTelemetry {
             return table[3];
         }
         return 0.0D;
+    }
+
+    /**
+     * 当前药水效果，格式 {@code 名称:等级|名称:等级}（等级 = amplifier + 1），无效果为 {@code -}。
+     *
+     * <p>为什么要这一列：板子的倒计时免伤（抗性 V）与「套件刚发还没穿上」都只能从效果/护甲看出来；
+     * 没有它，验收时只能用「打一下试试」来判断免伤是否生效。
+     */
+    static String describeEffects(Player player) {
+        if (player == null) {
+            return "-";
+        }
+        Collection<PotionEffect> active = player.getActivePotionEffects();
+        if (active == null || active.isEmpty()) {
+            return "-";
+        }
+        List<String> parts = new ArrayList<String>();
+        for (PotionEffect effect : active) {
+            if (effect == null) {
+                continue;
+            }
+            parts.add(effect.getType().getName() + ":" + (effect.getAmplifier() + 1));
+        }
+        if (parts.isEmpty()) {
+            return "-";
+        }
+        Collections.sort(parts);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < parts.size(); i++) {
+            if (i > 0) {
+                sb.append('|');
+            }
+            sb.append(parts.get(i));
+        }
+        return sb.toString();
     }
 
     private static String decimal(double value) {

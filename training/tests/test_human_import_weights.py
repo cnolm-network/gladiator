@@ -158,13 +158,19 @@ class BehaviorCloneWeightTests(unittest.TestCase):
                                        rtol=1e-9, atol=1e-12)
 
     def test_weight_changes_direction(self) -> None:
-        """同一批样本，把权重全压在 A 类动作上，策略应更偏向 A。"""
+        """同一批样本，把权重全压在 A 类动作上，策略应更偏向 A。
 
+        G-711：这条用例的数据刻意用**固定 25 维**（不与 ``OBS_DIM`` 绑定）。
+        它测的是「权重方向」，若跟着观测维度走，每次加维都会换一批随机数
+        （``rng.normal(size=D)`` 的流不同），断言就退化成对种子敏感了。
+        """
+
+        dim = 25
         rng = np.random.default_rng(23)
-        obs_a = [rng.normal(size=OBS_DIM) for _ in range(16)]
+        obs_a = [rng.normal(size=dim) for _ in range(16)]
         obs_b = [obs + 4.0 for obs in obs_a]
         samples = [(obs, 2, 0.0) for obs in obs_a] + [(obs, 9, 0.0) for obs in obs_b]
-        policy = Policy(obs_dim=OBS_DIM, n_actions=11, hidden=16, seed=9)
+        policy = Policy(obs_dim=dim, n_actions=11, hidden=16, seed=9)
         before = policy.probs(obs_a[0])
         behavior_clone(policy, samples, epochs=20, seed=4,
                        weights=[1.0] * len(obs_a) + [0.0] * len(obs_b))
@@ -204,6 +210,44 @@ class RoundWinnerLoadingTests(unittest.TestCase):
             ]}), encoding="utf-8")
             winners = human.load_round_winners(Path(tmp))
             self.assertEqual(winners, {1: "player", 2: "bot", 3: "draw"})
+
+
+class RewardColumnTests(unittest.TestCase):
+    """``build_dataset`` 现在会带 ``rewards``（只由血量差推出，给 AWR 用）。"""
+
+    @staticmethod
+    def _frame(t: float, player_hp: float, bot_hp: float, round_no: int = 1) -> dict:
+        return {
+            "t": t,
+            "round": round_no,
+            "player": {"health": player_hp, "x": 0.0, "y": 4.0, "z": 0.0},
+            "bot": {"health": bot_hp, "x": 3.0, "y": 4.0, "z": 0.0},
+        }
+
+    def test_rewards_track_health_delta(self) -> None:
+        frames = [
+            self._frame(0.0, 20.0, 20.0),
+            self._frame(1.0, 20.0, 16.0),  # 打掉对手 4
+            self._frame(2.0, 17.0, 16.0),  # 自己吃 3
+        ]
+        dataset = human.build_dataset(frames, player_name="p", bot_name="b")
+        self.assertEqual(list(dataset["rewards"]), [0.0, 4.0, -3.0])
+
+    def test_rewards_length_matches_samples(self) -> None:
+        frames = [self._frame(float(i), 20.0, 20.0) for i in range(5)]
+        dataset = human.build_dataset(frames, player_name="p", bot_name="b")
+        self.assertEqual(len(dataset["rewards"]), len(dataset["actions"]))
+        self.assertEqual(len(dataset["rewards"]), 5)
+
+    def test_win_bonus_only_on_round_boundary(self) -> None:
+        frames = [
+            self._frame(0.0, 20.0, 20.0, 1),
+            self._frame(1.0, 20.0, 10.0, 1),
+            self._frame(2.0, 20.0, 20.0, 2),  # 第二局开局的跨界帧
+        ]
+        dataset = human.build_dataset(
+            frames, player_name="p", bot_name="b", winners={1: "player"}, win_bonus=7.0)
+        self.assertEqual(list(dataset["rewards"]), [0.0, 10.0, 7.0])
 
 
 if __name__ == "__main__":

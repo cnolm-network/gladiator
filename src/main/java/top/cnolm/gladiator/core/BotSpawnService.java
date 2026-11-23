@@ -22,6 +22,7 @@ import top.cnolm.gladiator.api.event.GladiatorBotReadyEvent;
 import top.cnolm.gladiator.bridge.Envelope;
 import top.cnolm.gladiator.bridge.LinkServer;
 import top.cnolm.gladiator.bridge.SessionRegistry;
+import top.cnolm.gladiator.core.board.BoardRegistryImpl;
 
 import java.util.Locale;
 import java.util.Map;
@@ -249,6 +250,8 @@ public final class BotSpawnService implements BotSpawner, Listener {
         service.unregisterBot(handle, "player-quit");
         handle.unbind();
         plugin.getLogger().info("Bot 退出: " + player.getName());
+        // 板子事件流：Bot 退出 = BOT_OFFLINE（与 spawn 失败/超时同一条出口）。
+        BoardRegistryImpl.notifyBotOffline(player.getName(), handle.getBotId(), "player-quit");
     }
 
     // ------------------------------------------------------------------
@@ -312,6 +315,9 @@ public final class BotSpawnService implements BotSpawner, Listener {
 
         plugin.getLogger().info("Bot ready: " + handle.getBotId()
                 + " user=" + player.getName() + " uuid=" + player.getUniqueId());
+        // 板子事件流：就绪点与 GladiatorBotReadyEvent 同一处（主线程 + MONITOR），
+        // 板子因此能在 onStart 之后立刻看到「Bot 可以用了」。
+        BoardRegistryImpl.notifyBotReady(player.getName(), handle.getBotId());
         // 主线程 + MONITOR 阶段：调用方可以在这里安全传送/给套件，然后 pushGame。
         Bukkit.getPluginManager().callEvent(new GladiatorBotReadyEvent(handle));
     }
@@ -344,6 +350,9 @@ public final class BotSpawnService implements BotSpawner, Listener {
         byUsername.remove(key(pending.username), pending);
         plugin.getLogger().warning("Bot 登录失败: " + pending.botId
                 + " request=" + requestId + " reason=" + reason);
+        // 板子事件流：spawn 失败/超时同样是「这个 Bot 不在」，reason 原样带出
+        // （TIMEOUT / LINK_LOST / SPAWN_FAILED 的 code:detail）。
+        BoardRegistryImpl.notifyBotOffline(pending.username, pending.botId, reason);
         Bukkit.getPluginManager().callEvent(
                 new GladiatorBotFailedEvent(pending.requestId, pending.botId, reason));
     }
