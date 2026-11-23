@@ -2,6 +2,8 @@ package top.cnolm.arena;
 
 import org.bukkit.ChatColor;
 import org.bukkit.Location;
+import org.bukkit.entity.Entity;
+import org.bukkit.entity.Item;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 import top.cnolm.arena.status.ArenaTeam;
@@ -145,6 +147,23 @@ final class FlatBoard implements Board {
         bot = "";
     }
 
+    /** 清掉中心周围 48 格内的地面掉落物（死亡掉落的套件）。 */
+    private void clearGroundItems(Location center) {
+        if (center == null || center.getWorld() == null) {
+            return;
+        }
+        int removed = 0;
+        for (Entity entity : center.getWorld().getNearbyEntities(center, 48.0D, 48.0D, 48.0D)) {
+            if (entity instanceof Item) {
+                entity.remove();
+                removed++;
+            }
+        }
+        if (removed > 0 && ctx != null) {
+            ctx.log("清理地面掉落物 " + removed + " 个");
+        }
+    }
+
     // ------------------------------------------------------------------ 回合
 
     private void startRound() {
@@ -182,6 +201,9 @@ final class FlatBoard implements Board {
 
         Location playerSpawn = spawnFor(p, ctx.spec().getPlayerSpawn(), -DEFAULT_OFFSET);
         Location botSpawn = spawnFor(b, ctx.spec().getBotSpawn(), DEFAULT_OFFSET);
+        // 上一局死亡掉落的物品（护甲/剑/苹果）不清理会一直躺在地上，录像和复盘都会看到。
+        // 只看一个中心（两侧出生点中点，半径 48）避免同一批掉落物被两侧各数一遍。
+        clearGroundItems(playerSpawn.clone().add(botSpawn).multiply(0.5D));
         anchorRespawn(p, playerSpawn);
         anchorRespawn(b, botSpawn);
 
