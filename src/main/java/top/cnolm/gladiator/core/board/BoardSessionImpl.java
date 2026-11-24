@@ -47,6 +47,9 @@ final class BoardSessionImpl implements BoardContext {
     private boolean finished;
     private String phase = "starting";
     private String lastReason = "";
+    //: G-719：最近一局的 reason 与时长（dashboard 逐局表格用；无局时 none / -1）。
+    private String roundReason = "none";
+    private double lastSeconds = -1.0D;
 
     BoardSessionImpl(BoardRegistryImpl registry, Plugin plugin, Board board, GladiatorAPI api,
                      ParticipantResolver resolver, RoundSpec spec, String sessionId) {
@@ -147,13 +150,26 @@ final class BoardSessionImpl implements BoardContext {
 
     @Override
     public void endRound(RoundOutcome outcome) {
+        // 旧入口：板子没报时长 → -1，等价于「用墙钟估算」（与 G-719 之前完全一致）。
+        endRound(outcome, -1.0D);
+    }
+
+    @Override
+    public void endRound(RoundOutcome outcome, double seconds) {
         requireMainThread();
         if (finished) {
             return;
         }
         RoundOutcome value = outcome == null ? RoundOutcome.draw("no-outcome") : outcome;
-        int seconds = (int) Math.max(0L, (System.currentTimeMillis() - roundStartedAt) / 1000L);
-        records.add(new MatchOutcome.RoundRecord(round, value.getWinner(), value.getReason(), seconds));
+        long now = System.currentTimeMillis();
+        // seconds < 0 / NaN = 板子不知道 → 用墙钟（这是 G-719 之前的行为，保持不变）。
+        double elapsed = BoardContext.resolveRoundSeconds(seconds, roundStartedAt, now);
+        int recordSeconds = BoardContext.recordSeconds(elapsed);
+        records.add(new MatchOutcome.RoundRecord(round, value.getWinner(), value.getReason(),
+                recordSeconds));
+        // 逐局原因与时长：dashboard 的 roundsDetail 直接读这两个（会话级 reason 在 lastReason）。
+        roundReason = value.getReason();
+        lastSeconds = elapsed;
         if (RoundOutcome.WINNER_PLAYER.equals(value.getWinner())) {
             playerWins++;
         } else if (RoundOutcome.WINNER_BOT.equals(value.getWinner())) {
@@ -161,13 +177,23 @@ final class BoardSessionImpl implements BoardContext {
         } else {
             draws++;
         }
-        log("第 " + round + " 局结束: " + value.getWinner() + " (" + value.getReason() + ", " + seconds + "s)"
-                + " 比分 " + playerWins + ":" + botWins);
+        log("第 " + round + " 局结束: " + value.getWinner() + " (" + value.getReason() + ", "
+                + recordSeconds + "s) 比分 " + playerWins + ":" + botWins);
         round++;
-        roundStartedAt = System.currentTimeMillis();
+        roundStartedAt = now;
         if (round > spec.getRounds()) {
             endMatch(new MatchOutcome(playerWins, botWins, draws, "rounds-finished", records, null));
         }
+    }
+
+    @Override
+    public String roundReason() {
+        return roundReason;
+    }
+
+    @Override
+    public double lastSeconds() {
+        return lastSeconds;
     }
 
     @Override

@@ -7,6 +7,7 @@
  */
 
 import { Vec3 } from 'vec3';
+import { isSwordItem } from './attack-guard.js';
 import { ClickGate, ReactionDelay, normalizeProfile, usesReactionDelay } from './bot-profile.js';
 import {
   ItemError, aimAt, blockWithSword, eatGoldenApple, equipArmor, eyeDistance, releaseRod, selectItem,
@@ -23,6 +24,16 @@ const MOVE_RELEASE_GRACE_MS = 120;
 // 打不到时「追一步」的按键时长：略短于一个控制周期（200ms），既产生实际位移，
 // 又不会让 Bot 冲过头。
 const CHASE_STEP_MS = 180;
+
+/**
+ * 等板子发套件的节奏（G-717-A）：背包里**根本没有剑**时按 200ms 看一次、最多 10 次（2 秒）。
+ *
+ * <p>背景（真机 2026-11-24）：开局板子还没发套件，模型已经选 `attack`，`ensureSwordInHand()`
+ * 立刻抛 `ITEM_MISSING`，一局里连打 4 条 `[brain] 意图执行失败`，把真正该看的失败淹掉。
+ * 这 2 秒是「还没开始」而不是「执行异常」，所以单独计数、不记失败。
+ */
+export const KIT_WAIT = Object.freeze({ intervalMs: 200, attempts: 10 });
+
 const FACES = Object.freeze({
   up: [0, 1, 0],
   down: [0, -1, 0],
@@ -63,7 +74,7 @@ function requirePosition(value, field) {
 
 export class ActionDispatcher {
   constructor({ bot, restrictionCache = null, maxMoveMs = 5000, profile = null,
-    now = () => Date.now() } = {}) {
+    now = () => Date.now(), kitWait = null, onKitWait = null } = {}) {
     this.bot = bot;
     this.restrictionCache = restrictionCache;
     this.maxMoveMs = maxMoveMs;
@@ -77,6 +88,16 @@ export class ActionDispatcher {
     this.reaction = new ReactionDelay(this.profile);
     this.hold = null;
     this.holdTimer = null;
+    //: 等套件的节奏（默认 200ms × 10 = 2s；测试可缩短）。
+    this.kitWait = {
+      intervalMs: Math.max(1, Number(kitWait && kitWait.intervalMs) || KIT_WAIT.intervalMs),
+      attempts: Math.max(1, Number(kitWait && kitWait.attempts) || KIT_WAIT.attempts),
+    };
+    //: 进入「等套件」的次数 / 2 秒内没等到的次数（后者才是真失败）。
+    this.kitWaits = 0;
+    this.kitWaitGaveUp = 0;
+    //: 通知外层（index.js 用它打「每局第一次」的日志并累加 waitingKit）。
+    this.onKitWait = typeof onKitWait === 'function' ? onKitWait : null;
   }
 
   setBot(bot) {
@@ -101,6 +122,9 @@ export class ActionDispatcher {
       rodReleases: this.rodReleases,
       wtaps: this.wtaps,
       ruleDenials: this.ruleDenials,
+      // G-717-A：等套件的次数（不算失败）/ 2 秒没等到的次数（算真失败）。
+      kitWaits: this.kitWaits,
+      kitWaitGaveUp: this.kitWaitGaveUp,
     };
   }
 
@@ -334,17 +358,25 @@ export class ActionDispatcher {
    *
    * <p>背包读不到（只读封装或测试替身）时不做判定，避免误伤没有 inventory API 的调用方；
    * 真实运行时 mineflayer 一定有 inventory，所以训练路径上这条判定始终生效。
+   *
+   * <p>G-717-A：背包里**根本没有剑**（开局板子还没发套件）不再立刻抛 `ITEM_MISSING`，
+   * 而是等最多 2 秒（200ms × 10）——这段等待由 {@link #waitForKit} 计数，外层不记失败。
    */
   async ensureSwordInHand() {
     const bot = this.bot;
-    const items = bot && bot.inventory && typeof bot.inventory.items === 'function'
-      ? bot.inventory.items() : null;
-    if (!Array.isArray(items)) {
+    const hasSword = this._inventoryHasSword();
+    if (hasSword === null) {
       return;
     }
-    const held = bot.heldItem;
-    if (held && typeof held.name === 'string' && /_sword$/.test(held.name)) {
+    if (isSwordItem(bot.heldItem)) {
       return;
+    }
+    if (!hasSword) {
+      const ready = await this.waitForKit();
+      if (!ready) {
+        throw new ActionError('ITEM_MISSING',
+          `背包里没有剑（等了 ${this.kitWait.attempts * this.kitWait.intervalMs}ms 板子仍未发套件）`);
+      }
     }
     // 每次死亡/传送后 mineflayer 会重开背包窗口，期间 items() 会短暂为空：
     // 立刻判定会误报 ITEM_MISSING（真机 23:48 每杀一次报一条）。给两个短重试窗口。
@@ -363,6 +395,47 @@ export class ActionDispatcher {
         throw error;
       }
     }
+  }
+
+  /** 背包（任意格子）里有没有剑；读不到背包返回 null（调用方不做判定）。 */
+  _inventoryHasSword() {
+    const bot = this.bot;
+    const items = bot && bot.inventory && typeof bot.inventory.items === 'function'
+      ? bot.inventory.items() : null;
+    if (!Array.isArray(items)) {
+      return null;
+    }
+    return items.some((item) => item && /_sword$/.test(String(item.name || '')));
+  }
+
+  /**
+   * 等板子发套件：每 `intervalMs` 看一次背包，最多 `attempts` 次（默认 200ms × 10 = 2s）。
+   *
+   * <p>**期间不抛错**：这是「还没开始」而不是「执行异常」，所以只累加 `kitWaits`；
+   * 只有 2 秒都没等到才由调用方抛 `ITEM_MISSING`（那时才算真失败）。
+   *
+   * @returns {Promise<boolean>} 是否等到剑
+   */
+  async waitForKit() {
+    this.kitWaits += 1;
+    if (this.onKitWait) {
+      try {
+        this.onKitWait({ attempts: this.kitWait.attempts, intervalMs: this.kitWait.intervalMs });
+      } catch (error) {
+        // 通知（打日志/计数）失败不能影响动作本身。
+      }
+    }
+    for (let attempt = 0; attempt < this.kitWait.attempts; attempt += 1) {
+      if (this._inventoryHasSword() === true) {
+        return true;
+      }
+      await sleep(this.kitWait.intervalMs);
+    }
+    if (this._inventoryHasSword() === true) {
+      return true;
+    }
+    this.kitWaitGaveUp += 1;
+    return false;
   }
 
   /**

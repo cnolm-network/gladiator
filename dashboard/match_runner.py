@@ -133,6 +133,76 @@ def parse_stats_line(raw: str) -> Optional[dict]:
     return result if ("health" in result or "name" in result) else None
 
 
+def _board_extras(line: str) -> dict:
+    """读 G-719 追加在状态行末尾的两个字段（``roundReason=`` / ``lastSeconds=``）。
+
+    缺失时给 ``None``，调用方回落到「按时长推断」的老路径——这样服务端还没升级时
+    dashboard 也不会崩。
+    """
+    tokens: dict[str, str] = {}
+    for token in (line or "").split():
+        if "=" in token:
+            key, value = token.split("=", 1)
+            tokens.setdefault(key.lower(), value)
+    seconds: Optional[float] = None
+    raw_seconds = tokens.get("lastseconds")
+    if raw_seconds is not None:
+        try:
+            seconds = float(raw_seconds)
+        except ValueError:
+            seconds = None
+        if seconds is not None and seconds < 0:
+            seconds = None
+    return {
+        "roundReason": _empty_to_none(tokens.get("roundreason")),
+        "lastSeconds": seconds,
+    }
+
+
+def parse_board_frame(raw: str) -> Optional[dict]:
+    """解析 ``/gladiator board frame``：状态 + 双方 stats 合成一行（G-719）。
+
+    契约::
+
+        <board status 行> | stats <玩家> <stats 键值...> | stats <Bot> <stats 键值...>
+
+    返回 ``{"status": {...}, "player": dict|None, "bot": dict|None}``；
+    状态段解析不出来返回 ``None``。某一段是 ``stats <名字> offline`` 时该侧为 ``None``
+    （对局还没把人拉起来、或已经掉线），录制侧据此跳过这一帧。
+    """
+    text = strip_formatting(raw or "")
+    for line in text.splitlines():
+        if "|" not in line:
+            continue
+        segments = [segment.strip() for segment in line.split("|")]
+        status = _parse_board_status_line(segments[0])
+        if status is None:
+            continue
+        status.update(_board_extras(segments[0]))
+        sides: dict[str, Optional[dict]] = {"player": None, "bot": None}
+        for segment in segments[1:]:
+            if not segment.lower().startswith("stats "):
+                continue
+            rest = segment[len("stats "):].strip()
+            name, _, tail = rest.partition(" ")
+            tail = tail.strip()
+            if not tail or tail.lower().startswith("offline"):
+                continue
+            parsed = parse_stats_line(tail)
+            if parsed is None:
+                continue
+            if status.get("player") and name.lower() == str(status["player"]).lower():
+                sides["player"] = parsed
+            elif status.get("bot") and name.lower() == str(status["bot"]).lower():
+                sides["bot"] = parsed
+            elif sides["player"] is None:
+                sides["player"] = parsed
+            elif sides["bot"] is None:
+                sides["bot"] = parsed
+        return {"status": status, "player": sides["player"], "bot": sides["bot"]}
+    return None
+
+
 def parse_board_status(raw: str) -> Optional[dict]:
     """解析 ``/gladiator board status`` 的一行 key=value。
 
@@ -156,6 +226,7 @@ def parse_board_status(raw: str) -> Optional[dict]:
     for line in text.splitlines():
         parsed = _parse_board_status_line(line)
         if parsed is not None:
+            parsed.update(_board_extras(line))
             return parsed
     return None
 
@@ -363,10 +434,15 @@ class BoardTracker:
             ("draw", max(0, new_score["draws"] - int(self.score.get("draws") or 0))),
         )
         created: list[dict] = []
+        # G-719：服务端现在会直接给「上一局为什么结束 / 打了多久」，优先用它；
+        # 老服务端没有这两个字段时回落到按时长推断。
+        round_reason = status.get("roundReason")
+        last_seconds = status.get("lastSeconds")
         for winner, count in deltas:
             for _ in range(count):
                 started = previous_started if not created else self.round_started
-                created.append(self._entry(winner, now, started))
+                created.append(self._entry(winner, now, started,
+                                           reason=round_reason, seconds=last_seconds))
         self.score = new_score
         # 跨局合并采样：比分已记完但轮次号早就变到下一局了（`round_no > len(entries)`），
         # 这时秒表要在**同一次采样**里补上新一局的起点，否则下一局会记成 0 秒。
@@ -374,15 +450,20 @@ class BoardTracker:
             self.round_started = now
         return created
 
-    def _entry(self, winner: str, now: float, started: Optional[float]) -> dict:
-        seconds = 0.0 if started is None else round(max(0.0, now - started), 1)
+    def _entry(self, winner: str, now: float, started: Optional[float], *,
+               reason: Optional[str] = None, seconds: Optional[float] = None) -> dict:
+        # 服务端给了真实秒数就用它（倒计时/等复活不算进局时长），否则退回墙钟。
+        if seconds is not None and seconds > 0:
+            elapsed = round(float(seconds), 1)
+        else:
+            elapsed = 0.0 if started is None else round(max(0.0, now - started), 1)
         entry = {
             "round": len(self.entries) + 1,
             "winner": winner,
-            "reason": _infer_round_reason(winner, seconds, self.round_seconds, self.reason),
-            "seconds": seconds,
+            "reason": reason or _infer_round_reason(winner, elapsed, self.round_seconds, self.reason),
+            "seconds": elapsed,
             # 向后兼容：旧字段 duration 与 seconds 同义（前端表格与既有消费者读它）。
-            "duration": seconds,
+            "duration": elapsed,
         }
         self.entries.append(entry)
         # 一局结束 → 下一局的秒表从下一次采样起算（板子可能已经在倒计时）。
@@ -758,6 +839,7 @@ class MatchRunner:
             "cancel": False,
             "started_runtime_ids": [],
             "frames_file": None,
+            "frames_written": 0,
             "record_dir": None,
             "meta": None,
             "board_stopped": False,
@@ -1023,11 +1105,11 @@ class MatchRunner:
         self._update_meta(match)
 
     def _follow_board(self, match: dict, plan: MatchPlan, conn) -> None:
-        """跟一场板子对局：status 每 500ms 探一次，录制帧每次循环都采。
+        """跟一场板子对局：每轮循环只发**一条** RCON（`gladiator board frame`）。
 
-        为什么分开：`gladiator stats` 在主线程算，一次往返约 50ms（20 TPS 的刻度），
-        一帧要采双方 = ~110ms。把 status 也塞进同一循环，帧密度就退化成 ~3Hz；
-        而 status 只需知道阶段/比分（0.5s 足够）。
+        为什么合并：以前一帧要发 `board status` + 两次 `stats`，单条往返约 50–60ms，
+        一帧 110ms 以上，实测只有 1.5–6Hz，一局 20s 只能采到几十帧。G-719 起服务端把
+        状态与双方 stats 合成一行，一帧一次往返，帧率随循环间隔走（可达 10Hz+）。
         """
         tracker = BoardTracker()
         tracker.round_seconds = float(plan.round_seconds or 0.0)
@@ -1036,44 +1118,52 @@ class MatchRunner:
         previous = {"round": 0, "player": None, "bot": None}
         unparsed = 0
         missing_session = 0
-        next_status_at = 0.0
         status = None
         while True:
             if self._cancelled(match):
                 raise _Cancelled()
             now = self._clock()
-            if now >= next_status_at:
-                raw = self._command(conn, "gladiator board status")
-                parsed = parse_board_status(raw)
-                next_status_at = now + STATUS_PROBE_PERIOD
-                if parsed is None:
+            raw = self._command(conn, "gladiator board frame")
+            frame = parse_board_frame(raw)
+            if frame is None:
+                # 老服务端 / 输出异常：退回单读 status，保证还能跑（只是帧率低）。
+                frame_status = parse_board_status(self._command(conn, "gladiator board status"))
+                if frame_status is None:
                     unparsed += 1
                     if unparsed >= MAX_UNPARSED_STATUS:
                         raise RuntimeError(
-                            "无法解析 /gladiator board status 的输出："
+                            "无法解析 /gladiator board frame 的输出："
                             f"{strip_formatting(raw).strip() or '(空)'}")
                     self._sleep(BOARD_STATUS_PERIOD)
                     continue
-                unparsed = 0
-                if parsed["session"] is None and not tracker.seen_session:
-                    # 刚 start 完的几百毫秒内可能还没进对局，宽限几次再判定结束。
-                    missing_session += 1
-                    if missing_session < SESSION_GRACE:
-                        self._sleep(BOARD_STATUS_PERIOD)
-                        continue
-                self._apply_status(match, plan, tracker, parsed, now)
-                status = parsed
+                frame = {"status": frame_status, "player": None, "bot": None}
+            unparsed = 0
+            parsed = frame["status"]
+            if parsed["session"] is None and not tracker.seen_session:
+                # 刚 start 完的几百毫秒内可能还没进对局，宽限几次再判定结束。
+                missing_session += 1
+                if missing_session < SESSION_GRACE:
+                    self._sleep(BOARD_STATUS_PERIOD)
+                    continue
+            self._apply_status(match, plan, tracker, parsed, now)
+            status = parsed
             if plan.record and tracker.round_no >= 1:
-                player = self._stats(conn, plan.player)
-                bot = self._stats(conn, plan.bot)
-                same_round = tracker.round_no == previous["round"]
-                rewards = frame_rewards(
-                    previous["player"] if same_round else None,
-                    previous["bot"] if same_round else None,
-                    player, bot)
-                self._write_frame(match, tracker.round_no, tracker.round_elapsed(self._clock()),
-                                  player, bot, rewards)
-                previous = {"round": tracker.round_no, "player": player, "bot": bot}
+                # frame 里已经带了双方 stats；只有老服务端（没有 board frame）才回退成单读。
+                player = frame.get("player")
+                bot = frame.get("bot")
+                if player is None:
+                    player = self._stats(conn, plan.player)
+                if bot is None:
+                    bot = self._stats(conn, plan.bot)
+                if player is not None and bot is not None:
+                    same_round = tracker.round_no == previous["round"]
+                    rewards = frame_rewards(
+                        previous["player"] if same_round else None,
+                        previous["bot"] if same_round else None,
+                        player, bot)
+                    self._write_frame(match, tracker.round_no,
+                                      tracker.round_elapsed(self._clock()), player, bot, rewards)
+                    previous = {"round": tracker.round_no, "player": player, "bot": bot}
             if status is not None and board_finished(status):
                 # 面板/板子已经自己收尾：stop() 不必再发一次 board stop。
                 with self._lock:
@@ -1160,7 +1250,8 @@ class MatchRunner:
             "board": BOARD_ID,
             # 板子还没开局：session 在 `_board_start` 之后补写（见 `_update_meta`）。
             "boardSession": None,
-            "frameHz": round(1.0 / FRAME_PERIOD, 2),
+            # 录制帧率是**实测**的（结束写 summary 时回填），这里只是配置里的采样周期。
+            "framePeriod": FRAME_PERIOD,
         }
         try:
             handle = (directory / "frames.jsonl").open("a", encoding="utf-8")
@@ -1194,6 +1285,10 @@ class MatchRunner:
         handle = match.get("frames_file")
         if handle is None:
             return
+        if elapsed <= 0 and match.get("frames_written", 0) > 0:
+            # 对局结束后 tracker 会复位，最后一次循环可能带着 t=0 再写一帧；
+            # 这种帧会把导入侧的「帧间隔」算成负数，直接丢掉。
+            return
         frame = {
             "t": round(float(elapsed), 2),
             "round": round_no,
@@ -1205,6 +1300,7 @@ class MatchRunner:
         try:
             handle.write(json.dumps(frame, ensure_ascii=False) + "\n")
             handle.flush()
+            match["frames_written"] = match.get("frames_written", 0) + 1
         except OSError:
             with self._lock:
                 match["frames_file"] = None
@@ -1234,6 +1330,13 @@ class MatchRunner:
             "score": dict(match["score"]),
             "rounds": [dict(item) for item in match["rounds"]],
             "plan": match["plan"].to_dict(),
+            # 实测帧率 / 帧数：写进 summary 方便判断「录制是否够密」。
+            "frames": match.get("frames_written", 0),
+            "frameHz": round(
+                match.get("frames_written", 0)
+                / max(1e-6, (match["finished_at"] or time.time()) - match["started_at"]),
+                2,
+            ),
         }
         try:
             _write_json(Path(directory) / "summary.json", summary)

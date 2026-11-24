@@ -614,3 +614,82 @@ def action_mask(observation: dict, item_table: "Any | None" = None) -> dict[str,
     # --- sprint_reset：恒定全开（见 docstring；不引入物品条件） ---
     mask["sprint_reset"] = [True] * ACTION_HEADS_V2["sprint_reset"]
     return mask
+
+
+# --- v1 宏动作 → v2 十头意图（G-720） ----------------------------------------
+#
+# 为什么需要：真人录像/旧日志里只有「一帧一个宏动作」的标签（``ACTION_NAMES`` 的
+# 下标），而 v2 模型吃的是十个头。没有这层映射时 ``import_human_match.py`` 只能训 v1，
+# 现役最强的 v2 模型（``v2-v4-dagger3`` 等）**一口真人数据都吃不下**（会抛
+# ``ValueError: 第 0 帧 v2 动作应有 10 个头…收到 1 个``）。
+#
+# 口径：这是**有损**的标签翻译，只表达「这一帧想干什么」，不表达「怎么走位到那一步」。
+# - 宏动作里的 ``approach``/``strafe``/``retreat`` 只有方向，没有「离多远」，所以
+#   ``move`` 头直接照抄方向、``look`` 头给中性（0°, 0°）；
+# - ``attack`` 宏动作默认带前压（v1 的 ``decode_action`` 就是这么做的），故 ``move=forward``
+#   且 ``sprint=True``；``sprint_reset`` 一律 ``none``——真人那一刻按没按 W 我们看不到，
+#   猜一个反而会教坏模型（知识库 §2.5 的结论是「KB 由命中帧是否疾跑决定」）；
+# - ``use_rod``/``eat_gapple``/``block`` 都映射到 ``use`` 头（单击/按住），
+#   具体用哪个物品由运行时按 ``slot`` + 能力表决定；
+# - ``switch_sword`` 在十个头里没有对应维度（切物品是 ``slot`` 头 + 能力表），
+#   这里退回 ``move=idle`` 并保持 ``slot=0``，只保证「不产生攻击」。
+#
+# 中性取值：``look_yaw``/``look_pitch`` 里 0.0 度的下标由元组 ``index`` 查得，不写死数字。
+
+_NEUTRAL_YAW = LOOK_YAW_V2.index(0.0)
+_NEUTRAL_PITCH = LOOK_PITCH_V2.index(0.0)
+_MOVE_FORWARD = MOVE_VALUES_V2.index("forward")
+_MOVE_BACK = MOVE_VALUES_V2.index("back")
+_MOVE_LEFT = MOVE_VALUES_V2.index("left")
+_MOVE_RIGHT = MOVE_VALUES_V2.index("right")
+_MOVE_IDLE = MOVE_VALUES_V2.index("idle")
+_USE_NONE = USE_VALUES_V2.index(None)
+_USE_CLICK = USE_VALUES_V2.index("click")
+_USE_HOLD = USE_VALUES_V2.index("hold")
+_RESET_NONE = SPRINT_RESET_VALUES_V2.index("none")
+
+
+def _intent(move: int = _MOVE_IDLE, *, yaw: int = _NEUTRAL_YAW,
+            pitch: int = _NEUTRAL_PITCH, attack: int = 0, use: int = _USE_NONE,
+            jump: int = 0, sneak: int = 0, sprint: int = 0, slot: int = 0,
+            reset: int = _RESET_NONE) -> list[int]:
+    """按 ``ACTION_HEADS_V2`` 的声明顺序拼一个十头向量（用具名常量，不写死魔法数）。"""
+    return [move, yaw, pitch, attack, use, jump, sneak, sprint, slot, reset]
+
+
+#: v1 宏动作下标 → v2 十头向量。键是 ``ACTION_NAMES`` 的名字，值是 10 个下标。
+MACRO_TO_INTENT: dict[str, tuple[int, ...]] = {
+    "idle": tuple(_intent()),
+    "approach": tuple(_intent(_MOVE_FORWARD, sprint=1)),
+    "attack": tuple(_intent(_MOVE_FORWARD, attack=1, sprint=1)),
+    "strafe_left": tuple(_intent(_MOVE_LEFT, sprint=1)),
+    "strafe_right": tuple(_intent(_MOVE_RIGHT, sprint=1)),
+    "retreat": tuple(_intent(_MOVE_BACK)),
+    "jump": tuple(_intent(_MOVE_FORWARD, jump=1, sprint=1)),
+    "use_rod": tuple(_intent(use=_USE_CLICK)),
+    "eat_gapple": tuple(_intent(use=_USE_HOLD)),
+    "block": tuple(_intent(use=_USE_HOLD)),
+    "switch_sword": tuple(_intent()),
+}
+
+
+def macro_to_intent(macro_index: "int | str") -> tuple[int, ...]:
+    """把 v1 宏动作（下标或名字）翻成 v2 的十头下标元组。
+
+    未登记的宏动作按 ``idle`` 处理并**不静默吞掉**：调用方（导入脚本）会把
+    ``ACTION_NAMES[index]`` 记进报告，所以真出现新宏动作时能在报告里看到
+    ``mapped="idle"`` 而不是悄悄变成待机。
+    """
+    if isinstance(macro_index, str):
+        name = macro_index
+    else:
+        index = int(macro_index)
+        if index < 0 or index >= len(ACTION_NAMES):
+            raise ValueError(f"宏动作下标越界: {index}（0..{len(ACTION_NAMES) - 1}）")
+        name = ACTION_NAMES[index]
+    return MACRO_TO_INTENT.get(name, MACRO_TO_INTENT["idle"])
+
+
+def macro_to_intent_array(macro_index: "int | str") -> "np.ndarray":
+    """:func:`macro_to_intent` 的 ndarray 版本（``dtype=int64``，方便整列堆叠）。"""
+    return np.asarray(macro_to_intent(macro_index), dtype=np.int64)

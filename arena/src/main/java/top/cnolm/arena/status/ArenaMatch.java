@@ -270,6 +270,14 @@ public class ArenaMatch<T extends GamingStatus, V extends MatchStatus> {
         playerDataMap.forEach((uuid, data) -> runnable.call(PlayerResolver.get(uuid)));
     }
 
+    public void forEachAlivePlayer(PRunnable runnable) {
+        playerDataMap.forEach((uuid, data) -> {
+            if (!eliminated.contains(uuid)) {
+                runnable.call(PlayerResolver.get(uuid));
+            }
+        });
+    }
+
     public void forEachPlayer(URunnable runnable) {
         playerDataMap.forEach((uuid, data) -> runnable.run(uuid));
     }

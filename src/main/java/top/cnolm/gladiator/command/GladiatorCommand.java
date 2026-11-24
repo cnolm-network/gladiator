@@ -33,6 +33,9 @@ import java.util.Locale;
 /** 管理命令：只读取 core 状态，不承载游戏逻辑。 */
 public final class GladiatorCommand implements CommandExecutor {
 
+    /** {@code board frame} 的三段分隔符（一行一帧，dashboard 按它切开，G-719）。 */
+    static final String FRAME_SEPARATOR = " | ";
+
     private final GladiatorMain plugin;
 
     public GladiatorCommand(GladiatorMain plugin) {
@@ -106,7 +109,7 @@ public final class GladiatorCommand implements CommandExecutor {
                 sender.sendMessage("[Gladiator] 用法: /" + label
                         + " <status|spawn <username>|train <username>|list|game|analyze [session] [windowSec]"
                         + "|pvp <x> <y> <z>|stats <player>|respawn <player>|spectate [bot]|unspectate"
-                        + "|board <status|start <boardId> <player> <bot> <rounds> <seconds> [6 个坐标] [kit=<id>]|stop>|reload>");
+                        + "|board <status|frame|start <boardId> <player> <bot> <rounds> <seconds> [6 个坐标] [kit=<id>]|stop>|reload>");
                 return true;
         }
     }
@@ -461,10 +464,13 @@ public final class GladiatorCommand implements CommandExecutor {
     }
 
     /**
-     * `/gladiator board <status|start|stop>`：板子对局的观察与控制。
+     * `/gladiator board <status|frame|start|stop>`：板子对局的观察与控制。
      *
      * <p>为什么放在 Gladiator 而不是让每块板子自己开命令：dashboard 只认一条命令通道，
      * 而「当前是哪场对局」是注册表的状态；板子自己的命令只管自己的规则。
+     *
+     * <p>{@code frame}（G-719）是 {@code status} 的「一次往返版」：多带双方 stats，供 dashboard
+     * 每帧只发一条 RCON。
      */
     private void handleBoard(CommandSender sender, String label, String[] args) {
         top.cnolm.gladiator.core.board.BoardRegistryImpl registry = plugin.getBoardRegistry();
@@ -476,6 +482,12 @@ public final class GladiatorCommand implements CommandExecutor {
         if ("status".equals(action)) {
             sender.sendMessage("[Gladiator] "
                     + boardStatusLine(registry.active(), registry.lastFinishedSession()));
+            return;
+        }
+        if ("frame".equals(action)) {
+            // G-719：状态 + 双方 stats 合成一行，dashboard 一帧只发一次 RCON。
+            sender.sendMessage("[Gladiator] "
+                    + boardFrameLine(registry.active(), registry.lastFinishedSession()));
             return;
         }
         if ("stop".equals(action)) {
@@ -490,7 +502,7 @@ public final class GladiatorCommand implements CommandExecutor {
             return;
         }
         if (!"start".equals(action)) {
-            sender.sendMessage("[Gladiator] 用法: /" + label + " board <status|start|stop>");
+            sender.sendMessage("[Gladiator] 用法: /" + label + " board <status|frame|start|stop>");
             return;
         }
         RoundSpec spec;
@@ -519,12 +531,17 @@ public final class GladiatorCommand implements CommandExecutor {
      *
      * <p>优先报进行中的对局；没有时退回「最近一场已结束」，这样外部在结束瞬间仍能读到最终比分
      * （否则会读到 {@code session=none} 而丢掉胜负）。抽成静态便于单测。
+     *
+     * <p>G-719 在**末尾**追加 {@code roundReason=}（最近一局的判定原因）与
+     * {@code lastSeconds=}（最近一局时长，一位小数；无局时 {@code -1.0}）——只追加，
+     * 既有字段顺序与语义一字不动，旧解析器按前缀取键不受影响。
      */
     static String boardStatusLine(BoardContext active, BoardContext lastFinished) {
         BoardContext session = active != null ? active : lastFinished;
         if (session == null) {
             return "session=none board=- round=0 rounds=0 phase=idle score=0:0 draws=0"
-                    + " reason=none player=- bot=-";
+                    + " reason=none player=- bot=-"
+                    + " roundReason=none lastSeconds=" + formatSeconds(-1.0D);
         }
         MatchOutcome summary = session.summary();
         RoundSpec spec = session.spec();
@@ -540,7 +557,70 @@ public final class GladiatorCommand implements CommandExecutor {
                 + " draws=" + summary.getDraws()
                 + " reason=" + (ended ? session.lastReason() : "running")
                 + " player=" + safe(spec.extra("player", "-"))
-                + " bot=" + safe(spec.extra("bot", "-"));
+                + " bot=" + safe(spec.extra("bot", "-"))
+                + " roundReason=" + safe(session.roundReason())
+                + " lastSeconds=" + formatSeconds(session.lastSeconds());
+    }
+
+    /** 秒数统一一位小数（{@code Locale.ROOT}：不能用逗号小数点，dashboard 按 "." 解析）。 */
+    static String formatSeconds(double seconds) {
+        return String.format(Locale.ROOT, "%.1f", seconds);
+    }
+
+    /**
+     * `/gladiator board frame`：**一帧一次往返**（G-719）。
+     *
+     * <p>为什么要有：dashboard 每帧原本要发三条 RCON（{@code board status} + 两条
+     * {@code stats}），每条往返约 56ms，实测只跑到 5–6Hz。这条命令把三段合成一行，
+     * 一次往返即可完成「同步比分 + 采样双方状态」。
+     *
+     * <p>输出（单行，{@code " | "} 分段）：
+     * <pre>{@code <status 行> | stats <玩家名> <stats 行> | stats <Bot名> <stats 行>}</pre>
+     * 状态段与 {@link #boardStatusLine} **逐字节一致**；stats 段复用 {@code stats} 子命令的行格式。
+     * 会话不存在（名字未知）或参与者不在线时，该段写作 {@code stats <名字> offline}，
+     * 不报错也不省略段（dashboard 可以按固定三段解析）。
+     */
+    static String boardFrameLine(BoardContext active, BoardContext lastFinished) {
+        String statusLine = boardStatusLine(active, lastFinished);
+        BoardContext session = active != null ? active : lastFinished;
+        String playerName = participantName(session, "player");
+        String botName = participantName(session, "bot");
+        return boardFrameLine(statusLine, playerName, onlineStatsOrNull(playerName),
+                botName, onlineStatsOrNull(botName));
+    }
+
+    /**
+     * 纯拼接版本（不碰 Bukkit，单测直接用）：{@code statsLine} 传 {@code null} 表示离线。
+     */
+    static String boardFrameLine(String statusLine, String playerName, String playerStats,
+                                 String botName, String botStats) {
+        return statusLine
+                + FRAME_SEPARATOR + frameStatsSegment(playerName, playerStats)
+                + FRAME_SEPARATOR + frameStatsSegment(botName, botStats);
+    }
+
+    /** 从会话参数里取参与者名；无会话/没填 → 空串（段里显示 {@code -}）。 */
+    private static String participantName(BoardContext session, String key) {
+        if (session == null || session.spec() == null) {
+            return "";
+        }
+        String name = session.spec().extra(key, "");
+        return name == null ? "" : name.trim();
+    }
+
+    /** 在线就取 {@code stats} 子命令那一行，离线/没服务端返回 null（段里写 offline）。 */
+    private static String onlineStatsOrNull(String name) {
+        if (name.isEmpty()) {
+            return null;
+        }
+        Player target = findOnlinePlayer(name);
+        return target == null ? null : statsResponse(target);
+    }
+
+    private static String frameStatsSegment(String name, String statsLine) {
+        String who = name == null || name.isEmpty() ? "-" : name;
+        String body = statsLine == null || statsLine.isEmpty() ? "offline" : statsLine;
+        return "stats " + who + " " + body;
     }
 
     /**

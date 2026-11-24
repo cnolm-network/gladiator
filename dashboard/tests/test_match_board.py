@@ -27,11 +27,93 @@ from match_runner import (  # noqa: E402
     board_start_command,
     frame_rewards,
     map_board_phase,
+    parse_board_frame,
     parse_board_status,
 )
 
 IDLE_LINE = ("session=none board= round=0 rounds=0 phase=idle score=0:0 draws=0"
              " reason=none player= bot=")
+
+
+class BoardFrameParseTests(unittest.TestCase):
+    """`/gladiator board frame`：状态 + 双方 stats 一行（G-719）。"""
+
+    STATS_P1 = ("name=Glad_P1 health=20.0 food=20 saturation=5.0 armor=20.0 x=-2178.0"
+                " y=4.0 z=-438.0 yaw=0.0 pitch=0.0 sprinting=false blocking=false"
+                " onGround=true hurt=0.0 dead=false effects=-")
+    STATS_B1 = ("name=Glad_B1 health=12.0 food=20 saturation=5.0 armor=8.0 x=-2172.5"
+                " y=4.0 z=-438.0 yaw=90.0 pitch=10.0 sprinting=true blocking=false"
+                " onGround=true hurt=2.0 dead=false effects=DAMAGE_RESISTANCE:5")
+
+    def _frame(self, status: str) -> str:
+        return (status + " | stats Glad_P1 " + self.STATS_P1
+                + " | stats Glad_B1 " + self.STATS_B1)
+
+    def test_parses_status_and_both_sides(self) -> None:
+        status = ("session=s1 board=flat-1v1 round=2 rounds=3 phase=fighting score=1:0"
+                  " draws=0 reason=running player=Glad_P1 bot=Glad_B1"
+                  " roundReason=kill lastSeconds=14.2")
+        frame = parse_board_frame(self._frame(status))
+        self.assertIsNotNone(frame)
+        assert frame is not None
+        self.assertEqual(frame["status"]["session"], "s1")
+        self.assertEqual(frame["status"]["round"], 2)
+        self.assertEqual(frame["status"]["roundReason"], "kill")
+        self.assertAlmostEqual(frame["status"]["lastSeconds"], 14.2)
+        self.assertEqual(frame["player"]["health"], 20.0)
+        self.assertEqual(frame["bot"]["health"], 12.0)
+        self.assertEqual(frame["bot"]["armor"], 8.0)
+
+    def test_offline_side_becomes_none(self) -> None:
+        status = ("session=s1 board=flat-1v1 round=1 rounds=1 phase=fighting score=0:0"
+                  " draws=0 reason=running player=Glad_P1 bot=Glad_B1")
+        raw = status + " | stats Glad_P1 " + self.STATS_P1 + " | stats Glad_B1 offline"
+        frame = parse_board_frame(raw)
+        assert frame is not None
+        self.assertIsNotNone(frame["player"])
+        self.assertIsNone(frame["bot"])
+
+    def test_without_pipes_returns_none(self) -> None:
+        self.assertIsNone(parse_board_frame(IDLE_LINE))
+
+    def test_colour_codes_and_noise(self) -> None:
+        status = ("\u00a7a[Gladiator] session=s2 board=flat-1v1 round=1 rounds=2"
+                  " phase=countdown score=0:0 draws=0 reason=running"
+                  " player=Glad_P1 bot=Glad_B1 roundReason=none lastSeconds=-1.0")
+        raw = status + " | stats Glad_P1 " + self.STATS_P1 + " | stats Glad_B1 offline"
+        frame = parse_board_frame(raw)
+        assert frame is not None
+        self.assertEqual(frame["status"]["session"], "s2")
+        self.assertIsNone(frame["status"]["roundReason"])
+        self.assertIsNone(frame["status"]["lastSeconds"])
+
+    def test_tracker_prefers_server_seconds_and_reason(self) -> None:
+        tracker = BoardTracker()
+        tracker.round_seconds = 20.0
+        tracker.update({"session": "s1", "round": 1, "rounds": 2, "phase": "fighting",
+                        "score": {"player": 0, "bot": 0, "draws": 0},
+                        "reason": "running", "roundReason": "none", "lastSeconds": None}, 0.0)
+        entries = tracker.update({"session": "s1", "round": 1, "rounds": 2, "phase": "fighting",
+                                  "score": {"player": 1, "bot": 0, "draws": 0},
+                                  "reason": "running", "roundReason": "kill",
+                                  "lastSeconds": 14.2}, 100.0)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["reason"], "kill")
+        self.assertAlmostEqual(entries[0]["seconds"], 14.2)
+
+    def test_tracker_falls_back_when_server_silent(self) -> None:
+        tracker = BoardTracker()
+        tracker.round_seconds = 20.0
+        tracker.update({"session": "s1", "round": 1, "rounds": 2, "phase": "fighting",
+                        "score": {"player": 0, "bot": 0, "draws": 0},
+                        "reason": "running", "roundReason": None, "lastSeconds": None}, 0.0)
+        entries = tracker.update({"session": "s1", "round": 1, "rounds": 2, "phase": "fighting",
+                                  "score": {"player": 0, "bot": 0, "draws": 1},
+                                  "reason": "running", "roundReason": None,
+                                  "lastSeconds": None}, 20.5)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["reason"], "timeout")
+        self.assertAlmostEqual(entries[0]["seconds"], 20.5)
 
 
 class BoardStatusParseTests(unittest.TestCase):

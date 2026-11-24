@@ -2,7 +2,6 @@ package top.cnolm.arena;
 
 import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
-import org.bukkit.Material;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -10,13 +9,12 @@ import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
-import org.bukkit.inventory.ItemStack;
-import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.scheduler.BukkitRunnable;
 import top.cnolm.arena.event.ArenaEliminateEvent;
 import top.cnolm.arena.event.ArenaKillEvent;
 import top.cnolm.arena.event.ArenaMatchEndEvent;
+import top.cnolm.arena.simplify.Recorder;
 import top.cnolm.arena.status.*;
 
 import java.util.Map;
@@ -31,19 +29,21 @@ public class FlatMatchManager implements Listener {
     private final ArenaMatch<GamingStatusImpl, MatchStatusImpl> match;
     private final String kitId;
     private final int shieldSeconds;
+    private final Recorder recorder;
     private static final int COUNTDOWN_TIME = 5;
     private static final boolean ALLOW_MOVE_IN_COUNTDOWN = false;
     private static final Map<UUID, FlatMatchManager> active = new ConcurrentHashMap<>();
 
     public FlatMatchManager(ArenaTeam t1, ArenaTeam t2) {
-        this(t1, t2, ArenaKits.CLASSIC, 0);
+        this(t1, t2, ArenaKits.CLASSIC, 0, new Recorder(System::currentTimeMillis));
     }
 
     /**
      * @param kitId         套件（未知值回退 classic 并告警）
      * @param shieldSeconds 倒计时免伤秒数（0 = 不免伤）
+     * @param recorder      录像记录器
      */
-    public FlatMatchManager(ArenaTeam t1, ArenaTeam t2, String kitId, int shieldSeconds) {
+    public FlatMatchManager(ArenaTeam t1, ArenaTeam t2, String kitId, int shieldSeconds, Recorder recorder) {
         this.match = new ArenaMatch<>(GamingStatusImpl.class, MatchStatusImpl.class);
         String normalized = ArenaKits.normalize(kitId);
         if (normalized == null) {
@@ -52,6 +52,8 @@ public class FlatMatchManager implements Listener {
         }
         this.kitId = normalized;
         this.shieldSeconds = Math.max(0, shieldSeconds);
+        this.recorder = recorder;
+
         startMatch(t1, t2);
     }
 

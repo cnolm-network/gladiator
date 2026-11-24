@@ -45,7 +45,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np  # noqa: E402
 
-from gladiator_env.spaces import ACTION_NAMES, OBS_DIM, encode_observation  # noqa: E402
+from gladiator_env.spaces import (ACTION_NAMES, OBS_DIM, encode_observation,  # noqa: E402
+                                 macro_to_intent)
 
 TRAINING_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ARTIFACTS = TRAINING_ROOT / "artifacts"
@@ -113,6 +114,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--win-bonus", type=float, default=0.0,
                         help="局末胜局额外加进 rewards 的量（默认 0 = 只用血量差；"
                              "想让 AWR 更看重「赢」可给正数）")
+    # --- G-720：目标动作空间（v1 宏动作 / v2 十头） ---
+    parser.add_argument("--target-action-space", choices=["auto", "v1", "v2"], default="auto",
+                        help="数据集的动作空间：auto = 跟 --base-model 走（无模型则 v1）；"
+                             "v2 会把宏动作有损翻译成十头（见 macro_to_intent）")
     return parser.parse_args(argv)
 
 
@@ -193,7 +198,7 @@ def compose_awr_weights(dataset: dict, policy, *, temperature: float,
             "数据集里没有 rewards，AWR 无从计算（A = -V，负优势会被全部置 0，"
             "等于没加权）。要么让录制侧带上单步回报，要么去掉 --awr-strict 接受"
             "--weighting contact 的效果。")
-    samples = [(dataset["obs"][i], int(dataset["actions"][i]), 0.0)
+    samples = [(dataset["obs"][i], _action_label(dataset["actions"][i]), 0.0)
                for i in range(len(base))]
     awr = advantage_weights(
         policy, samples,
@@ -365,8 +370,15 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
                   win_weight: float = WIN_WEIGHT, loss_weight: float = LOSS_WEIGHT,
                   draw_weight: float = DRAW_WEIGHT, contact_range: float = CONTACT_RANGE,
                   contact_weight: float = CONTACT_WEIGHT,
-                  far_weight: float = FAR_WEIGHT, win_bonus: float = 0.0) -> dict:
+                  far_weight: float = FAR_WEIGHT, win_bonus: float = 0.0,
+                  action_space: str = "v1") -> dict:
     """返回 ``{"obs","actions","times","rounds","weights","rewards"}``（obs 为 ``OBS_DIM`` 维）。
+
+    ``actions`` 的形状取决于 ``action_space``：
+
+    - ``"v1"``（默认）：``(N,)`` 的宏动作下标（``ACTION_NAMES``）；
+    - ``"v2"``：``(N, 10)`` 的十头下标，由 :func:`gladiator_env.spaces.macro_to_intent`
+      从宏动作**有损翻译**而来（见该函数的注释；只表达「这一帧想干什么」）。
 
     ``weights`` 是 (a)(b) 两步择优的结果：``局结果权重 × 接触窗口权重``。
     全部参数取默认值时，赢局接触帧为 1.0、输局远处帧为 0.06，权重并未丢弃任何样本。
@@ -377,8 +389,15 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
     每步 ``(对手掉血 - 自己掉血)``，局末再加 ``win_bonus``（仅当该局赢，默认 0）。
     它给 AWR 一个 ``A = R - V(s)`` 的 R；没有它时 AWR 只能退化成 ``A = -V``。
     """
+    from gladiator_env.spaces import MULTI_DISCRETE_V2, ACTION_HEADS_V2
+
+    mode = str(action_space or "v1").strip().lower()
+    if mode not in ("v1", "v2"):
+        raise ValueError(f"action_space 只能是 v1 / v2，收到 {action_space!r}")
+
     observations: list[np.ndarray] = []
     actions: list[int] = []
+    intents: list[tuple[int, ...]] = []
     times: list[float] = []
     rounds: list[int] = []
     weights: list[float] = []
@@ -403,6 +422,8 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
         observations.append(_observation(frame, previous, player_name, bot_name,
                                          step_fraction, since_attack, reach))
         actions.append(int(action))
+        if mode == "v2":
+            intents.append(macro_to_intent(int(action)))
         times.append(t)
         round_number = int(_num(frame.get("round"), 1))
         rounds.append(round_number)
@@ -431,17 +452,33 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
         previous = frame
 
     obs = np.asarray(observations, dtype=np.float32) if observations else np.zeros((0, OBS_DIM), np.float32)
+    if mode == "v2":
+        action_array = (np.asarray(intents, dtype=np.int64) if intents
+                        else np.zeros((0, len(MULTI_DISCRETE_V2)), np.int64))
+    else:
+        action_array = np.asarray(actions, dtype=np.int64)
     return {
         "obs": obs,
-        "actions": np.asarray(actions, dtype=np.int64),
+        "actions": action_array,
         "times": np.asarray(times, dtype=np.float32),
         "rounds": np.asarray(rounds, dtype=np.int64),
         "weights": np.asarray(weights, dtype=np.float32),
         "rewards": np.asarray(rewards, dtype=np.float32),
+        "actionSpace": mode,
+        "headSizes": list(ACTION_HEADS_V2.values()) if mode == "v2" else [],
+        "macroActions": np.asarray(actions, dtype=np.int64),
     }
 
 
 # --- BC ---------------------------------------------------------------------
+
+def _action_label(value: Any) -> Any:
+    """v1 标签是动作号（int），v2 标签是十头元组；``behavior_clone`` 自己按策略分流。"""
+    array = np.asarray(value)
+    if array.ndim == 0:
+        return int(array)
+    return tuple(int(item) for item in array.reshape(-1))
+
 
 def run_bc(dataset: dict, *, base_model: Optional[str], epochs: int,
            run_dir: Optional[Path], meta: dict, seed: int = 0,
@@ -450,8 +487,11 @@ def run_bc(dataset: dict, *, base_model: Optional[str], epochs: int,
     from gladiator_train.demos import behavior_clone
     from gladiator_train.policy import Policy
 
-    samples = [(dataset["obs"][i], int(dataset["actions"][i]), 0.0)
-               for i in range(len(dataset["actions"]))]
+    actions = dataset["actions"]
+    # v2 的样本第三字段是**权重**（不是 v1 的回报），必须给 1.0，否则整批样本权重为 0。
+    default_weight = 0.0
+    samples = [(dataset["obs"][i], _action_label(actions[i]), default_weight)
+               for i in range(len(actions))]
     weight_list = dataset.get("weights")
     if weight_list is not None and len(weight_list) != len(samples):
         return {"skipped": True,
@@ -473,6 +513,13 @@ def run_bc(dataset: dict, *, base_model: Optional[str], epochs: int,
                     "reason": f"模型 obsDim={policy.obs_dim} 与数据集 {OBS_DIM} 不一致"}
     else:
         policy = Policy(obs_dim=OBS_DIM, n_actions=len(ACTION_NAMES), hidden=64, seed=seed)
+
+    if getattr(policy, "is_v2", False):
+        # v2 把第三字段当权重用（v1 当回报且不使用），统一改成 1.0 再交给 behavior_clone。
+        samples = [(obs, label, 1.0) for obs, label, _ in samples]
+        if dataset.get("actionSpace") != "v2":
+            return {"skipped": True,
+                    "reason": "起点是 v2 模型，但数据集动作不是 v2（加 --target-action-space v2）"}
 
     result = behavior_clone(policy, samples, epochs=max(1, int(epochs)), seed=seed,
                             weights=None if weight_list is None else list(weight_list))
@@ -501,6 +548,22 @@ def run_bc(dataset: dict, *, base_model: Optional[str], epochs: int,
     return report
 
 
+def _resolve_action_space(target: str, base_model: Optional[str]) -> str:
+    """``--target-action-space auto`` 时按起点模型判 v1 / v2（无模型按 v1）。"""
+    choice = (target or "auto").strip().lower()
+    if choice in ("v1", "v2"):
+        return choice
+    if not base_model:
+        return "v1"
+    try:
+        from gladiator_train.model_io import load_model
+
+        return load_model(base_model, obs_dim=OBS_DIM).action_space
+    except (OSError, ValueError):
+        # 模型读不出来时不要在这里报错：后面 run_bc / AWR 会给更具体的失败原因。
+        return "v1"
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     record_dir = Path(args.record_dir).resolve()
@@ -522,6 +585,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     bot_name = str(plan.get("bot") or "bot")
     round_seconds = float(plan.get("roundSeconds") or 120)
 
+    action_space = _resolve_action_space(args.target_action_space, args.base_model)
+
     dataset = build_dataset(
         frames, player_name=player_name, bot_name=bot_name, round_seconds=round_seconds,
         winners=load_round_winners(record_dir),
@@ -531,6 +596,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         # round 模式只要 (a)：把接触窗口关掉（远/近都按 1.0），不另写一条权重路径。
         far_weight=1.0 if args.weighting == "round" else args.far_weight,
         win_bonus=args.win_bonus,
+        action_space=action_space,
     )
     if args.no_prefer_wins:
         dataset["weights"] = np.ones_like(dataset["weights"])
@@ -582,7 +648,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                   file=sys.stderr)
     out_path = Path(args.out) if args.out else record_dir / "dataset.npz"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    counts = {ACTION_NAMES[index]: int((dataset["actions"] == index).sum())
+    macro = dataset.get("macroActions")
+    if macro is None:
+        macro = dataset["actions"]
+    counts = {ACTION_NAMES[index]: int((macro == index).sum())
               for index in range(len(ACTION_NAMES))}
     np.savez(
         out_path,
@@ -592,6 +661,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         rounds=dataset["rounds"],
         weights=dataset["weights"],
         rewards=dataset["rewards"],
+        macroActions=np.asarray(macro, dtype=np.int64),
         meta=np.array(json.dumps({
             "schema": "gladiator.human-match-dataset/v1",
             "recordDir": str(record_dir),
@@ -600,6 +670,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             "frames": len(frames),
             "samples": int(len(dataset["actions"])),
             "obsDim": OBS_DIM,
+            "actionSpace": action_space,
+            "headSizes": list(dataset.get("headSizes") or []),
             "actionNames": list(ACTION_NAMES),
             "labelRules": "见 import_human_match.py 模块 docstring",
             "preferWins": not args.no_prefer_wins,

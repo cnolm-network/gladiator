@@ -59,6 +59,67 @@ public interface BoardContext {
      */
     void endRound(RoundOutcome outcome);
 
+    /**
+     * 结束当前局，并显式带上本局实际时长（秒）。{@code seconds < 0}（或 {@code NaN}）表示
+     * 板子自己也不知道（例如整局靠事件驱动的板子），此时与 {@link #endRound(RoundOutcome)}
+     * 完全等价：Gladiator 用墙钟估算。
+     *
+     * <p>为什么要这个重载：板子才知道「开打时刻」——它可能在倒计时、等待双方复活之后才真正
+     * 开打，墙钟会把准备时间也算进局时长（G-719）。外部（dashboard）读
+     * {@link #lastSeconds()} 拿到的就是这个数。
+     *
+     * <p>默认实现忽略秒数并退化为单参版本：旧板子一行都不用改。
+     */
+    default void endRound(RoundOutcome outcome, double seconds) {
+        endRound(outcome);
+    }
+
+    /**
+     * 最近一局的判定原因（板子传给 {@link RoundOutcome#getReason()} 的原文），
+     * 还没有打过任何一局时返回 {@code "none"}。
+     *
+     * <p>为什么单独给一个 getter：{@link #summary()} 里的 reason 是**会话级**的（如
+     * {@code rounds-finished}），只有这个才是「上一局为什么结束」（如 {@code kill}/{@code timeout}），
+     * dashboard 的逐局表格要用它。
+     */
+    default String roundReason() {
+        return "none";
+    }
+
+    /**
+     * 最近一局的时长（秒，可能带小数）；还没有打过任何一局时返回 {@code -1}。
+     *
+     * @see #endRound(RoundOutcome, double)
+     */
+    default double lastSeconds() {
+        return -1.0D;
+    }
+
+    /**
+     * 秒数归一（G-719 纯函数，便于单测）：板子给负数/NaN 时退化成墙钟估算。
+     *
+     * @param seconds            板子上报的局时长；{@code <0}/{@code NaN} = 未知
+     * @param roundStartedAtMs   本局开始时的毫秒时间戳（Gladiator 自己记的）
+     * @param nowMs              当前毫秒时间戳
+     */
+    static double resolveRoundSeconds(double seconds, long roundStartedAtMs, long nowMs) {
+        if (!Double.isNaN(seconds) && seconds >= 0.0D) {
+            return seconds;
+        }
+        return Math.max(0L, nowMs - roundStartedAtMs) / 1000.0D;
+    }
+
+    /**
+     * 写进 {@link MatchOutcome.RoundRecord} 的整数秒（该字段是 int，G-719 纯函数）。
+     * 四舍五入；未知/负数记 0。
+     */
+    static int recordSeconds(double seconds) {
+        if (Double.isNaN(seconds) || seconds <= 0.0D) {
+            return 0;
+        }
+        return (int) Math.round(seconds);
+    }
+
     /** 结束整场对局（调用后板子不应再发任何指令，直到下一次 {@link Board#onStart}）。 */
     void endMatch(MatchOutcome outcome);
 

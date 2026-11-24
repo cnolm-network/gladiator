@@ -6,6 +6,7 @@ import org.bukkit.entity.Entity;
 import org.bukkit.entity.Item;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
+import top.cnolm.arena.simplify.FlatManagerSimplified;
 import top.cnolm.arena.status.ArenaTeam;
 import top.cnolm.gladiator.api.board.Board;
 import top.cnolm.gladiator.api.board.BoardContext;
@@ -39,6 +40,11 @@ final class FlatBoard implements Board {
     /** 开下一局前等待双方复活：每次重试间隔与最大次数（10 秒）。 */
     private static final long START_RETRY_TICKS = 10L;
     private static final int MAX_START_ATTEMPTS = 20;
+    /** 内置 Recorder 的位置采样周期（tick）；2 tick = 10Hz，和 dashboard 的录制同频。 */
+    private static final int RECORD_PERIOD_TICKS = 2;
+    /** 没给出生点时两队的默认半距（x,z）：水平间距 = 2·√(x²+z²) ≈ 7.2 格，进战斗距离。 */
+    private static final int DEFAULT_SPAWN_VEC_X = 3;
+    private static final int DEFAULT_SPAWN_VEC_Z = 2;
 
     private final Plugin plugin;
     private final String id;
@@ -48,6 +54,8 @@ final class FlatBoard implements Board {
     private String bot = "";
     private int roundSeconds = 120;
 
+    /** 每场对局一个；跨局复用它，避免每局都注册一个新的 Listener。 */
+    private FlatManagerSimplified simplified;
     private FlatMatchManager manager;
     private ArenaTeam playerTeam;
     private ArenaTeam botTeam;
@@ -55,6 +63,11 @@ final class FlatBoard implements Board {
     private boolean finished;
     private int startAttempts;
     private long roundStartTick;
+    /** 真正开打（phase=fighting）的墙钟时刻：本局时长按它算，不含倒计时与等复活。 */
+    private long fightStartMs;
+    /** 开局前的位置：对局结束后把双方送回去（否则会留在出生点，下一次对局距离越拉越远）。 */
+    private Location playerStart;
+    private Location botStart;
 
     FlatBoard(Plugin plugin, String id) {
         this.plugin = plugin;
@@ -82,10 +95,16 @@ final class FlatBoard implements Board {
         this.manager = null;
         this.playerTeam = null;
         this.botTeam = null;
+        // 简化 API 每个对局一个实例（构造时注册 Listener），跨局复用、不重复注册。
+        this.simplified = new FlatManagerSimplified();
         RoundSpec spec = context.spec();
         this.player = spec.extra("player", "player");
         this.bot = spec.extra("bot", "bot");
         this.roundSeconds = spec.getSecondsPerRound();
+        Player startP = context.player(this.player);
+        Player startB = context.player(this.bot);
+        this.playerStart = startP == null ? null : startP.getLocation().clone();
+        this.botStart = startB == null ? null : startB.getLocation().clone();
         startRound();
     }
 
@@ -120,6 +139,7 @@ final class FlatBoard implements Board {
                 if (!"fighting".equals(ctx.phase())) {
                     ctx.phase("fighting");
                     roundStartTick = tick;
+                    fightStartMs = System.currentTimeMillis();
                 }
                 if ((tick - roundStartTick) / 10L >= roundSeconds) {
                     ctx.log("第 " + ctx.round() + " 局超时，按平局结算");
@@ -136,15 +156,60 @@ final class FlatBoard implements Board {
     public void onStop(String reason) {
         if (ctx != null) {
             ctx.log("板子清理: " + reason);
+            // 对局结束后把双方送回开局位置：板子没有清理这一步时，玩家会一直留在出生点，
+            // 下一场对局「距离开局位置越远、开局距离越大」，看起来像 Bot 不会靠近。
+            restorePosition(ctx.player(player), playerStart, player);
+            restorePosition(ctx.player(bot), botStart, bot);
         }
         roundActive = false;
         finished = true;
         manager = null;
+        simplified = null;
         playerTeam = null;
         botTeam = null;
         ctx = null;
         player = "";
         bot = "";
+        playerStart = null;
+        botStart = null;
+    }
+
+    /** 对局结束后的归位；玩家已离线就跳过（不清空记录，交给下一场覆盖）。 */
+    private void restorePosition(Player target, Location home, String label) {
+        if (target == null || home == null || !target.isOnline()) {
+            return;
+        }
+        target.teleport(home);
+        target.setBedSpawnLocation(home, true);
+        if (ctx != null) {
+            ctx.log("已把 " + label + " 送回开局位置");
+        }
+    }
+
+    /**
+     * 打满局数时归位。
+     *
+     * <p>延后 20 tick：最后一局往往以「某人被打死」结束，1.8 里死者还停在死亡界面，
+     * 立刻 teleport 会被客户端重生流程覆盖回重生点。会话走 {@code stop} 时另有
+     * {@link #onStop(String)} 兜底，两条路径都归位一次是幂等的。
+     */
+    private void scheduleRestore() {
+        final BoardContext session = ctx;
+        if (session == null) {
+            return;
+        }
+        final Location homeP = playerStart;
+        final Location homeB = botStart;
+        plugin.getServer().getScheduler().runTaskLater(plugin, new Runnable() {
+            @Override
+            public void run() {
+                if (ctx != session) {
+                    return;
+                }
+                restorePosition(ctx.player(player), homeP, player);
+                restorePosition(ctx.player(bot), homeB, bot);
+            }
+        }, 20L);
     }
 
     /** 清掉中心周围 48 格内的地面掉落物（死亡掉落的套件）。 */
@@ -218,9 +283,40 @@ final class FlatBoard implements Board {
         ctx.log("第 " + ctx.round() + " 局开始：" + player + " vs " + bot + " 套件=" + kitId
                 + " 免伤=" + ctx.spec().getShieldSeconds() + "s");
 
-        manager = new FlatMatchManager(playerTeam, botTeam, kitId, ctx.spec().getShieldSeconds());
+        // 走用户的简化 API：它负责套件/免伤/摆位/录制/事件，本类只管「一局何时开始与结束」。
+        manager = startSimplifiedMatch(p, b, playerSpawn, botSpawn, kitId);
         manager.setResultListener(this::onRoundResult);
         ctx.log("第 " + ctx.round() + " 局套件已发：" + manager.kitId());
+    }
+
+    /**
+     * 用 {@link FlatManagerSimplified} 起一局。
+     *
+     * <p>简化 API 只接受「中心点 + 半距」这种对称摆位（内部 {@code mid ± spawnVec}），
+     * 所以把两侧出生点换算成中心与半距；换算后位置与上面算出的 playerSpawn/botSpawn 完全一致。
+     */
+    private FlatMatchManager startSimplifiedMatch(Player p, Player b,
+                                                  Location playerSpawn, Location botSpawn, String kitId) {
+        double dx = playerSpawn.getX() - botSpawn.getX();
+        double dz = playerSpawn.getZ() - botSpawn.getZ();
+        int halfX = (int) Math.round(Math.abs(dx) / 2.0D);
+        int halfZ = (int) Math.round(Math.abs(dz) / 2.0D);
+        if (halfX == 0 && halfZ == 0) {
+            halfX = DEFAULT_SPAWN_VEC_X;
+            halfZ = DEFAULT_SPAWN_VEC_Z;
+        }
+        Location mid = new Location(playerSpawn.getWorld(),
+                (playerSpawn.getX() + botSpawn.getX()) / 2.0D,
+                (playerSpawn.getY() + botSpawn.getY()) / 2.0D,
+                (playerSpawn.getZ() + botSpawn.getZ()) / 2.0D);
+
+        FlatManagerSimplified.StartParams params = new FlatManagerSimplified.StartParams(p, b)
+                .mid(mid)
+                .spawnVec(halfX, halfZ)
+                .team(playerTeam, botTeam)
+                .recordPeriod(RECORD_PERIOD_TICKS);
+        simplified.start(params, kitId, ctx.spec().getShieldSeconds());
+        return simplified.getFlatMatchManager();
     }
 
     /** arena 的结算回流：赢家队伍 → Gladiator 的 RoundOutcome。 */
@@ -247,10 +343,16 @@ final class FlatBoard implements Board {
         botTeam = null;
 
         final BoardContext session = ctx;
-        ctx.endRound(outcome);
+        // 板子自己知道开打时刻，把真实局时长一起报上去（dashboard 逐局表格用，G-719）。
+        double seconds = fightStartMs > 0L
+                ? Math.max(0L, System.currentTimeMillis() - fightStartMs) / 1000.0D
+                : -1.0D;
+        fightStartMs = 0L;
+        ctx.endRound(outcome, seconds);
         // endRound 会自增轮次；打满后会话已经 endMatch，不能再准备下一局。
         if (session.round() > session.spec().getRounds()) {
             finished = true;
+            scheduleRestore();
             return;
         }
         plugin.getServer().getScheduler().runTaskLater(plugin, new Runnable() {

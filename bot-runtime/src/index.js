@@ -25,6 +25,14 @@ import { LinkClient } from './connection.js';
 import { decodeAction, encodeObservation, entityHealth, nearestPlayer, OBS_DIM } from './features.js';
 import { applyIntent, decodeIntentVector, describeIntent, resetIntentState } from './intent.js';
 import { BrainCrossFrame } from './brain-cross-frame.js';
+import {
+  FarChaseNotifier,
+  TargetPresence,
+  armorPoints,
+  formatHeartbeat,
+  horizontalDistance,
+} from './brain-telemetry.js';
+import { debugLog, setDebugEnabled } from './debug.js';
 import { EnvLinkServer } from './link-server.js';
 import { describeLoginFailure, launchBot } from './minecraft.js';
 import { buildObservation } from './observation.js';
@@ -82,6 +90,19 @@ const attackCooldownMs = Math.max(
     : DEFAULT_ATTACK_COOLDOWN_MS),
 );
 const targetPlayerArg = String(arg('target-player', '') || '').trim();
+// --- 调试日志（G-717-B）-----------------------------------------------------
+// `--debug` 或 GLADIATOR_DEBUG=1 才打开；打开后高频细节（远距离追击的
+// OUT_OF_REACH_CHASED 等）以 `[debug]` 前缀输出，默认静默不刷屏。
+setDebugEnabled(
+  process.argv.slice(2).some((item) => item === '--debug' || item.startsWith('--debug='))
+  || /^(1|true|yes|on)$/i.test(String(process.env.GLADIATOR_DEBUG ?? '').trim()),
+);
+// --- 遥测阈值（G-717-B/C）---------------------------------------------------
+//: 目标玩家从 tab 列表消失多久算「不在线」。
+const TARGET_OFFLINE_AFTER_MS = 5000;
+//: 距离超过多少格算「在赶路」，以及这种提示的节流间隔。
+const FAR_CHASE_THRESHOLD = 24;
+const FAR_CHASE_LOG_MS = 5000;
 // --- 软约束（运行参数，**不写进模型**）----------------------------------------
 // 只影响「本进程怎么用这个模型」：同一份 .npz 在演示/评测/对战时可以开不同约束。
 // 任何情况下都不要把它写进 policy.npz 或 model.json —— 那是运行期选择，不是模型事实。
@@ -193,6 +214,14 @@ let activeProfile = cliProfile;
 function makeSession(currentBot) {
   const dispatcher = new ActionDispatcher({
     bot: currentBot, restrictionCache, profile: activeProfile,
+    // G-717-A：开局板子还没发套件时只「等」，不记失败；日志每局只打一次。
+    onKitWait: ({ attempts, intervalMs }) => {
+      brainState.waitingKit += 1;
+      if (!brainState.kitWaitLogged) {
+        brainState.kitWaitLogged = true;
+        console.log(`[brain] 还没拿到剑，等板子发套件（最多 ${Math.round(attempts * intervalMs / 1000)}s）`);
+      }
+    },
   });
   return {
     bot: currentBot,
@@ -225,6 +254,17 @@ function makeSession(currentBot) {
 // 之后每 20 条打一条（5Hz 下节奏刚好，quota 也不会被日志吃掉）。
 const intentEcho = { received: 0 };
 
+/**
+ * 这一帧的执行结果是不是**只有**「够不到、追了一步」（G-717-B）。
+ *
+ * <p>它是 `ok:true` 的战术结果，不是失败；远距离赶路时每刀一条，留在 info 里会把
+ * 真机日志刷满（实测 1114 格追击 50 秒），所以整行降到 debug。
+ */
+function isChaseResult(applied) {
+  const attack = applied && applied.attack;
+  return Boolean(attack && attack.code === 'OUT_OF_REACH_CHASED');
+}
+
 function logIntent(currentBot, intent, result) {
   intentEcho.received += 1;
   const count = intentEcho.received;
@@ -233,7 +273,13 @@ function logIntent(currentBot, intent, result) {
   }
   const applied = (result && result.applied) || {};
   const detail = Object.keys(applied).length ? JSON.stringify(applied) : '-';
-  console.log(`[intent] #${count} ${describeIntent(intent)} → ${detail}`);
+  const line = `[intent] #${count} ${describeIntent(intent)} → ${detail}`;
+  if (isChaseResult(applied)) {
+    // 追击帧：`--debug` 才看得到（`OUT_OF_REACH_CHASED` 不再是噪音）。
+    debugLog(line);
+  } else {
+    console.log(line);
+  }
   if (itemTable && (count === 1 || count % 100 === 0)) {
     // 运行时侧的 mask（实时背包）与训练侧（观测 200ms 一帧）偶发不一致，
     // 打出来是为了让「策略明明选了 use 却没反应」这类问题一眼可见。
@@ -329,6 +375,14 @@ const brainState = {
   busySkips: 0,
   //: 因为 bot/session/bot.entity 缺失而跳过的次数（另一种「静默空转」）。
   notReadySkips: 0,
+  // --- G-717：把「在赶路 / 等套件 / 目标不在线」从「不动也不打」里区分开 ---------
+  //: 进入「等板子发套件」的次数（不算失败；2 秒没等到才由调用方算失败）。
+  waitingKit: 0,
+  //: 本次对局是否已经打过「等套件」的提示（每局只打一次）。
+  kitWaitLogged: false,
+  //: 与目标的水平距离（心跳里的 dist）与本局最远距离（远距离提示用）。
+  targetDist: null,
+  maxTargetDist: 0,
   startedAt: Date.now(),
   seq: 0,
   tick: 0,
@@ -343,6 +397,15 @@ const brainState = {
   rconLastPollAt: 0,
   rconWarned: false,
 };
+
+/** 目标在线状态机（G-717-C）：只有显式 `--target-player` 时才跟踪。 */
+const targetPresence = new TargetPresence({
+  offlineAfterMs: TARGET_OFFLINE_AFTER_MS, name: targetPlayerArg,
+});
+/** 远距离「赶路中」提示（G-717-B）：>24 格每 5 秒一条，回到近处重置。 */
+const farChaseNotifier = new FarChaseNotifier({
+  threshold: FAR_CHASE_THRESHOLD, everyMs: FAR_CHASE_LOG_MS,
+});
 
 const brainScheduler = new ActionScheduler({
   // 大脑每 tick 最多发 3 条动作（look/move/attack），20Hz 就是 60 条/秒。
@@ -419,12 +482,94 @@ async function runBrainAction(label, factory) {
   return outcome.value;
 }
 
+/** 当前背包物品（带 slot；读不到返回空数组——心跳只是展示，不值得抛）。 */
+function currentInventoryItems() {
+  try {
+    if (bot && bot.inventory && typeof bot.inventory.items === 'function') {
+      const items = bot.inventory.items();
+      return Array.isArray(items) ? items : [];
+    }
+  } catch (error) {
+    // 背包窗口重建期间 items() 可能抛：心跳不能因此失败。
+  }
+  return [];
+}
+
+/** 目标玩家实体（mineflayer 只跟踪视野内的实体：可能「在线但拿不到实体」）。 */
+function findPlayerEntity(name) {
+  if (!name || !bot) {
+    return null;
+  }
+  const key = String(name).toLowerCase();
+  const entities = bot.entities || {};
+  for (const id of Object.keys(entities)) {
+    const entity = entities[id];
+    if (entity && entity.type === 'player'
+      && String(entity.username || '').toLowerCase() === key) {
+      return entity;
+    }
+  }
+  return null;
+}
+
 /**
- * 心跳（G-716）：每 5 秒一行，回答「大脑还在转吗、卡在哪」。
+ * 目标是否在线：1.8 的 tab 列表（`bot.players`）含全部在线玩家，
+ * 比「实体在不在视野里」可靠（1114 格外不会有实体，但人是真在线）。
+ */
+function isTargetOnline(name) {
+  if (!name || !bot || !bot.players) {
+    return false;
+  }
+  const key = String(name).toLowerCase();
+  return Object.keys(bot.players).some((id) => {
+    const entry = bot.players[id];
+    return entry && String(entry.username || '').toLowerCase() === key;
+  });
+}
+
+/** 目标离线/回来各报一次（G-717-C）。 */
+function refreshTargetPresence(nowMs) {
+  if (!targetPlayerArg) {
+    return;
+  }
+  const event = targetPresence.update(nowMs, isTargetOnline(targetPlayerArg));
+  if (event === 'offline') {
+    console.log(`[brain] 目标玩家 ${targetPlayerArg} 不在线，先待机`);
+  } else if (event === 'back') {
+    console.log(`[brain] 目标玩家 ${targetPlayerArg} 回来了`);
+  }
+}
+
+/**
+ * 刷新「与目标的水平距离」（G-717-B），顺带维护本局最远距离，并结算两条提示：
+ * 目标不在线（C）、远距离赶路（B）。返回当前距离或 null（没有目标/拿不到实体）。
+ */
+function refreshTargetDistance(nowMs) {
+  const self = bot && bot.entity ? bot.entity.position : null;
+  const entity = findPlayerEntity(brainState.target);
+  const dist = entity && entity.position && self
+    ? horizontalDistance(self, entity.position)
+    : null;
+  brainState.targetDist = dist;
+  if (dist !== null && dist > brainState.maxTargetDist) {
+    brainState.maxTargetDist = dist;
+  }
+  refreshTargetPresence(nowMs);
+  const farLine = farChaseNotifier.update(nowMs, dist, brainState.maxTargetDist);
+  if (farLine) {
+    console.log(farLine);
+  }
+  return dist;
+}
+
+/**
+ * 心跳（G-716/G-717）：每 5 秒一行，回答「大脑还在转吗、卡在哪、是在赶路还是在等套件」。
  *
  * - `decisions` 不涨 + `busy=1` → 有动作卡住（配合 `last=` 看是哪个）；
  * - `skips` 一直涨 → 每帧都因为 busy 被丢掉（就是「只决策一次就停」的形态）；
- * - `failures`/`timeouts` → 动作层真的在报错/超时。
+ * - `failures`/`timeouts` → 动作层真的在报错/超时；
+ * - `dist`/`armor` → 与目标的水平距离、身上护甲点数（`dist=-` 表示没有目标）；
+ * - `waitingKit` → 板子还没发套件（不是模型问题）。
  */
 function startBrainHeartbeat() {
   if (brainState.heartbeat) {
@@ -432,27 +577,13 @@ function startBrainHeartbeat() {
   }
   brainState.heartbeat = setInterval(() => {
     const now = Date.now();
-    const sinceTick = brainState.lastTickAt ? `${now - brainState.lastTickAt}ms` : 'never';
-    const inflight = brainState.lastAction
-      ? `${brainState.lastAction}(${now - brainState.lastActionAt}ms)`
-      : 'idle';
-    const parts = [
-      `decisions=${brainState.decisions}`,
-      `attacks=${brainState.attacks}`,
-      `failures=${brainState.actionFailures}`,
-      `timeouts=${brainState.actionTimeouts}`,
-      `busy=${brainState.busy ? 1 : 0}`,
-      `skips=${brainState.busySkips}`,
-      `notReady=${brainState.notReadySkips}`,
-      `last=${inflight}`,
-      `lastTick=${sinceTick}`,
-      `target=${brainState.target || '-'}`,
-      `oppHp=${brainState.opponentHealth === null ? '-' : brainState.opponentHealth}`,
-    ];
-    if (brainState.lastError) {
-      parts.push(`lastError=${brainState.lastError}`);
-    }
-    console.log(`[brain] 心跳 ${parts.join(' ')}`);
+    // 心跳里也要结算一次「赶路 / 目标不在线」：决策线程被动作占住时它同样要刷新。
+    const dist = refreshTargetDistance(now);
+    console.log(formatHeartbeat({
+      ...brainState,
+      dist,
+      armor: armorPoints(currentInventoryItems()),
+    }, now));
   }, 5000);
   if (typeof brainState.heartbeat.unref === 'function') {
     brainState.heartbeat.unref();
@@ -658,6 +789,8 @@ async function brainTick() {
   brainState.busy = true;
   brainState.lastTickAt = Date.now();
   const currentSession = session;
+  // G-717：每帧结算「距离/目标在线/赶路提示」——它们与决策解耦，卡在动作里也要照常报。
+  refreshTargetDistance(brainState.lastTickAt);
   try {
     brainState.tick += 1;
     const observation = buildObservation(bot, {
@@ -758,6 +891,11 @@ async function brainTick() {
         if (brainState.actionFailures <= 5) {
           console.warn(`[brain] 动作失败 ${action.type}: ${result.code || '?'} ${result.reason || ''}`);
         }
+      } else if (result && result.code === 'OUT_OF_REACH_CHASED') {
+        // G-717-B：够不到先追一步是战术结果（ok=true），只在 --debug 下可见。
+        const distance = Number(result.distance);
+        debugLog(`[brain] 追击 ${action.type}`
+          + ` distance=${Number.isFinite(distance) ? distance.toFixed(2) : '?'}`);
       }
       if (action.type === 'attack') {
         brainState.attacks += 1;
@@ -782,6 +920,12 @@ function startBrain() {
   }
   // G-711：新一局/重连：上一帧动作与两个帧计数都从头开始（与训练侧 reset() 同口径）。
   brainCrossFrame.reset();
+  // G-717：每局重新开始统计（套件提示每局一次、最远距离每局归零、目标在线状态重算）。
+  brainState.kitWaitLogged = false;
+  brainState.maxTargetDist = 0;
+  brainState.targetDist = null;
+  targetPresence.reset(targetPlayerArg);
+  farChaseNotifier.reset();
   const interval = Math.max(50, Math.floor(1000 / brainHz));
   brainState.timer = setInterval(() => {
     brainTick().catch((error) => {
@@ -849,6 +993,8 @@ function printMatchSummary(reason) {
     // G-716：卡死/超时也要进汇总，否则「0 失败但 0 伤害」看起来像策略不行为。
     actionTimeouts: brainState.actionTimeouts,
     busySkips: brainState.busySkips,
+    // G-717-A：等套件的次数（不是失败；真失败在 actionFailures 里）。
+    waitingKit: brainState.waitingKit,
     softDropped: brainState.softDropped,
     soft: describeSoft(soft),
     brainHz,
@@ -979,6 +1125,10 @@ async function handleSpawn(spawn) {
     if (brainEnabled) {
       brainState.deathSummaryPrinted = false;
       startBrain();
+      // G-717-A：每局（含重生/重连后的新一轮）只提醒一次「还没拿到剑」。
+      current.on('spawn', () => {
+        brainState.kitWaitLogged = false;
+      });
     }
     // 调用方（训练场/对局）给完套件后自动穿上护甲。
     // 注意：不能只靠 bot.inventory 的 'update' 事件——1.8.8 实测 RCON give 之后
