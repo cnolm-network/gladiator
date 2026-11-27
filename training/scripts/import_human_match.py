@@ -682,6 +682,19 @@ def select_record_files(target: Path, events_by_file: dict[Path, list[dict]],
     return [path for _first, path in sorted(chosen)]
 
 
+def frame_seconds(frames: list[dict]) -> list[float]:
+    """帧的**对局绝对时间**（秒）。
+
+    多局对局时 `frames.jsonl` 里的 `t` 是「本局已过秒数」，每局都会归零（真机实测：
+    3 局 637 帧，`t` 在 20.11→0.07、21.38→0.08 处重置）；拿它跟 `arena-record` 的
+    绝对毫秒对齐就会把第 2、3 局的事件全算到第 1 局头上。所以录制侧同时写 `tAbs`
+    （整场累计秒数），这里优先用它，老录制没有 `tAbs` 时退回 `t`。
+    """
+    if frames and all("tAbs" in frame for frame in frames):
+        return [_num(frame.get("tAbs")) for frame in frames]
+    return [_num(frame.get("t")) for frame in frames]
+
+
 def align_record_rewards(frames: list[dict], events: list[dict], *,
                          origin_ms: float, player_name: str, bot_name: str,
                          win_bonus: float = 0.0) -> dict:
@@ -698,7 +711,7 @@ def align_record_rewards(frames: list[dict], events: list[dict], *,
     import bisect
 
     count = len(frames)
-    times = [_num(frame.get("t")) for frame in frames]
+    times = frame_seconds(frames)
     rounds = [int(_num(frame.get("round"), 1)) for frame in frames]
     rewards = np.zeros(count, dtype=np.float64)
     dealt = np.zeros(count, dtype=np.float64)
@@ -810,7 +823,7 @@ def load_arena_records(target: str | Path, *, frames: list[dict], meta: dict,
             warn(f"读不了录制文件 {candidate}: {exc}")
             events_by_file[candidate] = []
 
-    times = [_num(frame.get("t")) for frame in frames]
+    times = frame_seconds(frames)
     end_ms = origin_ms + (times[-1] if times else 0.0) * 1000.0
     if path.is_dir():
         chosen = select_record_files(path, events_by_file, origin_ms=origin_ms,

@@ -64,7 +64,9 @@ BOARD_ID = "flat-1v1"
 
 # Arena 侧导出的原始事件流（伤害/KILL/位置）；对局结束时由 `_harvest_arena_record` 拷进录制
 # 目录，赛后导入优先用它做奖励来源（比 10Hz 血量差准，且能分辨「谁打谁」）。
+# 多局对局每局导出一份，所以按子目录归档、导入时用目录模式合并。
 ARENA_RECORD_NAME = "arena-record.jsonl"
+ARENA_RECORDS_SUBDIR = "arena-records"
 
 #: status 轮询周期（秒）：契约规定 500ms。同一节奏写一帧 frames.jsonl（≈2Hz）。
 STATUS_PERIOD = 0.5
@@ -494,9 +496,14 @@ def build_import_command(python_exe: str, script: Path, record_dir: Path,
     command = [str(python_exe), str(script), str(record_dir)]
     if dataset is not None:
         command.extend(["--out", str(dataset)])
-    events = Path(record_dir) / ARENA_RECORD_NAME
-    if events.is_file():
-        command.extend(["--records", str(events)])
+    records_dir = Path(record_dir) / ARENA_RECORDS_SUBDIR
+    if records_dir.is_dir() and any(records_dir.glob("*.jsonl")):
+        # 目录模式：导入侧按「时间窗 + 参与者」把同一场的多局文件合起来。
+        command.extend(["--records", str(records_dir)])
+    else:
+        events = Path(record_dir) / ARENA_RECORD_NAME
+        if events.is_file():
+            command.extend(["--records", str(events)])
     if bc:
         command.append("--bc")
         if base_model:
@@ -1306,6 +1313,8 @@ class MatchRunner:
             return
         frame = {
             "t": round(float(elapsed), 2),
+            # 整场累计秒数：`t` 每局会归零，多局对局要拿它对 arena-record 的绝对时间
+            "tAbs": round(max(0.0, time.time() - (match.get("started_at") or time.time())), 2),
             "round": round_no,
             "player": _frame_of(player),
             "bot": _frame_of(bot),
@@ -1334,9 +1343,10 @@ class MatchRunner:
     def _harvest_arena_record(self, match: dict) -> None:
         """把 Arena 的 `records/*.jsonl` 拷进录制目录，供赛后导入按伤害事件对齐。
 
-        板子的 `Recorder` 在对局结束时会自动导出到 `server/plugins/Arena/records/`，
-        文件名是 `<uuid>-<yyyyMMdd-HHmmss>.jsonl`。这里取「本场开始之后生成的最新一份」，
-        复制成 `arena-record.jsonl`，并在 summary 里记一笔；取不到就静默跳过（不影响对局）。
+        板子每局结束时把 `Recorder` 导出到 `server/plugins/Arena/records/`，文件名是
+        `<uuid>-<yyyyMMdd-HHmmss>.jsonl`。**多局对局会产出多份**（每局一份），所以这里
+        把「本场开始之后生成的所有文件」都拷到 `<录制目录>/arena-records/`，导入时按目录
+        模式合并——只取最新一份会丢掉前面几局的伤害。
         """
         directory = match["snapshot"].get("recordDir")
         if not directory:
@@ -1345,24 +1355,27 @@ class MatchRunner:
         if not records_dir.is_dir():
             return
         started = match.get("started_at") or 0
-        newest = None
+        chosen: list[Path] = []
         for candidate in records_dir.glob("*.jsonl"):
             try:
                 if candidate.stat().st_mtime + 1.0 < started:
                     continue
             except OSError:
                 continue
-            if newest is None or candidate.stat().st_mtime > newest.stat().st_mtime:
-                newest = candidate
-        if newest is None:
+            chosen.append(candidate)
+        if not chosen:
             return
-        target = Path(directory) / ARENA_RECORD_NAME
+        chosen.sort(key=lambda item: item.stat().st_mtime)
+        target_dir = Path(directory) / ARENA_RECORDS_SUBDIR
         try:
-            shutil.copyfile(newest, target)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for item in chosen:
+                shutil.copyfile(item, target_dir / item.name)
         except OSError as exc:
             self._log(match, f"复制 Arena 录制失败（忽略）：{exc}", ok=False)
             return
-        match["arena_record"] = str(target)
+        match["arena_record"] = str(target_dir)
+        match["arena_records"] = [item.name for item in chosen]
 
     def _ensure_arena_record(self, match: dict, *, attempts: int = 8,
                              delay: float = 0.5) -> bool:

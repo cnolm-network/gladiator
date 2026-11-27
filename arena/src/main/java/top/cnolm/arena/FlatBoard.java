@@ -49,6 +49,9 @@ final class FlatBoard implements Board {
     /** 开下一局前等待双方复活：每次重试间隔与最大次数（10 秒）。 */
     private static final long START_RETRY_TICKS = 10L;
     private static final int MAX_START_ATTEMPTS = 20;
+    /** G-739：倒计时/开局卡死多久之后强制收尾（tick，20 tick = 1 秒）。 */
+    private static final int STUCK_TIMEOUT_TICKS = 600;
+    private int stuckTicks;
     /** 内置 Recorder 的位置采样周期（tick）；2 tick = 10Hz，和 dashboard 的录制同频。 */
     private static final int RECORD_PERIOD_TICKS = 2;
     /** 没给出生点时两队的默认半距（x,z）：水平间距 = 2·√(x²+z²) ≈ 7.2 格，进战斗距离。 */
@@ -114,6 +117,7 @@ final class FlatBoard implements Board {
         this.finished = false;
         this.roundActive = false;
         this.startAttempts = 0;
+        this.stuckTicks = 0;
         this.manager = null;
         this.playerTeam = null;
         this.botTeam = null;
@@ -171,6 +175,7 @@ final class FlatBoard implements Board {
         if (manager != null) {
             // 阶段由板子声明：倒计时 → 战斗；外部（命令/dashboard）靠它判断现在能不能算伤害。
             if (manager.isFighting()) {
+                stuckTicks = 0;
                 if (!"fighting".equals(ctx.phase())) {
                     ctx.phase("fighting");
                     roundStartTick = tick;
@@ -183,6 +188,24 @@ final class FlatBoard implements Board {
                 }
             } else if ("starting".equals(ctx.phase())) {
                 ctx.phase("countdown");
+            } else {
+                // G-739：倒计时卡死看门狗。真机出现过「phase=countdown 挂了 3 分钟、
+                // board status 一直显示 round=2」——arena 的倒计时任务被某个死亡事件
+                // 吃掉后既不 fighting 也不结算。超过 30 秒仍未进入战斗就强制收尾。
+                stuckTicks++;
+                if (stuckTicks > STUCK_TIMEOUT_TICKS) {
+                    ctx.log("第 " + ctx.round() + " 局卡在 " + ctx.phase() + "，强制判平局");
+                    stuckTicks = 0;
+                    finishRound(RoundOutcome.draw("stuck-" + ctx.phase()));
+                }
+            }
+        } else if (roundActive && stuckTicks >= 0) {
+            // 开局一直在等复活/等玩家，超过 60 秒说明流程断了，直接收尾避免整场挂住。
+            stuckTicks++;
+            if (stuckTicks > STUCK_TIMEOUT_TICKS * 2) {
+                stuckTicks = 0;
+                ctx.log("第 " + ctx.round() + " 局迟迟开不起来，判平局（no-manager）");
+                finishRound(RoundOutcome.draw("no-manager"));
             }
         }
     }
@@ -310,8 +333,9 @@ final class FlatBoard implements Board {
         }
         // 上一局刚被打死的一方可能还停在死亡界面（1.8 的 respawn 是下一 tick 生效）；
         // 此时直接开下一局会在倒计时里被判死。等双方都活过来再开局，最多等 10 秒。
-        if ((p.isDead() || p.getHealth() <= 0.0D || b.isDead() || b.getHealth() <= 0.0D)
-                && startAttempts < MAX_START_ATTEMPTS) {
+        boolean waiting = p.isDead() || p.getHealth() <= 0.0D
+                || b.isDead() || b.getHealth() <= 0.0D;
+        if (waiting && startAttempts < MAX_START_ATTEMPTS) {
             startAttempts++;
             final BoardContext session = ctx;
             plugin.getServer().getScheduler().runTaskLater(plugin, new Runnable() {
@@ -322,6 +346,15 @@ final class FlatBoard implements Board {
                     }
                 }
             }, START_RETRY_TICKS);
+            return;
+        }
+        if (waiting) {
+            // G-739：重试用尽仍有一方没活过来（死亡界面没人点重生 / 假玩家卡在死亡态）。
+            // 之前这里会「硬开一局」，结果倒计时结束瞬间被判 one-team-left，甚至整场卡在
+            // countdown 再也不推进（真机 06:29 复现：round=2 phase=countdown 挂了 3 分钟）。
+            startAttempts = 0;
+            ctx.log("第 " + ctx.round() + " 局无法开局：参与者 10 秒内未复活，判平局");
+            finishRound(RoundOutcome.draw("not-ready"));
             return;
         }
         startAttempts = 0;
@@ -480,6 +513,7 @@ final class FlatBoard implements Board {
             return;
         }
         roundActive = false;
+        stuckTicks = 0;
         manager = null;
         playerTeam = null;
         botTeam = null;
