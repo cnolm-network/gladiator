@@ -95,9 +95,8 @@ public final class A8Probe implements Listener {
         }
         timeline.add("Ready " + name);
         Player player = event.getPlayer();
-        if (player != null) {
-            player.teleport(spawn);
-        }
+        // G-727：Ready 回调里客户端还没跟上，立即发一次 + 之后每 10 tick 补发（helper 自带 null 判断）。
+        teleportWithReassert(plugin, player, spawn);
         ready.put(name, event.getBot());
         if (ready.size() == names.length && sessionA == null) {
             runMatches();
@@ -271,6 +270,53 @@ public final class A8Probe implements Listener {
 
         private static String shortId(UUID id) {
             return id.toString().substring(0, 8);
+        }
+    }
+
+    // --- 位置补发（G-727）-----------------------------------------------------
+    //: 补发节拍（tick）。Bot 刚 Ready 时客户端还在位置预测窗口内，服务端下发的 tp
+    //: 会被客户端按「自己的位置」纠正掉：服务端坐标已经对了，客户端却停在原地，
+    //: 双方互相看不见（观测里 entities 只剩自己）。arena 的 FlatBoard.reassertPositions
+    //: 用同一套策略，这里保持一致。
+    private static final int PLACE_REASSERT_TICKS = 10;
+    //: 补发次数（不含立即那一次）。10 tick × 3 = 1.5 秒，覆盖客户端完成区块同步的窗口。
+    private static final int PLACE_REASSERT_TIMES = 3;
+
+    /**
+     * 摆位：立即传送一次，随后每 {@link #PLACE_REASSERT_TICKS} tick 再补发，
+     * 最多 {@link #PLACE_REASSERT_TIMES} 次（总共 1 + 3 = 4 次）。
+     *
+     * <p>为什么不能只发一次：Ready 事件只代表**服务端**完成了登录与实体生成，1.8 客户端
+     * 此时还在用自己的位置预测覆盖服务端下发的 {@code S08PacketPlayerPosLook}。单发一次
+     * 的结果是「服务端坐标正确、客户端停在旧位置」，mineflayer 侧表现为实体表只剩自己。
+     *
+     * <p>补发前判 {@code isOnline()}：玩家中途退出/被踢时立刻停，避免对着离线实体刷 tp。
+     */
+    private static void teleportWithReassert(final Plugin plugin, final Player player,
+                                             final Location target) {
+        if (player == null || target == null) {
+            return;
+        }
+        player.teleport(target);
+        if (plugin == null) {
+            // 没有插件实例（纯单元测试/独立调用）时退回单发：至少不抛异常。
+            return;
+        }
+        for (int index = 1; index <= PLACE_REASSERT_TIMES; index += 1) {
+            final int attempt = index;
+            plugin.getServer().getScheduler().runTaskLater(plugin, new Runnable() {
+                @Override
+                public void run() {
+                    if (!player.isOnline()) {
+                        return;
+                    }
+                    player.teleport(target);
+                    if (attempt == PLACE_REASSERT_TIMES) {
+                        plugin.getLogger().fine("[place] 摆位已补发 "
+                                + PLACE_REASSERT_TIMES + " 次: " + player.getName());
+                    }
+                }
+            }, PLACE_REASSERT_TICKS * (long) attempt);
         }
     }
 }

@@ -521,11 +521,16 @@ def argv_brain_spec(argv: list) -> Optional[str]:
 
 
 def choose_runtime(runtimes: list, bot: str, env_port: int,
-                   brain_spec: Optional[str]) -> dict:
+                   brain_spec: Optional[str], assume_brain: bool = False) -> dict:
     """决定复用/重启/新起运行时。
 
     返回 ``{"action": "reuse"|"restart"|"start"|"blocked", "runtime": dict|None, "reason": str}``。
     优先按用户名匹配（含 external），其次按通道 B 端口匹配。
+
+    ``assume_brain``（payload 的 ``brainAssumed``）：外部运行时的命令行在 dashboard 重启后会
+    变成未知（`command` 为空 → 检测不到 `--brain`），于是以前一律判 `blocked`。但「attach +
+    该运行时其实已经带着同一个大脑」是真实场景（用户手工起的陪练进程），所以允许显式声明
+    「它已经在跑这个模型」，此时直接复用、不重启进程。
     """
     alive = [item for item in (runtimes or []) if item.get("alive")]
     by_name = [item for item in alive
@@ -538,6 +543,12 @@ def choose_runtime(runtimes: list, bot: str, env_port: int,
     if brain_spec:
         if has_brain == brain_spec:
             return {"action": "reuse", "runtime": target, "reason": "运行时已带同一模型"}
+        if target.get("external") and assume_brain:
+            return {
+                "action": "reuse",
+                "runtime": target,
+                "reason": "外部运行时按「已在跑同一模型」复用（brainAssumed）",
+            }
         if target.get("external"):
             return {
                 "action": "blocked",
@@ -593,6 +604,9 @@ class MatchPlan:
     soft: str = ""
     #: 本次是否因为「勾了赛后训练」而强制打开录制（前端据此提示用户）。
     record_forced: bool = False
+    #: attach 模式下对外部运行时「已在跑同一模型」的显式声明（payload ``brainAssumed``）。
+    #: dashboard 重启后外部运行时的命令行不可见，不声明就会被判 blocked。
+    brain_assumed: bool = False
 
     @classmethod
     def from_payload(cls, payload: dict, cfg: DashboardConfig) -> "MatchPlan":
@@ -620,6 +634,7 @@ class MatchPlan:
         train_after = parse_bool(payload.get("trainAfter", False), "trainAfter")
         # 赛后训练的数据来自录制：没有录制就没有 frames.jsonl，导入只会拿到空数据集。
         # 这里静默补上录制（而不是 400），并在快照里标注 recordForced，前端负责提示。
+        brain_assumed = parse_bool(payload.get("brainAssumed", False), "brainAssumed")
         record_forced = False
         if train_after and not record:
             record = True
@@ -632,7 +647,7 @@ class MatchPlan:
                    rounds=rounds, round_seconds=float(round_seconds), kit=kit,
                    spawns=spawns, brain=brain, record=record, train_after=train_after,
                    respawn_delay_ms=respawn_delay_ms, soft=soft,
-                   record_forced=record_forced)
+                   record_forced=record_forced, brain_assumed=brain_assumed)
 
     def to_dict(self) -> dict:
         return {
@@ -650,6 +665,7 @@ class MatchPlan:
             "respawnDelayMs": self.respawn_delay_ms,
             "soft": self.soft,
             "recordForced": self.record_forced,
+            "brainAssumed": self.brain_assumed,
         }
 
 
@@ -825,7 +841,8 @@ class MatchRunner:
             raise Conflict(f"通道 B 端口 {plan.env_port} 已被占用；attach 模式可复用该运行时")
         # attach + 大脑 + 外部进程这类"必须重启但不能重启"的情况在启动前就拒绝，
         # 否则用户只会看到一个已经 failed 的对局。
-        decision = choose_runtime(self.runtimes.list(), plan.bot, plan.env_port, plan.brain)
+        decision = choose_runtime(self.runtimes.list(), plan.bot, plan.env_port, plan.brain,
+                                  assume_brain=plan.brain_assumed)
         if decision["action"] == "blocked":
             raise Conflict(decision["reason"])
 
@@ -998,7 +1015,8 @@ class MatchRunner:
     # --- 运行时 ---------------------------------------------------------
     def _ensure_runtime(self, match: dict, plan: MatchPlan) -> None:
         candidates = self.runtimes.list()
-        decision = choose_runtime(candidates, plan.bot, plan.env_port, plan.brain)
+        decision = choose_runtime(candidates, plan.bot, plan.env_port, plan.brain,
+                                  assume_brain=plan.brain_assumed)
         action = decision["action"]
         target = decision.get("runtime") or {}
         if action == "blocked":

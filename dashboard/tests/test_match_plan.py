@@ -365,6 +365,19 @@ class RuntimeChoiceTests(unittest.TestCase):
         decision = choose_runtime(runtimes, "Glad_Bot_1", 8775, "/m/policy.npz")
         self.assertEqual(decision["action"], "blocked")
 
+    def test_external_runtime_can_be_reused_when_brain_assumed(self) -> None:
+        """attach + 用户声明「外部运行时已在跑同一模型」时不要 blocked。"""
+        runtimes = [{"id": "external-8775", "alive": True, "username": None, "envPort": 8775,
+                     "external": True, "command": ["node", "src/index.js"]}]
+        decision = choose_runtime(runtimes, "Glad_Bot_1", 8775, "/m/policy.npz",
+                                  assume_brain=True)
+        self.assertEqual(decision["action"], "reuse")
+        self.assertIn("brainAssumed", decision["reason"])
+
+    def test_brain_assumed_does_not_override_missing_runtime(self) -> None:
+        decision = choose_runtime([], "Glad_Bot_1", 8775, "/m/policy.npz", assume_brain=True)
+        self.assertEqual(decision["action"], "start")
+
     def test_argv_brain_spec(self) -> None:
         self.assertEqual(argv_brain_spec(["node", "--brain", "/x.npz", "--host", "1"]), "/x.npz")
         self.assertIsNone(argv_brain_spec(["node", "src/index.js"]))
