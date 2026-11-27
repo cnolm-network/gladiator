@@ -38,6 +38,8 @@ import java.util.UUID;
 public class FlatManagerSimplified implements Listener {
     private FlatMatchManager flatMatchManager = null;
     private Recorder recorder = null;
+    /** 最近一局的 arena matchId（导出录像文件名用）；未开局为 null。 */
+    private UUID lastMatchId = null;
     private boolean registered = false;
     public Map<UUID, BukkitTask> recordingTaskMap = new HashMap<>();
 
@@ -290,8 +292,17 @@ public class FlatManagerSimplified implements Listener {
         return recorder;
     }
 
+    /** 最近一局的 arena matchId（导出录像的默认文件名要用）；未开局为 {@code null}。 */
+    public UUID getLastMatchId() {
+        return lastMatchId;
+    }
+
     void setRecorder(Recorder recorder) {
         this.recorder = recorder;
+    }
+
+    private void setLastMatchId(UUID matchId) {
+        this.lastMatchId = matchId;
     }
 
     public interface AsTeam {
@@ -370,7 +381,9 @@ public class FlatManagerSimplified implements Listener {
             owner.startRecording(p1, recordPeriod);
             owner.startRecording(p2, recordPeriod);
             owner.note("setup", "kit=" + kitId + " shield=" + shieldSeconds + " period=" + recordPeriod);
-            return new FlatMatchManager(t1, t2, kitId, shieldSeconds, recorder);
+            FlatMatchManager manager = new FlatMatchManager(t1, t2, kitId, shieldSeconds, recorder);
+            owner.setLastMatchId(manager.getMatchId());
+            return manager;
         }
 
         FlatMatchManager effect(FlatManagerSimplified owner) {
@@ -379,7 +392,9 @@ public class FlatManagerSimplified implements Listener {
             owner.startRecording(p1, recordPeriod);
             owner.startRecording(p2, recordPeriod);
             owner.note("setup", "period=" + recordPeriod);
-            return new FlatMatchManager(t1, t2);
+            FlatMatchManager manager = new FlatMatchManager(t1, t2);
+            owner.setLastMatchId(manager.getMatchId());
+            return manager;
         }
     }
 }

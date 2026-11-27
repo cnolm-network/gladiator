@@ -292,7 +292,12 @@ test('完整意图按 选槽 → 视角 → 移动 → 右键 → 攻击 的顺�
   assert.equal(result.ok, true);
   assert.equal(result.type, 'intent');
   assert.deepEqual(calls.slots, [4]);
-  assert.equal(calls.looks.length, 1);
+  // 意图自带的 look + 「出手前必须面朝目标」的校正 look（G-729：背身不许打）。
+  assert.equal(calls.looks.length, 2);
+  assert.ok(
+    Math.abs(calls.looks[1][0] - (-Math.PI / 2)) < 1e-9,
+    '第二次 look 应指向对手（1.8：yaw 0=+Z、90=-X）',
+  );
   assert.deepEqual(calls.attacks, [7]);
   assert.equal(calls.activates, 1);
   assert.equal(result.applied.slot, 4);

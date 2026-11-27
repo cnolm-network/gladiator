@@ -45,6 +45,11 @@ public final class BoardRegistryImpl implements BoardRegistry {
     private final ParticipantResolver resolver;
     private final Map<String, Board> boards = new LinkedHashMap<String, Board>();
     private final AtomicLong seq = new AtomicLong();
+    /**
+     * {@code MATCH_PHASE} 的下发通道（生产实现由 {@code GladiatorMain} 注入，见
+     * {@link #attachMatchPhaseSink}）；未注入时阶段帧全部静默丢弃。
+     */
+    private volatile MatchPhaseSink phaseSink;
 
     /** 当前对局；包内可见是为了单测能直接注入假会话（生产代码只经 {@link #start}/{@link #stop} 改写）。 */
     BoardSessionImpl active;
@@ -71,6 +76,11 @@ public final class BoardRegistryImpl implements BoardRegistry {
                 BoardSessionImpl session = active;
                 if (session != null) {
                     session.onTick();
+                    // 阶段帧的「每秒一帧」也挂在这条 ticker 上：会话自己不起调度器，
+                    // 单测里直接构造会话也不会因为「没有 Bukkit 调度器」而崩。
+                    if (!session.isFinished()) {
+                        session.pumpPhase(System.currentTimeMillis());
+                    }
                 }
             }
         }, 2L, 2L);
@@ -79,6 +89,7 @@ public final class BoardRegistryImpl implements BoardRegistry {
     /** 插件 disable 时调用：停对局、停 ticker、清空注册表。 */
     public void disable() {
         stop("plugin-disable");
+        phaseSink = null;
         if (ticker != null) {
             ticker.cancel();
             ticker = null;
@@ -147,6 +158,9 @@ public final class BoardRegistryImpl implements BoardRegistry {
                 + " 局数=" + spec.getRounds() + " 每局=" + spec.getSecondsPerRound() + "s"
                 + " 套件=" + spec.getKitId());
         try {
+            // 先推一帧 starting：运行时的「阶段闸门」只有在收到第一帧后才生效，
+            // 否则从会话创建到倒计时开始之间的几百毫秒里 Bot 仍会自由出手（真机 03:24 复现）。
+            session.declareStartingPhase();
             board.onStart(session);
         } catch (RuntimeException e) {
             plugin.getLogger().warning("[board] onStart 抛异常，终止对局: " + e);
@@ -197,8 +211,42 @@ public final class BoardRegistryImpl implements BoardRegistry {
         return lastFinished;
     }
 
+    // ------------------------------------------------------------ MATCH_PHASE
+
+    /**
+     * 注入 {@code MATCH_PHASE} 的下发通道（{@code GladiatorMain} 在链路起来之后调用）。
+     *
+     * <p>为什么用 setter 而不是构造参数：注册表在 {@code startLink()} **之前**就建好并
+     * {@code enable()} 了（端口绑不上也要能开对局），构造时拿不到 LinkServer；
+     * 顺带让单测的三参构造保持可用。
+     */
+    public void attachMatchPhaseSink(MatchPhaseSink sink) {
+        this.phaseSink = sink;
+    }
+
+    /**
+     * 把一帧阶段信息推给本场参与者（只发给能认出来的 Bot）。
+     *
+     * <p>过滤放在 sink 里（它手里有 {@code BotRegistry}）：真实玩家、golem 假玩家、
+     * 链路还没连上的 Bot 都会被静默跳过，注册表不重复判断。
+     */
+    void publishMatchPhase(BoardSessionImpl session, String phase, int round,
+                           int seconds, long endsAt) {
+        MatchPhaseSink sink = phaseSink;
+        if (sink == null || session == null) {
+            return;
+        }
+        for (String username : session.participants()) {
+            try {
+                sink.sendMatchPhase(username, phase, round, seconds, endsAt);
+            } catch (RuntimeException e) {
+                // 一个参与者推失败不能影响另一个，更不能影响对局本身。
+                plugin.getLogger().warning("[board] MATCH_PHASE 下发失败（" + username + "）: " + e);
+            }
+        }
+    }
+
     // ------------------------------------------------------------ Bot 生命周期
-    //
     // 与 Bukkit 事件（BoardEventBridge）分开：Bot 的「就绪/失效」不是服务器事件，
     // 而是 BotSpawnService 绑定（bind）与失败（fail）两条链路上的事实。
     // 两者都只在**有活动会话**时转发；没有会话就静默丢弃（对局没开，板子不该被打扰）。

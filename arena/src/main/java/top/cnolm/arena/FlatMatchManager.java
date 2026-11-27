@@ -1,6 +1,7 @@
 package top.cnolm.arena;
 
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.GameMode;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -15,8 +16,11 @@ import top.cnolm.arena.event.ArenaEliminateEvent;
 import top.cnolm.arena.event.ArenaKillEvent;
 import top.cnolm.arena.event.ArenaMatchEndEvent;
 import top.cnolm.arena.simplify.Recorder;
+import top.cnolm.arena.simplify.RecorderExport;
 import top.cnolm.arena.status.*;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -26,6 +30,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * 我不知道你是每一局算作一个 Match 还是一整轮算作一个 Match，我这边认为是前者
  */
 public class FlatMatchManager implements Listener {
+
+    /** G-723：Ready 窗口内补发摆位的间隔与次数。 */
+    private static final int RESYNC_TICKS = 10;
+    private static final int RESYNC_TIMES = 4;
+
     private final ArenaMatch<GamingStatusImpl, MatchStatusImpl> match;
     private final String kitId;
     private final int shieldSeconds;
@@ -92,7 +101,10 @@ public class FlatMatchManager implements Listener {
             }
             for (ArenaTeam team : m.getTeams()) {
                 if (team.getPlayers().contains(playerId)) {
-                    player.teleport(team.getSpawn());
+                    // G-723：Bot 晚于 startMatch 才 Ready 时正落在「登录窗口」，单发一次 tp
+                    // 会被客户端位置预测吃掉（服务端到位、客户端没动，双方互相看不见）。
+                    // 参照 FlatBoard.reassertPositions：按 10 tick 补发，最多 4 次。
+                    scheduleResync(player, team.getSpawn());
                     break;
                 }
             }
@@ -111,8 +123,34 @@ public class FlatMatchManager implements Listener {
         }
     }
 
-    private void giveKit(Player target) {
-        ArenaKits.give(target, kitId);
+    /**
+     * G-723：登录/重生窗口内的单发 `teleport` 会被客户端位置预测吃掉，
+     * 表现为「服务端坐标对了、客户端还在原地」，双方实体互相看不见。
+     * 这里按 {@link #RESYNC_TICKS} tick 的间隔补发 {@link #RESYNC_TIMES} 次。
+     */
+    private static void scheduleResync(final Player player, final Location target) {
+        if (player == null || target == null) {
+            return;
+        }
+        for (int index = 1; index <= RESYNC_TIMES; index += 1) {
+            final int attempt = index;
+            Bukkit.getScheduler().runTaskLater(ArenaPlugin.getInstance(), new Runnable() {
+                @Override
+                public void run() {
+                    if (!player.isOnline()) {
+                        return;
+                    }
+                    player.teleport(target);
+                    if (attempt == RESYNC_TIMES) {
+                        ArenaPlugin.getInstance().getLogger().info(
+                                "[flat] 参与者 " + player.getName() + " 摆位已补发 " + attempt + " 次");
+                    }
+                }
+            }, RESYNC_TICKS * (long) attempt);
+        }
+    }
+
+    private void giveKit(Player target) {        ArenaKits.give(target, kitId);
     }
 
     private void applyShield(Player target) {
@@ -311,6 +349,27 @@ public class FlatMatchManager implements Listener {
         this.resultListener = null;
         if (listener != null) {
             listener.onResult(this, winner, event.getReason());
+        }
+        // 本局结束自动落一份 JSONL：录像不再只存在内存里（用户 2026-11-28 需求）。
+        exportRecord(match.getId().toString());
+    }
+
+    /**
+     * 对局结束时自动导出录像（`plugins/Arena/records/<matchId>-<时间戳>.jsonl`）。
+     *
+     * <p>必须放在 {@link ResultListener} 之后：结算回调可能还会写统计，晚一点导出才完整。
+     * 导出失败只告警，不影响结算——录像不是对局的必要产物。
+     */
+    private void exportRecord(String matchId) {
+        if (recorder == null || recorder.size() == 0) {
+            return;
+        }
+        try {
+            Path file = RecorderExport.export(recorder, matchId);
+            ArenaPlugin.getInstance().getLogger().info("[recorder] 已导出 " + file.toAbsolutePath()
+                    + "（" + recorder.size() + " 条）");
+        } catch (IOException | RuntimeException e) {
+            ArenaPlugin.getInstance().getLogger().warning("[recorder] 导出失败: " + e);
         }
     }
 }

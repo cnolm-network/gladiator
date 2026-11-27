@@ -11,12 +11,14 @@
 
 from __future__ import annotations
 
+import math
 import unittest
 
 import numpy as np
 
 from gladiator_env.spaces import (
     ACTION_HEADS_V2,
+    LOOK_YAW_V2,
     MULTI_DISCRETE_V2,
     SPRINT_RESET_VALUES_V2,
     decode_intent,
@@ -279,6 +281,76 @@ class StateTest(unittest.TestCase):
 
     def test_sprint_reset_values_cover_all_three(self) -> None:
         self.assertEqual(SPRINT_RESET_VALUES_V2, ("none", "release_w", "block_hit"))
+
+class YawCorrectionTest(unittest.TestCase):
+    """G-731：老师 v4 要输出「朝目标转」的 look 头，而不是恒 0。
+
+    真机取证（2026-11-28）：``dist=2.8 yaw=-108.1 bearing=-71.9 yawErr=36.3``——
+    被击退后朝向被甩开 36°，而旧老师从不转头（``dyaw`` 恒 0），蒸馏出来的策略自然也不会转。
+    这些用例把「老师会转头」钉住：分档、死区、跨 ±180 的最短路、无目标/无朝向时不乱转。
+    """
+
+    @staticmethod
+    def obs_at(yaw_deg: float, tx: float, tz: float, *, has_target: bool = True) -> np.ndarray:
+        """目标在 ``(tx, tz)``、自身 yaw 为 ``yaw_deg``（度）的一帧观测。"""
+        targets = [make_target(2, "Foe", x=tx, z=tz)] if has_target else []
+        raw = make_observation("Glad_Bot_1", targets=targets)
+        raw["self"]["yaw"] = math.radians(yaw_deg)
+        return encode_observation(raw, "Glad_Bot_1", reach=REACH)
+
+    def dyaw_of(self, yaw_deg: float, tx: float, tz: float, **kwargs) -> float:
+        teacher = TeacherV4()
+        intent, _action, _reason = decide(self.obs_at(yaw_deg, tx, tz, **kwargs), teacher)
+        return float(intent["look"]["dyaw"])
+
+    def test_facing_target_keeps_dyaw_zero(self) -> None:
+        """正对目标（yaw=0、对手在 +Z）→ 不转，别抖。"""
+        self.assertEqual(self.dyaw_of(0.0, 0.0, 4.0), 0.0)
+
+    def test_back_target_turns_toward_it(self) -> None:
+        """背身（对手在身后偏右，yawErr≈−135°）→ 输出最大一档反向转。"""
+        dyaw = self.dyaw_of(0.0, 3.0, -3.0)
+        self.assertNotEqual(dyaw, 0.0, "背对目标却不转头：G-731 的核心行为丢了")
+        self.assertEqual(dyaw, -30.0)
+        # 转完这一档之后 |yawErr| 必须变小（−135° → −105°），否则就是转反了。
+        self.assertLess(abs(-135.0 - dyaw), 135.0)
+
+    def test_seam_uses_shortest_path_not_sign_flip(self) -> None:
+        """跨 ±180：+170° 与 −170° 的误差必须给出**相反**的转向（各走 10° 那一侧）。"""
+        plus = self.dyaw_of(170.0, 0.0, 4.0)      # yawErr ≈ −170°
+        minus = self.dyaw_of(-170.0, 0.0, 4.0)    # yawErr ≈ +170°
+        self.assertEqual(plus, -30.0)
+        self.assertEqual(minus, 30.0)
+        self.assertEqual(plus, -minus, "跨缝时转向符号必须镜像，不能同向")
+
+    def test_deadzone_is_silent_but_outside_turns(self) -> None:
+        """|yawErr| ≤ 20° 不转；25° 就要转（死区边界）。"""
+        self.assertEqual(self.dyaw_of(15.0, 0.0, 4.0), 0.0)
+        self.assertEqual(self.dyaw_of(-15.0, 0.0, 4.0), 0.0)
+        # yaw=+25°（朝 −X 偏一点）、对手在 +Z → yawErr = −25° → 往负方向转。
+        self.assertNotEqual(self.dyaw_of(25.0, 0.0, 4.0), 0.0)
+        self.assertEqual(self.dyaw_of(25.0, 0.0, 4.0), -30.0)
+
+    def test_no_target_never_turns(self) -> None:
+        """没有目标 → 观测 37/38 是 (0,0) → 不许乱转。"""
+        self.assertEqual(self.dyaw_of(120.0, 3.0, 3.0, has_target=False), 0.0)
+
+    def test_old_37_dim_vector_does_not_crash(self) -> None:
+        """旧 37 维向量（没有 37/38 位）也要能跑：没有朝向信息就不转。"""
+        legacy = self.obs_at(0.0, 3.0, -3.0)[:37]
+        teacher = TeacherV4()
+        intent, action, _reason = decide(legacy, teacher)
+        self.assertEqual(len(action), 10)
+        self.assertEqual(float(intent["look"]["dyaw"]), 0.0)
+
+    def test_intent_reflects_the_correction(self) -> None:
+        """``meta["intent"]`` 必须是修正**之后**的动作（复盘不能看到旧朝向）。"""
+        teacher = TeacherV4()
+        meta: dict = {}
+        action = teacher(self.obs_at(0.0, 3.0, -3.0), meta)
+        self.assertEqual(action[1], LOOK_YAW_V2.index(-30.0))
+        self.assertEqual(float(meta["intent"]["look"]["dyaw"]), -30.0)
+        self.assertEqual(action, list(teacher.state.last_action))
 
 
 if __name__ == "__main__":

@@ -17,8 +17,10 @@ from .items import default_table
 
 # --- 观测 ---------------------------------------------------------------
 
-#: 观测总维数。G-711：25 → 37（**只在末尾追加** 12 维跨帧信息，索引 0–24 一动不动）。
-OBS_DIM = 37
+#: 观测总维数。G-711：25 → 37（末尾追加 12 维跨帧信息）；G-731：37 → 39
+#: （末尾追加朝向误差 sin/cos）。**两轮都只在末尾追加**，索引 0–36 一动不动，
+#: 旧模型右侧补零即可继续用（``policy._pad_obs_columns``）。
+OBS_DIM = 39
 OBS_FIELDS = (
     "self_health",       # 0  自身血量 / 20
     "self_food",         # 1  饱食度 / 20
@@ -58,6 +60,9 @@ OBS_FIELDS = (
     "prev_sprint_reset",      # 34 上一帧 sprint_reset 头 / 3
     "frames_since_attack",    # 35 距上次 attack 的帧数，clip0–50 后 /50（0=本帧刚出手）
     "frames_since_hit",       # 36 距上次受伤的帧数，clip0–50 后 /50（0=本帧刚挨打）
+    # --- G-731：朝向误差（37/38）。sin/cos 由「指向对手的 bearing − 自身 yaw」得来 ----
+    "target_bearing_sin",     # 37 sin(yawErr)：正值 = 对手在自己左手边（1.8 yaw 逆时针）
+    "target_bearing_cos",     # 38 cos(yawErr)：1 = 正对对手，-1 = 完全背对
 )
 
 #: G-711：「上一帧十头动作」在观测里的起始下标（25..34，顺序 = ``ACTION_HEADS_V2``）。
@@ -67,6 +72,13 @@ FRAMES_SINCE_ATTACK_INDEX = 35
 FRAMES_SINCE_HIT_INDEX = 36
 #: G-711：帧数特征的分母（50 帧 ≈ 20Hz 下的 2.5 秒；再久就该饱和，不必区分）。
 FRAMES_NORMALIZER = 50.0
+
+#: G-731：朝向误差 sin/cos 的下标。
+BEARING_SIN_INDEX = 37
+BEARING_COS_INDEX = 38
+#: G-731：``self.yaw`` 缺失时这两维写 ``(0, 0)``——真实值恒满足 sin²+cos²=1，
+#: 所以 ``(0,0)`` 可以无歧义地表示「没有朝向信息」，不必伪造一个角度。
+BEARING_UNKNOWN = (0.0, 0.0)
 
 #: 观测裁剪范围：协议字段理论上有限，但 NaN/异常值不应该进网络。
 OBS_CLIP = 5.0
@@ -138,6 +150,214 @@ def nearest_player(
     return best
 
 
+# --- 对手着地推断（docs/observation-blindspots.md §2 #12） -----------------
+#
+# 为什么不能直接读协议里的 ``entities[].onGround``：
+# mineflayer 的实体对象（prismarine-entity）在构造函数里把 ``onGround`` 置 **true**，
+# 之后只有 ``lib/plugins/physics.js`` 会更新——而它只算 **Bot 自己** 的物理。
+# 远端玩家实体的 ``onGround`` 因此是**构造默认值常真**，转发过来只会得到恒 1.0，
+# 和恒 0 一样是死特征，而且更隐蔽（看起来「合理」）。所以训练侧自己从
+# 「竖直速度 + y 是否变化」推，运行时应按同一套规则推导（见文档里的 JS diff）。
+
+#: 判定「竖直速度归零」的阈值（格/tick）。1.8 站立时 vy 恒为 0，自由落体每 tick −0.08。
+GROUND_VY_EPS = 0.02
+#: 判定「这一帧 y 没动」的阈值（格）。静立时 y 逐位不变，0.001 只挡浮点抖动。
+GROUND_Y_EPS = 0.001
+#: 连续多少帧「vy≈0 且 y 未变」才认作着地。取 2 是为了滤掉跳跃顶点：
+#: 顶点那一帧 vy≈0、y 位移也接近 0，但下一帧必然转为下落。
+GROUND_CONFIRM_FRAMES = 2
+
+
+def _float_or_none(value: Any) -> float | None:
+    """宽容转 float；非数/NaN/Inf 一律 None（与 ``_f`` 的区别：不掩盖「没有」）。"""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(out) or math.isinf(out):
+        return None
+    return out
+
+
+def estimate_on_ground(
+    entity: dict,
+    previous_y: float | None = None,
+    *,
+    vy_eps: float = GROUND_VY_EPS,
+    y_eps: float = GROUND_Y_EPS,
+) -> bool | None:
+    """单帧推断「这个实体是否着地」。
+
+    @returns ``True`` 着地 / ``False`` 明确在空中 / ``None`` 无从判断
+
+    判据（按优先级）：
+    1. ``vy < -vy_eps`` → 在下落，无争议；
+    2. ``|vy| > vy_eps`` → 在上升或快速运动，不是着地；
+    3. 否则需要 ``previous_y``：``|y - previous_y| <= y_eps`` 才算着地。
+       没有上一帧时返回 ``None``——单帧的「vy≈0」无法区分静立与跳跃顶点。
+    """
+    if not isinstance(entity, dict):
+        return None
+    pos = entity.get("pos") or {}
+    velocity = entity.get("velocity") or {}
+    y = _float_or_none(pos.get("y"))
+    vy = _float_or_none(velocity.get("y"))
+    if y is None:
+        return None
+    if vy is None:
+        return None
+    if vy < -vy_eps:
+        return False
+    if abs(vy) > vy_eps:
+        return False
+    if previous_y is None:
+        return None
+    return abs(y - previous_y) <= y_eps
+
+
+class GroundEstimator:
+    """逐观测者维护「对手是否着地」的推断状态。
+
+    每个 Bot 一个实例：``update()`` 吃它自己那一帧的 ``entities``，``as_map()`` 交给
+    :func:`encode_observation` 的 ``opponent_ground`` 参数。状态是「上一帧 y + 连续帧计数」，
+    所以必须在**每步编码前**调一次 ``update()``（``GladiatorEnv._encode_all`` 是唯一入口）。
+
+    首帧一律给 ``False``（没有上一帧 y，无法区分静立与跳跃顶点）；之后要连续
+    ``confirm_frames`` 帧判为「可着地」才翻成 ``True``，即最快在**第 3 帧**（首帧 + 2 帧确认）
+    报 ``True``——20Hz 下约 100ms。
+    """
+
+    def __init__(
+        self,
+        *,
+        vy_eps: float = GROUND_VY_EPS,
+        y_eps: float = GROUND_Y_EPS,
+        confirm_frames: int = GROUND_CONFIRM_FRAMES,
+    ) -> None:
+        self.vy_eps = float(vy_eps)
+        self.y_eps = float(y_eps)
+        self.confirm_frames = max(1, int(confirm_frames))
+        self.reset()
+
+    def reset(self) -> None:
+        self._last_y: dict[str, float] = {}
+        self._streak: dict[str, int] = {}
+        self._grounded: dict[str, bool] = {}
+        self._frame: "object | None" = None
+
+    def update(self, entities: "Iterable[dict] | None", frame: "object | None" = None) -> dict[str, bool]:
+        """推进一帧；返回 ``{小写名字: 是否着地}``（沿用上一帧的名字集合）。
+
+        ``frame`` 给「同一帧可能被多处编码」的场景用（学习方 ``_encode_all`` 与
+        策略对手的观测在同一 step 内各编码一次）：**同一个 frame 只推进一次**，
+        否则连续帧计数会被推快一倍，跳跃顶点的误判就漏出来了。
+        传 ``None`` 表示不做幂等保护（纯函数式用法/单测）。
+        """
+        if frame is not None and frame == self._frame:
+            return self._grounded
+        if frame is not None:
+            self._frame = frame
+        for entity in entities or []:
+            if not isinstance(entity, dict):
+                continue
+            name = str(entity.get("name", "")).lower()
+            if not name:
+                continue
+            y = _float_or_none((entity.get("pos") or {}).get("y"))
+            state = estimate_on_ground(entity, self._last_y.get(name),
+                                       vy_eps=self.vy_eps, y_eps=self.y_eps)
+            if state is True:
+                streak = self._streak.get(name, 0) + 1
+                self._streak[name] = streak
+                self._grounded[name] = streak >= self.confirm_frames
+            else:
+                # False（在空中）与 None（不知道）都清零：连续确认必须是真的连续。
+                self._streak[name] = 0
+                self._grounded[name] = False
+            if y is not None:
+                self._last_y[name] = y
+        return self._grounded
+
+    def as_map(self) -> dict[str, bool]:
+        """当前推断结果（拷贝，避免调用方改到内部状态）。"""
+        return dict(self._grounded)
+
+
+def episode_fraction(steps: int, max_steps: int) -> float:
+    """本局进度 0..1（观测 ``step_fraction``）。
+
+    口径 = **本局已过时间 / 本局时长上限**：在训练里步长固定
+    （``steps × 1/control_hz``），所以等价于 ``steps / max_steps``；运行时按
+    ``elapsed / roundSeconds`` 算，两边是同一个量。``max_steps <= 0`` 视为「无上限」→ 0。
+    """
+    total = _float_or_none(max_steps)
+    if total is None or total <= 0.0:
+        return 0.0
+    done = _float_or_none(steps)
+    if done is None:
+        return 0.0
+    return _clamp(done / total, 0.0, 1.0)
+
+
+def attack_cooldown_remaining(since_attack: float | None) -> float:
+    """距上次出手还差多少秒到 0.5s 无敌帧结束（观测 ``self_attack_cooldown``）。
+
+    ``0.0`` = 可以打、``ATTACK_COOLDOWN_S`` = 刚打完。既然口径是「没有出手就一定 ≥0.5s」，
+    所以传 ``None``（不知道上次出手时间）按 **0.0**（= 视为可打），与
+    ``encode_observation`` 的缺省语义、以及 ``since_attack`` 缺省 5s 保持一致。
+    """
+    value = _float_or_none(since_attack)
+    if value is None:
+        return 0.0
+    return _clamp(ATTACK_COOLDOWN_S - value, 0.0, ATTACK_COOLDOWN_S)
+
+
+def wrap_pi(angle: float) -> float:
+    """把弧度角归一到 ``[-π, π)``（跨 ±180° 折返用）。
+
+    ``(x + π) % 2π - π`` 是区间映射的标准写法：``190° → -170°``、``-190° → 170°``，
+    ``180°`` 落在 ``-π``（左闭右开，避免「+π 与 −π 同一个方向却编码成两个值」）。
+    """
+    return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def wrap180(angle: float) -> float:
+    """角度制版本的 :func:`wrap_pi`（结果落在 ``[-180, 180)``）。"""
+    return math.degrees(wrap_pi(math.radians(float(angle))))
+
+
+def yaw_error(dx: float, dz: float, self_yaw: float) -> float:
+    """指向对手的 bearing 与自身 yaw 的差（弧度，已折返到 ``[-π, π)``）。
+
+    ``bearing = atan2(-dx, dz)`` 是 1.8 的 yaw 约定（0 = +Z、+90° = −X、−90° = +X），
+    与运行时 ``index.js::describeFacing`` 的 ``bearing`` / ``arena`` 的 ``yawTowards`` 同口径。
+    正值 = 需要把 yaw 加大（逆时针）才对得上对手。
+    """
+    return wrap_pi(math.atan2(-dx, dz) - float(self_yaw))
+
+
+def bearing_sin_cos(dx: float, dz: float, self_yaw: float) -> tuple[float, float]:
+    """朝向误差的 ``(sin, cos)``（G-731 观测 37/38）。
+
+    用 sin/cos 而不是直接给角度：角度在 ±180° 处不连续，网络学起来会看到「跳变」；
+    sin/cos 是连续的，且两者合起来等价于角度（``atan2(sin, cos)`` 可还原）。
+    """
+    error = yaw_error(dx, dz, self_yaw)
+    return math.sin(error), math.cos(error)
+
+
+def self_yaw_of(observation: dict) -> float | None:
+    """读观测里的自身朝向（弧度）；缺字段/非数返回 ``None``。
+
+    单独一个入口是为了让「朝向到底有没有」这件事只有一种判法：编码器与环境的
+    ``yawAvailable`` 诊断都走这里，避免两边对「0 是默认值还是真实读数」理解不同。
+    """
+    payload = observation.get("self") if isinstance(observation, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    return _float_or_none(payload.get("yaw"))
+
+
 def encode_observation(
     observation: dict,
     username: str,
@@ -151,6 +371,8 @@ def encode_observation(
     prev_action: "Iterable[int] | None" = None,
     frames_since_attack: float | None = None,
     frames_since_hit: float | None = None,
+    opponent_ground: "dict[str, bool] | None" = None,
+    self_yaw: float | None = None,
 ) -> np.ndarray:
     """把一条 OBSERVATION 编码成固定长度的 float32 向量。
 
@@ -163,6 +385,10 @@ def encode_observation(
     ``attack_cooldown_remaining`` 是距上次 attack 还差多少秒到 0.5s 无敌帧结束（G-702）；
     环境按 ``0.5 - 距上次下发 attack 的秒数`` 算好后传入，不传按 0（= 可以打）。
 
+    ``opponent_ground`` 是 ``{小写用户名: 是否着地}``（``GroundEstimator.as_map()``）。
+    优先级：本参数 > 协议字段 ``target["onGround"]``（**只在它是真 bool 时**才采信）>
+    :func:`estimate_on_ground` 的单帧推断（无历史，判不出着地 → 0）。
+
     G-711（跨帧信息，索引 25–36）：
 
     - ``prev_action``：上一帧的**十头下标**（顺序 = ``ACTION_HEADS_V2``），每维
@@ -170,12 +396,18 @@ def encode_observation(
     - ``frames_since_attack`` / ``frames_since_hit``：距上次出手 / 受伤的**帧数**，
       clip 到 0–50 再 /50。``None`` 视为「很久以前」（= 1.0，与 ``since_attack`` 缺省 5s
       同口径），这样旧调用方不传时不会假装「刚打完」。
+
+    G-731（朝向误差，索引 37/38）：``self_yaw`` 是自身朝向（弧度，mineflayer 口径）。
+    不传则回落到 ``observation.self.yaw``；**两边都拿不到时写 ``(0, 0)`` 并在环境侧记
+    ``yawAvailable=False``**（``(0,0)`` 不可能是真实的 sin/cos，所以是无歧义的「不知道」）。
     """
     self_payload = observation.get("self") or {}
     pos = self_payload.get("pos") or {}
     sx, sy, sz = _f(pos.get("x")), _f(pos.get("y")), _f(pos.get("z"))
     yaw = _f(self_payload.get("yaw"))
     pitch = _f(self_payload.get("pitch"))
+    # G-731：朝向读没读到要单独判——``0.0`` 是合法角度（面向 +Z），不能用真假值区分。
+    known_yaw = _float_or_none(self_yaw) if self_yaw is not None else self_yaw_of(observation)
 
     target = nearest_player(observation, username, opponents)
     state = str(observation.get("state", "Alive"))
@@ -256,7 +488,18 @@ def encode_observation(
             0.0,
             1.0,
         )
-        vector[12] = 1.0 if target.get("onGround") else 0.0
+        # 对手是否着地（原为恒 0 的死特征）。取数顺序见 ``opponent_ground`` 的说明：
+        # 环境推断 > 协议真 bool 字段 > 单帧推断（判不出就当「未着地」）。
+        grounded = None
+        if opponent_ground:
+            grounded = opponent_ground.get(str(target.get("name", "")).lower())
+        if grounded is None:
+            flag = target.get("onGround")
+            if isinstance(flag, bool):
+                grounded = flag
+        if grounded is None:
+            grounded = estimate_on_ground(target)
+        vector[12] = 1.0 if grounded else 0.0
         vector[13] = 1.0
         # 对手速度（缺字段=0）：水平速度用 √(vx²+vz²)，竖直分量单独给。
         velocity = target.get("velocity") or {}
@@ -266,6 +509,13 @@ def encode_observation(
         # 水平距离 ≤ reach 才算「这一刀打得中」；竖直差再大也不该判 false
         # （原版攻击判定是 3D 距离，但训练里跳劈的干扰远小于水平贴身/拉开）。
         vector[22] = 1.0 if horizontal <= float(reach) else 0.0
+        # G-731（index 37/38）：朝向误差。索引 4/5 的 self_yaw_sin/cos 只说「朝哪」，
+        # 不说「对手在哪」，模型因此学不出「先转向再走」——真机表现为被击退后一路背身跑。
+        # 这里给「两者之差」的 sin/cos，让 7–9 维的相对位置与 4/5 维的朝向在同一空间对齐。
+        if known_yaw is not None:
+            vector[BEARING_SIN_INDEX], vector[BEARING_COS_INDEX] = bearing_sin_cos(
+                dx, dz, known_yaw)
+        # 无 yaw（协议没带）或无目标：保持 (0,0) = 「不知道」，不假装正对。
 
     return np.clip(vector, -OBS_CLIP, OBS_CLIP).astype(np.float32)
 

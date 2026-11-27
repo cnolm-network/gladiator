@@ -27,6 +27,9 @@ function state(overrides = {}) {
     busy: false,
     busySkips: 512,
     notReadySkips: 0,
+    // G-721：盲决策计数与原始实体数（心跳字段名是 blind= / entities=）。
+    blind: 0,
+    entitiesSeen: 0,
     lastAction: null,
     lastActionAt: 0,
     lastTickAt: 1000,
@@ -42,7 +45,7 @@ function state(overrides = {}) {
 test('心跳行包含 dist / armor / waitingKit，且顺序稳定', () => {
   const line = formatHeartbeat(state(), 1046);
   assert.match(line, /^\[brain\] 心跳 decisions=2486 attacks=132 failures=3 waitingKit=2 timeouts=0 /);
-  assert.match(line, / busy=0 skips=512 notReady=0 dist=3\.2 armor=20 /);
+  assert.match(line, / busy=0 skips=512 notReady=0 blind=0 entities=0 dist=3\.2 armor=20 /);
   assert.match(line, / last=idle lastTick=46ms target=lvsm_ oppHp=18\.4$/);
 });
 

@@ -348,9 +348,11 @@ class CritJumpTest(unittest.TestCase):
                          f"3 步里跳了 {actions.count(ACTION_JUMP)} 次：{[ACTION_NAMES[a] for a in actions]}")
 
     def test_jump_does_not_depend_on_target_ground(self):
-        """回归：协议 entities[] 没有 onGround，观测第 12 维恒为 0。
+        """回归：``teacher`` 的起跳条件**不许**依赖 ``target_on_ground``（index 12）。
 
         2026-11-21 的 12 局里 crit_jump 一次都没出现，就是因为起跳条件里要求了它。
+        注：该维本身后来改成了推断值（见 ``docs/observation-blindspots.md`` §4 P1-1），
+        但老师仍然不读它——这条用例锁的是「不依赖」，不是「恒 0」。
         """
         harness = Harness(frame_seconds=0.2037)
         harness.step(2.6)                          # 砍

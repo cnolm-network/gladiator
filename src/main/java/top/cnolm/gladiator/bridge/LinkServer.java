@@ -269,7 +269,8 @@ public final class LinkServer {
                     }
                 }
             } catch (IOException e) {
-                if (running) {
+                // 探活式连接（未发字节就断）不记日志，否则面板刷新会把日志刷屏。
+                if (running && !(e instanceof WebSocketConnection.SilentHandshakeClose)) {
                     handler.log("link connection closed: " + e.getMessage());
                 }
             } finally {
@@ -313,6 +314,16 @@ public final class LinkServer {
         String username = hello.payloadString("username", botId);
         SessionRegistry.Session previous = sessions.findByBotId(botId);
         if (previous != null) {
+            // G-726：先给旧连接发一条**致命** REJECT，再关掉它。否则旧运行时只看到
+            // 「连接被关闭」就会立刻重连，两个进程互相顶掉对方，形成每秒一次的
+            // replaced-by-reconnect 风暴（真机 23:33 实测）；风暴期间 mineflayer 的
+            // 实体表反复重建，表现为「Bot 看不见对手」（G-721 的真正根因）。
+            try {
+                reject(previous.connection(), "SESSION_REPLACED",
+                        "同一 botId 已有新连接接入，本连接不再重连");
+            } catch (java.io.IOException ignored) {
+                // 旧连接可能已经半死，发不出去不影响后续清理。
+            }
             sessions.remove(previous);
             previous.connection().close();
             notifyDisconnect(previous, "replaced-by-reconnect");

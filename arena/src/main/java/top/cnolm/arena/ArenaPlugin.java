@@ -5,6 +5,8 @@ import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 import top.cnolm.arena.handler.ArenaEventHandler;
+import top.cnolm.arena.simplify.Recorder;
+import top.cnolm.arena.simplify.RecorderExport;
 import top.cnolm.arena.status.ArenaMatch;
 import top.cnolm.arena.status.MatchManager;
 import top.cnolm.gladiator.api.board.Board;
@@ -12,6 +14,9 @@ import top.cnolm.gladiator.api.board.BoardContext;
 import top.cnolm.gladiator.api.board.BoardRegistry;
 import top.cnolm.gladiator.api.board.Boards;
 import top.cnolm.gladiator.api.board.RoundSpec;
+
+import java.io.IOException;
+import java.nio.file.Path;
 
 /**
  * 板子插件入口。
@@ -72,6 +77,9 @@ public final class ArenaPlugin extends JavaPlugin {
             sender.sendMessage("§e对局已结束");
             return true;
         }
+        if ("record".equals(sub)) {
+            return handleRecord(sender, args);
+        }
         if ("quit".equals(sub)) {
             if (!(sender instanceof Player)) {
                 sender.sendMessage("§c该命令只能由玩家执行");
@@ -110,7 +118,37 @@ public final class ArenaPlugin extends JavaPlugin {
             }
             return true;
         }
-        sender.sendMessage("§7/arena start <player> <bot> [局数] [每局秒数] | quit | stop | status");
+        sender.sendMessage("§7/arena start <player> <bot> [局数] [每局秒数] | quit | stop | status"
+                + " | record dump [文件名]");
+        return true;
+    }
+
+    /**
+     * {@code /arena record dump [文件名]}：把当前（或最近一局）的内存录像写成 JSONL。
+     *
+     * <p>无参时用 {@code <matchId>-<yyyyMMdd-HHmmss>.jsonl}；给了文件名就按它命名
+     * （自动补 {@code .jsonl}），固定写到 {@code plugins/Arena/records/}。
+     * 回显绝对路径与条数——录像丢了最难查，先把「写到哪」说清楚。
+     */
+    private boolean handleRecord(CommandSender sender, String[] args) {
+        if (args.length < 2 || !"dump".equalsIgnoreCase(args[1])) {
+            sender.sendMessage("§c用法: /arena record dump [文件名]");
+            return true;
+        }
+        Recorder recorder = board == null ? null : board.recorder();
+        if (recorder == null || recorder.size() == 0) {
+            sender.sendMessage("§c没有可导出的录像（本场还没开局，或未采集到记录）");
+            return true;
+        }
+        String fileName = args.length > 2 ? args[2] : null;
+        try {
+            Path file = RecorderExport.export(recorder, board.recordMatchId(), fileName);
+            sender.sendMessage("§a已导出录像: §f" + file.toAbsolutePath()
+                    + " §7(" + recorder.size() + " 条)");
+        } catch (IOException | RuntimeException e) {
+            getLogger().warning("[recorder] 导出失败: " + e);
+            sender.sendMessage("§c导出失败: " + e.getMessage());
+        }
         return true;
     }
 

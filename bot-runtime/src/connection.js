@@ -6,9 +6,13 @@
  * - 断线后按 1s → 2s → 4s … 30s 上限退避重连，重连成功必须重新 HELLO。
  * - AUTH_FAILED / VERSION_UNSUPPORTED 属于配置错误，重试没有意义，直接停止并上报。
  * - 服务端重启后端口暂时不可用，重连会自然退避等待，不需要特殊处理。
+ * - `MATCH_PHASE` 只做「归一化 + 存进 state.matchPhase + emit('match-phase')」，
+ *   要不要据此改变行为由上层决定（`index.js` 在准备期不出手）。
  */
 import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
+
+import { normalizeMatchPhase } from './match-phase.js';
 
 /** 指数退避（带轻微抖动，避免多个进程同时重连打爆插件）。 */
 export class Backoff {
@@ -45,7 +49,7 @@ export class Backoff {
 }
 
 /** REJECT 中这些错误码意味着重连也不会成功。 */
-const FATAL_CODES = new Set(['AUTH_FAILED', 'VERSION_UNSUPPORTED']);
+const FATAL_CODES = new Set(['AUTH_FAILED', 'VERSION_UNSUPPORTED', 'SESSION_REPLACED']);
 
 export class LinkClient extends EventEmitter {
   constructor({
@@ -79,6 +83,15 @@ export class LinkClient extends EventEmitter {
     this.fatal = null;
     this.reconnectTimer = null;
     this.heartbeatTimer = null;
+    /**
+     * 链路层保存的会话内状态（只读镜像，游戏逻辑仍在 index.js 决定）。
+     *
+     * `matchPhase` 是最近一帧 `MATCH_PHASE` 的归一化结果（`match-phase.js`），
+     * 没收到过就是 `null`——调用方必须把 `null` 当成「不知道」，不要当成某个阶段。
+     */
+    this.state = {
+      matchPhase: null,
+    };
   }
 
   /** 开始连接；重复调用是幂等的。 */
@@ -213,6 +226,14 @@ export class LinkClient extends EventEmitter {
         }
         return;
       }
+      case 'MATCH_PHASE': {
+        // 对局阶段：归一化后存进链路状态，并单独发一个事件给上层（不混进 'message'，
+        // 否则 index.js 那条兜底 `console.log(未知类型)` 会把每秒一帧刷成日志噪音）。
+        const phase = normalizeMatchPhase(envelope.payload, Date.now());
+        this.state.matchPhase = phase;
+        this.emit('match-phase', phase, envelope);
+        return;
+      }
       default:
         this.emit('message', envelope);
     }
@@ -221,6 +242,9 @@ export class LinkClient extends EventEmitter {
   _onClose(code, reason) {
     this._clearHeartbeat();
     this.ws = null;
+    // 断线后阶段就失效了：上一个会话的 `ended` 不能把重连后的新对局永久冻住。
+    // 重连后插件在倒计时/战斗中每秒都会重推，最多晚 1 秒恢复。
+    this.state.matchPhase = null;
     this.emit('close', { code, reason: reason?.toString?.() ?? '' });
     if (this.stopped) {
       this.emit('stopped');

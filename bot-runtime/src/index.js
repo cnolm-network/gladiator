@@ -13,6 +13,7 @@
  * 环境变量：GLADIATOR_BRIDGE_PORT / GLADIATOR_BRIDGE_TOKEN / GLADIATOR_ENV_PORT /
  *          MC_HOST / MC_PORT / BOT_USERNAME / MC_VERSION / OBSERVATION_HZ
  */
+import fs from 'node:fs';
 import path from 'node:path';
 import { loadItemTable, matchingMask } from './action-mask.js';
 import { ActionDispatcher } from './actions.js';
@@ -24,15 +25,26 @@ import {
 import { LinkClient } from './connection.js';
 import { decodeAction, encodeObservation, entityHealth, nearestPlayer, OBS_DIM } from './features.js';
 import { applyIntent, decodeIntentVector, describeIntent, resetIntentState } from './intent.js';
+import {
+  countdownLine,
+  facingAction,
+  filterPhaseActions,
+  phaseGate,
+  remainingSeconds,
+} from './match-phase.js';
 import { BrainCrossFrame } from './brain-cross-frame.js';
 import {
+  BlindWatch,
   FarChaseNotifier,
   TargetPresence,
   armorPoints,
   formatHeartbeat,
+  hasVisibleTarget,
   horizontalDistance,
 } from './brain-telemetry.js';
 import { debugLog, setDebugEnabled } from './debug.js';
+import { DecisionRate, RollingMean } from './brain-metrics.js';
+import { PlanExecutor, makePlan } from './plan-queue.js';
 import { EnvLinkServer } from './link-server.js';
 import { describeLoginFailure, launchBot } from './minecraft.js';
 import { buildObservation } from './observation.js';
@@ -90,6 +102,22 @@ const attackCooldownMs = Math.max(
     : DEFAULT_ATTACK_COOLDOWN_MS),
 );
 const targetPlayerArg = String(arg('target-player', '') || '').trim();
+// --- 观测落盘（G-721 排查）---------------------------------------------------
+// `--dump-obs <file>` 把每个大脑决策帧的编码向量写成 JSONL（最多 DUMP_OBS_LIMIT 帧），
+// 用来和训练侧 `spaces.encode_observation` 逐维 diff——「运行时看到的世界」不该靠猜。
+const dumpObsPath = String(arg('dump-obs', '') || '').trim();
+const DUMP_OBS_LIMIT = 60;
+//: 每多少个决策帧落一帧（20Hz 下 40 帧 ≈ 2 秒采样一件，覆盖整局而不是只抓开头）。
+const DUMP_OBS_EVERY = Math.max(1, Number(arg('dump-obs-every', 40)) || 40);
+let dumpObsCount = 0;
+if (dumpObsPath) {
+  try {
+    fs.writeFileSync(dumpObsPath, '', 'utf8');
+    console.log(`[brain] 观测落盘：${dumpObsPath}（上限 ${DUMP_OBS_LIMIT} 帧）`);
+  } catch (error) {
+    console.warn(`[brain] 观测落盘初始化失败：${error.message}`);
+  }
+}
 // --- 调试日志（G-717-B）-----------------------------------------------------
 // `--debug` 或 GLADIATOR_DEBUG=1 才打开；打开后高频细节（远距离追击的
 // OUT_OF_REACH_CHASED 等）以 `[debug]` 前缀输出，默认静默不刷屏。
@@ -340,7 +368,7 @@ const ATTACK_HEAD_INDEX = policy && policy.actionSpace === 'v2'
 /**
  * G-711：本地大脑的跨帧状态（上一帧动作 + 两个帧计数）。
  *
- * <p>训练侧把这三项编码进观测的 25–36 维；运行时如果不产，37 维模型的后 12 维恒为 0，
+ * <p>训练侧把这三项编码进观测的 25–36 维；运行时如果不产，模型的后 12 维恒为 0，
  * 训练与推理的输入分布就错位了。计数单位是**大脑决策帧**（`--brain-hz`，默认 20Hz），
  * 与训练侧 `action_ticks/control_hz` 的步长口径对齐——不是 mineflayer tick，也不是服务端 tick。
  */
@@ -375,11 +403,35 @@ const brainState = {
   busySkips: 0,
   //: 因为 bot/session/bot.entity 缺失而跳过的次数（另一种「静默空转」）。
   notReadySkips: 0,
+  // --- G-735：非阻塞派发（决策侧耗时 / 执行侧耗时拆开看） ---------------------
+  //: 一帧决策的总耗时（ms）= 读观测 + 编码 + 推理 + 入队；心跳 `lastTick=`。
+  lastFrameMs: 0,
+  //: 上一帧的分段耗时（心跳 `obsMs/inferMs/applyMs`）。
+  obsMs: 0,
+  inferMs: 0,
+  //: 最近一次「计划执行」的耗时（ms），由执行器写回；心跳 `applyMs=`。
+  applyMs: 0,
+  //: 因为「计划还没执行完」被丢掉的计划数（心跳 `superseded=`）。
+  superseded: 0,
+  // --- G-721：盲决策（大脑认为有目标，观测里 has_target=0） -------------------
+  //: 盲决策帧数（进心跳 `blind=`）。它一直涨说明目标「看不见」：登录窗口内 tp 被客户端
+  //: 位置预测吃掉、换世界/重生后实体未同步、或目标名字被过滤器挡掉。
+  blind: 0,
+  //: 最近一帧 mineflayer 的原始实体数（含自己，进心跳 `entities=`）。
+  //: `entities=1` + `blind` 涨 = 世界还没同步进来，不是模型问题。
+  entitiesSeen: 0,
   // --- G-717：把「在赶路 / 等套件 / 目标不在线」从「不动也不打」里区分开 ---------
   //: 进入「等板子发套件」的次数（不算失败；2 秒没等到才由调用方算失败）。
   waitingKit: 0,
   //: 本次对局是否已经打过「等套件」的提示（每局只打一次）。
   kitWaitLogged: false,
+  // --- 对局阶段（MATCH_PHASE，插件每秒推一帧）-------------------------------
+  //: 最近一帧归一化后的阶段；`null` = 没收到过（老服务端）→ 不做任何抑制。
+  matchPhase: null,
+  //: 准备期日志的节流哨兵：只在「剩余秒数变了」时打一行，避免 5Hz 刷屏。
+  countdownLoggedSecond: null,
+  //: `ended` 只提示一次。
+  endedLogged: false,
   //: 与目标的水平距离（心跳里的 dist）与本局最远距离（远距离提示用）。
   targetDist: null,
   maxTargetDist: 0,
@@ -402,10 +454,35 @@ const brainState = {
 const targetPresence = new TargetPresence({
   offlineAfterMs: TARGET_OFFLINE_AFTER_MS, name: targetPlayerArg,
 });
+
+// --- G-735：决策侧 / 执行侧拆开的两个基础设施 ---------------------------------
+//: 最近 10 秒的决策率（心跳 `hz=`）。用首末间隔算，开局也能显示真实频率。
+const decisionRate = new DecisionRate({ windowMs: 10000 });
+//: 最近 50 个计划的执行耗时（心跳 `applyMsMean=`）；不用累计均值，免得一次超时把基线拉高。
+const applyMean = new RollingMean({ size: 50 });
+
+/**
+ * 动作计划执行器：**串行**消费，队列最多 1 个待执行计划。
+ *
+ * <p>决策侧 `submit()` 立刻返回（这就是非阻塞的那一半）；正在执行的计划不打断，
+ * 新计划只在队列里等——所以「半截 move」不会出现，而决策仍能按 20Hz 跑满。
+ */
+const planExecutor = new PlanExecutor({
+  capacity: 1,
+  execute: (plan) => executePlan(plan),
+  onError: (error, plan) => {
+    brainState.lastError = `计划执行失败: ${error?.message ?? error}`;
+    console.warn(`[brain] 计划执行失败 plan=${plan?.planId ?? '?'}:`
+      + ` ${error?.message ?? error}`);
+  },
+});
+
 /** 远距离「赶路中」提示（G-717-B）：>24 格每 5 秒一条，回到近处重置。 */
 const farChaseNotifier = new FarChaseNotifier({
   threshold: FAR_CHASE_THRESHOLD, everyMs: FAR_CHASE_LOG_MS,
 });
+/** 盲决策告警（G-721）：首次立刻报，之后每 5 秒一条；恢复可见报一条。 */
+const blindWatch = new BlindWatch({ everyMs: 5000 });
 
 const brainScheduler = new ActionScheduler({
   // 大脑每 tick 最多发 3 条动作（look/move/attack），20Hz 就是 60 条/秒。
@@ -421,7 +498,7 @@ const brainScheduler = new ActionScheduler({
 /**
  * 单个动作的硬超时（G-716）。默认 3 秒；`GLADIATOR_ACTION_TIMEOUT_MS` 可覆盖。
  *
- * <p>为什么需要：`brainTick()` 用 `brainState.busy` 防重入，`finally` 里清零。只要有一条
+ * <p>为什么需要：`brainDecide()` 用 `brainState.busy` 防重入，`finally` 里清零。只要有一条
  * `await` 永不 settle（mineflayer 的窗口事务确认、`equip`、`look` 的 physicsTick 都可能），
  * `busy` 就永远是 true，之后**每一帧都直接 return**——表现是「只决策一次、不动不打、无失败日志」。
  * 超时后放行不是修根因，而是把「静默卡死」变成「可见的告警 + 继续决策」。
@@ -495,6 +572,32 @@ function currentInventoryItems() {
   return [];
 }
 
+/**
+ * 带护甲槽的背包快照（G-722）。
+ *
+ * `bot.inventory.items()` 只遍历 `inventoryStart..inventoryEnd`（9–44），
+ * **不含 5–8 的护甲槽**，所以心跳用 `items()` 算护甲永远得到 0（服务端却是 20）。
+ * 这里直接读 `bot.inventory.slots`（窗口 0 的完整 45 格）并补上 `slot` 下标。
+ */
+function currentInventorySlots() {
+  try {
+    const inventory = bot && bot.inventory;
+    if (inventory && Array.isArray(inventory.slots)) {
+      const out = [];
+      for (let slot = 0; slot < inventory.slots.length; slot += 1) {
+        const item = inventory.slots[slot];
+        if (item) {
+          out.push({ ...item, slot });
+        }
+      }
+      return out;
+    }
+  } catch (error) {
+    // 背包窗口重建期间可能抛：心跳不能因此失败，退化成 items()。
+  }
+  return currentInventoryItems();
+}
+
 /** 目标玩家实体（mineflayer 只跟踪视野内的实体：可能「在线但拿不到实体」）。 */
 function findPlayerEntity(name) {
   if (!name || !bot) {
@@ -544,6 +647,40 @@ function refreshTargetPresence(nowMs) {
  * 刷新「与目标的水平距离」（G-717-B），顺带维护本局最远距离，并结算两条提示：
  * 目标不在线（C）、远距离赶路（B）。返回当前距离或 null（没有目标/拿不到实体）。
  */
+/**
+ * G-723：朝向诊断。
+ *
+ * `yaw` 是 mineflayer 的自身朝向（弧度转度），`bearing` 是「从自己指向目标」的理想朝向，
+ * 采用 1.8 的约定：0° 指 +Z、90° 指 −X（与 `arena` 的 `yawTowards` 同一公式）。
+ * `move=forward` 时角色沿自身朝向走，所以 `yawErr` 接近 ±90/180 就等于「在绕圈」。
+ */
+function describeFacing() {
+  const self = bot && bot.entity ? bot.entity : null;
+  const entity = findPlayerEntity(brainState.target);
+  const yaw = self && Number.isFinite(self.yaw) ? (self.yaw * 180) / Math.PI : null;
+  if (!self || !self.position || !entity || !entity.position) {
+    return { yaw, bearing: null, yawErr: null };
+  }
+  const dx = entity.position.x - self.position.x;
+  const dz = entity.position.z - self.position.z;
+  if (Math.abs(dx) < 1e-6 && Math.abs(dz) < 1e-6) {
+    return { yaw, bearing: null, yawErr: null };
+  }
+  const bearing = (Math.atan2(-dx, dz) * 180) / Math.PI;
+  let yawErr = bearing - (yaw === null ? 0 : yaw);
+  while (yawErr > 180) {
+    yawErr -= 360;
+  }
+  while (yawErr < -180) {
+    yawErr += 360;
+  }
+  return { yaw: round1(yaw), bearing: round1(bearing), yawErr: round1(yawErr) };
+}
+
+function round1(value) {
+  return Number.isFinite(value) ? Math.round(value * 10) / 10 : value;
+}
+
 function refreshTargetDistance(nowMs) {
   const self = bot && bot.entity ? bot.entity.position : null;
   const entity = findPlayerEntity(brainState.target);
@@ -563,11 +700,45 @@ function refreshTargetDistance(nowMs) {
 }
 
 /**
+ * G-721 自检：大脑认为有目标、但观测里 `has_target==0` 时告警并计数。
+ *
+ * <p>为什么必须单独报：`encodeObservation` 在找不到目标时，`target_dx/dy/dz/distance`、
+ * `target_health`、`opponent_speed`、`in_reach` 全部**静默 0**（`has_target` 是唯一的判别位）。
+ * 策略会把「对手贴脸、满血、够得着」与「看不见」编码成不同向量，而「看不见」这一帧
+ * 恰好长得像「对手在正中心 0 格、0 血」，于是做出任何动作都不会在日志里留下异常。
+ *
+ * <p>判读：`entities=1` → 世界没同步进来（客户端坐标还停在旧位置，G-721 真机形态）；
+ * `entities>1` 而仍不可见 → 目标名字被 `allowed` / `isLikelyBot` 过滤掉了。
+ *
+ * @param {string|null} targetName 本帧大脑选定的目标（`pickTarget` 的返回值）
+ * @param {ArrayLike<number>} features 本帧 39 维观测（G-731 从 37 扩到 39，前 37 位不变）
+ * @param {number} nowMs
+ * @returns {boolean} 本帧是否盲
+ */
+function recordBlindness(targetName, features, nowMs) {
+  const rawEntities = bot && bot.entities ? Object.keys(bot.entities).length : 0;
+  brainState.entitiesSeen = rawEntities;
+  const { blind, line } = blindWatch.update(nowMs, {
+    expected: Boolean(targetName),
+    visible: hasVisibleTarget(features),
+    entities: rawEntities,
+  });
+  if (blind) {
+    brainState.blind += 1;
+  }
+  if (line) {
+    console.warn(line);
+  }
+  return blind;
+}
+
+/**
  * 心跳（G-716/G-717）：每 5 秒一行，回答「大脑还在转吗、卡在哪、是在赶路还是在等套件」。
  *
  * - `decisions` 不涨 + `busy=1` → 有动作卡住（配合 `last=` 看是哪个）；
  * - `skips` 一直涨 → 每帧都因为 busy 被丢掉（就是「只决策一次就停」的形态）；
  * - `failures`/`timeouts` → 动作层真的在报错/超时；
+ * - `blind`/`entities` → 盲决策帧数与原始实体数（G-721，见 `recordBlindness`）；
  * - `dist`/`armor` → 与目标的水平距离、身上护甲点数（`dist=-` 表示没有目标）；
  * - `waitingKit` → 板子还没发套件（不是模型问题）。
  */
@@ -579,10 +750,30 @@ function startBrainHeartbeat() {
     const now = Date.now();
     // 心跳里也要结算一次「赶路 / 目标不在线」：决策线程被动作占住时它同样要刷新。
     const dist = refreshTargetDistance(now);
+    // G-723：朝向诊断——`yaw` 是自身朝向、`bearing` 是「指向目标」的理想朝向，
+    // `yawErr` 是两者差（度，归一到 ±180）。move=forward 却贴不近目标时，
+    // 先看 yawErr：接近 ±90/180 就说明它在绕圈而不是前进。
+    const facing = describeFacing();
     console.log(formatHeartbeat({
       ...brainState,
+      // 心跳里带 phase：`countdown` 时 decisions 不涨是**预期**（准备期不出手），
+      // 没有这一列会被误读成「决策卡住」。
+      phase: brainState.matchPhase ? brainState.matchPhase.phase : null,
+      // G-735：`lastTick` 改成「整帧决策耗时」，另给最近 10 秒实际决策率 `hz`；
+      // `superseded` 是被顶掉的待执行计划数（队列容量 1 的直接后果），
+      // `applyMsMean` 是最近 50 个计划的执行耗时均值。
+      lastTick: brainState.lastFrameMs,
+      hz: decisionRate.hz(now),
+      superseded: planExecutor.stats.superseded,
+      applyMs: brainState.applyMs,
+      applyMsMean: applyMean.mean(),
       dist,
-      armor: armorPoints(currentInventoryItems()),
+      armor: armorPoints(currentInventorySlots()),
+      yaw: facing.yaw,
+      bearing: facing.bearing,
+      yawErr: facing.yawErr,
+      rawEntities: Object.keys((bot && bot.entities) || {}).length,
+      targetVisible: Boolean(findPlayerEntity(brainState.target)),
     }, now));
   }, 5000);
   if (typeof brainState.heartbeat.unref === 'function') {
@@ -658,6 +849,12 @@ function pickTarget(observation, nowMs) {
 
 /** 记录一次对手血量采样：掉的血记成 damage，归零记一次 kill。 */
 function recordOpponentHealth(health) {
+  // `Number(null) === 0`，直接转数会把「读不到血量」当成「对手 0 血」：
+  // 无 RCON 时读实体血量失败 → 每 tick 记一次击杀、并把 target_health 压成 0。
+  // 只有「有限数值且非 null/undefined/空串」才算真读数。
+  if (health === null || health === undefined || health === '') {
+    return;
+  }
   const value = Number(health);
   if (!Number.isFinite(value)) {
     return;
@@ -717,61 +914,279 @@ async function pollOpponentHealth() {
   }
 }
 
+/** 计划序号（只用于日志/复盘对账，与协议 `seq` 无关）。 */
+let planSeq = 0;
+
+function nextPlanId() {
+  planSeq += 1;
+  return planSeq;
+}
+
 /**
- * v2 大脑一次决策：十头（带 mask）→ 意图帧 → `applyIntent`。
+ * 入队一个计划（G-735）：**不等待执行**，`superseded` 落到心跳。
  *
- * <p>与 v1 的差别只在「动作怎么表达」：v1 走 `decodeAction(index)` 得到一串宏动作，
- * v2 是 10 个下标，由 `intent.js::decodeIntentVector` 翻成意图字典再执行。
- * 两条路共用同一个 `brainScheduler`（限流）与同一批统计字段，日志里不会出现两套口径。
- *
- * <p>为什么发 `{type:'intent', payload:{action:[...]}}` 而不是自己拼 `applyIntent` 的入参：
- * 这个形状把「模型输出」和「执行入参」分开，日志/复盘能按 `payload.action` 逐位回放；
- * 而 `payload.action` → intent 字典的解码只在 `intent.js` 一处（别在运行时再抄一遍取值表）。
- * 注意它**不是**通道 B 的意图帧：通道 B 发的已经是解码后的 `{type:'intent', intent:{...}}`
- * （见 `link-server.js::onIntent`），两者的区别就是「10 个下标」与「语义字典」。
+ * <p>队列容量 1：如果上一帧的计划还没开始执行，它会被这里顶掉——这是刻意的，
+ * 新计划基于更新的观测，旧的只会让 Bot 对着两帧前的画面出手。
  */
-async function brainTickIntent(currentSession, features) {
+function enqueuePlan(plan) {
+  const outcome = planExecutor.submit(plan);
+  brainState.superseded = planExecutor.stats.superseded;
+  if (outcome.superseded > 0) {
+    debugLog(`[brain] 计划替换 plan=${plan.planId}`
+      + `（待执行被丢弃，累计 superseded=${planExecutor.stats.superseded}）`);
+  }
+  return outcome;
+}
+
+/**
+ * v2 大脑一次决策（G-735：**只产计划，不执行**）。
+ *
+ * <p>为什么把执行摘出去：旧实现一路 `await` 到 `applyIntent` 返回，一次 `move` 就 200ms，
+ * 20Hz 的定时器于是有 3/4 的帧被 `busy` 丢掉（真机 decisions=81/25s ≈ 4Hz）。
+ * 现在这里只做「十头 → 意图字典」——`policy.actWithMask` 是纯 JS，毫秒级。
+ *
+ * <p>`brainCrossFrame.commit` 必须留在决策侧：下一帧编码要读「上一帧选了什么」，
+ * 等执行完再写就会永远慢一拍（跨帧特征会整体错位）。
+ */
+function buildIntentPlan(features) {
   const mask = itemTable ? matchingMask(bot, itemTable) : null;
+  const startedAt = Date.now();
   const heads = policy.actWithMask(features, mask ? mask.array : null, {
     greedy: true,
     epsilon: brainEpsilon,
     rng: Math.random,
   });
-  const frame = { type: 'intent', payload: { action: heads } };
-  const intent = decodeIntentVector(frame.payload.action);
-  brainState.decisions += 1;
-  brainState.seq += 1;
+  brainState.inferMs = Date.now() - startedAt;
+  const intent = decodeIntentVector(heads);
+  const attackPicked = ATTACK_HEAD_INDEX >= 0 && Number(heads[ATTACK_HEAD_INDEX]) === 1;
   if (brainState.decisions === 1) {
     // 首帧留证：以后「模型到底发了什么」不用靠猜。
-    console.log(`[brain] v2 首帧 ${frame.type} payload.action=[${heads.join(',')}]`
-      + ` → ${describeIntent(intent)}`);
+    console.log(`[brain] v2 首帧 payload.action=[${heads.join(',')}] → ${describeIntent(intent)}`);
   }
-  const result = await runBrainAction('intent',
-    () => brainScheduler.run(brainState.seq, () => currentSession.applyIntent(intent)));
-  if (result && result.ok === false) {
-    brainState.actionFailures += 1;
-    if (brainState.actionFailures <= 5) {
-      console.warn(`[brain] 意图执行失败 ${result.code || '?'} ${result.reason || ''}`);
-    }
-  }
-  if (ATTACK_HEAD_INDEX >= 0 && Number(heads[ATTACK_HEAD_INDEX]) === 1) {
-    brainState.attacks += 1;
-    brainState.lastAttackAt = Date.now();
-  }
-  // G-711：把「这一帧选了什么、有没有出手」记进跨帧状态（下一帧编码时生效）。
-  brainCrossFrame.commit({
-    prevAction: heads,
-    attacked: ATTACK_HEAD_INDEX >= 0 && Number(heads[ATTACK_HEAD_INDEX]) === 1,
+  brainCrossFrame.commit({ prevAction: heads, attacked: attackPicked });
+  return makePlan({
+    planId: nextPlanId(),
+    kind: 'intent',
+    intents: [intent],
+    meta: { heads, attackPicked },
   });
 }
 
-/** 一次决策：编码观测 → 策略 → 解码成协议动作 → 经 ActionDispatcher 下发。 */
-async function brainTick() {
+/**
+ * 执行一个计划（G-735）：串行跑完 `plan.intents`，同一时刻只会有一个。
+ *
+ * <p>这里保留 MATCH_PHASE 闸门作为**第二道**保险：计划是 50ms 前生成的，这期间阶段
+ * 可能已经变成 `ended`（丢掉整个计划）或 `countdown`（只放行 look/idle）。
+ * 「不打断正在执行的计划」与「阶段变了立刻停」在时间上重叠时，以**阶段**为准。
+ */
+async function executePlan(plan) {
+  const current = session;
+  const phase = brainState.matchPhase ? brainState.matchPhase.phase : null;
+  const gate = phaseGate(phase);
+  if (gate.ended) {
+    planExecutor.clear();
+    return { skipped: 'ended' };
+  }
+  if (!current || !bot) {
+    return { skipped: 'no-session' };
+  }
+  // 协议动作按阶段裁剪（准备期只留 look/idle）；意图字典没有 type，整体按 gate 放行/丢弃。
+  const steps = plan.kind === 'action'
+    ? filterPhaseActions(plan.intents, phase)
+    : (gate.hold ? [] : plan.intents);
+  const startedAt = Date.now();
+  let executed = 0;
+  for (const step of steps) {
+    brainState.seq += 1;
+    const label = plan.kind === 'action' ? (step.type || 'action') : 'intent';
+    const result = await runBrainAction(label, () => brainScheduler.run(brainState.seq, () => (
+      plan.kind === 'action' ? current.dispatcher.dispatch(step) : current.applyIntent(step))));
+    executed += 1;
+    if (result && result.ok === false) {
+      brainState.actionFailures += 1;
+      if (brainState.actionFailures <= 5) {
+        console.warn(`[brain] 动作失败 ${label}: ${result.code || '?'} ${result.reason || ''}`);
+      }
+    } else if (result && result.code === 'OUT_OF_REACH_CHASED') {
+      // G-717-B：够不到先追一步是战术结果（ok=true），只在 --debug 下可见。
+      const distance = Number(result.distance);
+      debugLog(`[brain] 追击 ${label}`
+        + ` distance=${Number.isFinite(distance) ? distance.toFixed(2) : '?'}`);
+    }
+    const attacked = plan.kind === 'action'
+      ? step.type === 'attack'
+      : Boolean(step && step.attack);
+    if (attacked) {
+      // 按**实际执行**计数（被顶掉的计划不算出手），口径与旧实现一致。
+      brainState.attacks += 1;
+      brainState.lastAttackAt = Date.now();
+    }
+  }
+  if (executed === 0) {
+    // 闸门把整条计划裁空了（准备期收到意图计划）：不算一次执行，也不要污染 applyMsMean。
+    return { skipped: 'phase-hold' };
+  }
+  const cost = Date.now() - startedAt;
+  brainState.applyMs = cost;
+  applyMean.push(cost);
+  return { steps: executed, ms: cost };
+}
+
+/**
+ * 准备期的对手实体：优先已锁定的 `brainState.target`，其次实体表里最近的、看起来不是 Bot 的玩家。
+ *
+ * <p>准备期不走策略，只需要一个「朝谁站」的答案；拿不到就返回 null（只 idle）。
+ */
+function countdownTargetEntity() {
+  const locked = findPlayerEntity(brainState.target);
+  if (locked) {
+    return locked;
+  }
+  const self = bot && bot.entity ? bot.entity : null;
+  if (!self || !self.position) {
+    return null;
+  }
+  let best = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const entity of Object.values(bot.entities || {})) {
+    if (!entity || entity.type !== 'player' || !entity.position) {
+      continue;
+    }
+    const name = String(entity.username || '');
+    if (!name || name.toLowerCase() === selfName().toLowerCase() || isLikelyBot(name)) {
+      continue;
+    }
+    const distance = entity.position.distanceTo(self.position);
+    if (Number.isFinite(distance) && distance < bestDistance) {
+      bestDistance = distance;
+      best = entity;
+    }
+  }
+  return best;
+}
+
+/**
+ * 对局阶段闸门（`MATCH_PHASE`）——G-735 起只**产计划**，不再 `await` 执行。
+ *
+ * - `ended`：清空待执行计划并停手，返回 `true`（本帧不再决策）；
+ * - `countdown` / `starting`：入队「朝向对手 + idle」的计划，返回 `true`；
+ * - `fighting` / 没收到过阶段帧：返回 `false`，照常决策（老服务端行为不变）。
+ *
+ * <p>为什么准备期也要走计划队列：它的 look/idle 同样会 await（`bot.look` 走 physicsTick），
+ * 留在决策线程里会把倒计时期间的决策率一起拖垮。
+ */
+function planMatchPhase() {
+  const frame = brainState.matchPhase;
+  if (!frame) {
+    return false;
+  }
+  const gate = phaseGate(frame.phase);
+  if (gate.ended) {
+    if (!brainState.endedLogged) {
+      brainState.endedLogged = true;
+      console.log('[brain] 对局已结束：停止决策与出手');
+    }
+    // 待执行的计划立刻作废：它们可能是「还在 fighting 时」生成的。
+    planExecutor.clear();
+    return true;
+  }
+  if (!gate.hold) {
+    if (brainState.countdownLoggedSecond !== null) {
+      brainState.countdownLoggedSecond = null;
+      console.log(`[brain] 阶段 ${frame.phase}（第 ${frame.round} 局）：恢复正常决策`);
+    }
+    return false;
+  }
+  const seconds = remainingSeconds(frame);
+  const self = bot && bot.entity ? bot.entity.position : null;
+  const target = countdownTargetEntity();
+  const look = facingAction(self, target ? target.position : null);
+  const wanted = look
+    ? [look, { type: 'idle', params: { durationMs: 200 } }]
+    : [{ type: 'idle', params: { durationMs: 200 } }];
+  // filterPhaseActions 是第二道闸：即使 look/idle 之外的动作为将来加进来，也不会漏到准备期。
+  const steps = filterPhaseActions(wanted, frame.phase);
+  if (steps.length > 0) {
+    enqueuePlan(makePlan({
+      planId: nextPlanId(), kind: 'action', intents: steps, meta: { reason: 'phase' },
+    }));
+  }
+  if (brainState.countdownLoggedSecond !== seconds) {
+    brainState.countdownLoggedSecond = seconds;
+    console.log(countdownLine(seconds));
+  }
+  return true;
+}
+
+/**
+ * v1（11 路宏动作）的决策：解码 + 软约束 + 攻击节流，产出一个协议动作计划。
+ *
+ * <p>语义与 G-735 之前完全一致，唯一区别是「返回计划」而不是「就地 await 执行」。
+ */
+function buildActionPlan(observation, features, targetName, nowMs) {
+  const inferStartedAt = Date.now();
+  const index = brainEpsilon > 0 && Math.random() < brainEpsilon
+    ? Math.floor(Math.random() * policy.numActions)
+    : policy.greedy(features);
+  brainState.inferMs = Date.now() - inferStartedAt;
+  let actions = decodeAction(index, observation, selfName(), {
+    allowed: [targetName],
+    reach: brainReach(),
+  });
+  // 软约束：策略选了被禁的宏动作就在这里剔除（补 idle），不碰模型、不改变动作空间。
+  const softDropped = actions.filter((action) => softDropReason(action, soft) !== null).length;
+  if (softDropped > 0) {
+    actions = applySoftActions(actions, soft);
+    brainState.softDropped += softDropped;
+    if (brainState.softDropped === softDropped) {
+      console.log(`[soft] ${describeSoft(soft)}（被禁动作已改为 idle/位移）`);
+    }
+  }
+  // 连续选 attack 说明已经贴身：按 1.8 的无敌帧（500ms）节流，别每 tick 刷空点击。
+  const choseAttack = actions.some((action) => action.type === 'attack');
+  brainState.attackStreak = choseAttack ? brainState.attackStreak + 1 : 0;
+  const throttled = choseAttack && shouldThrottleAttack({
+    streak: brainState.attackStreak,
+    lastAttackAt: brainState.lastAttackAt,
+    now: nowMs,
+    cooldownMs: softAttackCooldownMs,
+  });
+  if (throttled) {
+    // 只摘掉 attack，**不要**补 idle：`idle` 会清空前进/疾跑等控制状态，于是
+    // 「贴身时每秒被节流十几次」的 Bot 会被钉在原地（G-716 真机：不动也不出手）。
+    // 留空数组 = 这一帧什么都不发，既省动作预算，也保住正在按住的移动键。
+    actions = actions.filter((action) => action.type !== 'attack');
+    brainState.attacksThrottled += 1;
+    if (brainState.attacksThrottled === 1) {
+      console.log(`[brain] 敌人仍在无敌帧内，攻击节流到 ${softAttackCooldownMs}ms 一刀`
+        + '（只摘掉攻击，保留移动/朝向）');
+    }
+  } else if (choseAttack && needsSwordSwap(bot.heldItem)) {
+    // 手上不是剑就先切剑再打：直接 attack 只会空手挥（训练里模型看不到手持物）。
+    actions = [{ type: 'use', params: { item: 'sword', holdMs: 50 } }, ...actions];
+    brainState.swordSwaps += 1;
+  }
+  // G-711：v1 只维护两个帧计数（十头标签不适用 → prevAction 恒 null），
+  // 「有没有出手」按**最终计划**算（节流/切剑之后），与训练侧口径一致。
+  brainCrossFrame.commit({
+    prevAction: null,
+    attacked: actions.some((action) => action.type === 'attack'),
+  });
+  return makePlan({ planId: nextPlanId(), kind: 'action', intents: actions, meta: { index } });
+}
+
+/**
+ * 一次决策（G-735：**同步、毫秒级**）：读观测 → 编码 → 推理 → 把计划丢进队列。
+ *
+ * <p>为什么要同步：只有决策侧不再 `await`，20Hz 的定时器才不会被「上一帧还没跑完」拖住。
+ * 执行侧（{@link executePlan}）在自己的微任务里串行跑，两者通过容量 1 的队列解耦。
+ */
+function brainDecide() {
   if (!policy) {
     return;
   }
-  // 三种「静默空转」分开计数（G-716）：否则「没日志、不动」到底是没 Bot、没会话、
-  // 还是上一帧动作没回来，现场完全看不出来。
+  // 三种「静默空转」分开计数（G-716）：否则「没日志、不动」到底是没 Bot、没会话，
+  // 还是上一帧没回来，现场完全看不出来。
   if (!bot || !session || !bot.entity) {
     brainState.notReadySkips += 1;
     if (brainState.notReadySkips === 1 || brainState.notReadySkips % 200 === 0) {
@@ -782,17 +1197,27 @@ async function brainTick() {
     return;
   }
   if (brainState.busy) {
-    // G-716：这里是「只决策一次就停」的现场——上一帧的动作还没返回。
+    // 拆开之后这条基本不会触发（决策是同步的）；真触发了说明有人在决策里 await 了，
+    // 必须打出来——否则又回到「只决策一次就停」的老毛病。
     brainState.busySkips += 1;
+    if (brainState.busySkips === 1 || brainState.busySkips % 100 === 0) {
+      console.warn(`[brain] 决策重入被跳过（上一帧还没结束，累计 ${brainState.busySkips} 次）`
+        + ' —— 检查是否有新代码在决策路径里 await');
+    }
     return;
   }
   brainState.busy = true;
-  brainState.lastTickAt = Date.now();
-  const currentSession = session;
+  const frameStartedAt = Date.now();
+  brainState.lastTickAt = frameStartedAt;
   // G-717：每帧结算「距离/目标在线/赶路提示」——它们与决策解耦，卡在动作里也要照常报。
-  refreshTargetDistance(brainState.lastTickAt);
+  refreshTargetDistance(frameStartedAt);
   try {
     brainState.tick += 1;
+    // 对局阶段闸门：准备期只站位、结束后全停。放在最前面——
+    // 一旦进入准备期，策略连「选动作」的机会都不该有（用户实测：倒计时里 Bot 会提前出手）。
+    if (planMatchPhase()) {
+      return;
+    }
     const observation = buildObservation(bot, {
       tick: brainState.tick,
       gameId,
@@ -808,8 +1233,12 @@ async function brainTick() {
     if (!targetName) {
       // 没有目标 = 这一帧没有决策：只推进出手计数（不要谎称「刚出手」）。
       brainCrossFrame.advance();
-      await runBrainAction('idle(no-target)',
-        () => currentSession.dispatcher.dispatch({ type: 'idle', params: { durationMs: 180 } }));
+      enqueuePlan(makePlan({
+        planId: nextPlanId(),
+        kind: 'action',
+        intents: [{ type: 'idle', params: { durationMs: 180 } }],
+        meta: { reason: 'no-target' },
+      }));
       return;
     }
     // 没有 RCON 时退化成读实体血量（有就用，读不到就保持上次的采样值）。
@@ -819,96 +1248,63 @@ async function brainTick() {
         && String(item.name || '').toLowerCase() === targetName.toLowerCase());
       recordOpponentHealth(entityHealth(entity));
     }
-    const features = encodeObservation(observation, {
-      username: selfName(),
-      stepFraction: 0,
-      opponentHealth: brainState.opponentHealth,
-      allowed: [targetName],
-      reach: brainReach(),
-      sinceAttack: brainState.lastAttackAt ? (nowMs - brainState.lastAttackAt) / 1000 : 5,
-      // G-711：25–36 维（上一帧十头动作 + 距上次出手/受伤帧数）。
-      // v1 下 `prevAction` 恒为 null（十头标签不适用），两个帧计数照常工作。
-      ...brainCrossFrame.options(),
-    });
-    // G-712：动作空间 v2 → 十头意图帧；v1 继续走下面的宏动作路径（两条互不影响）。
-    if (policy.actionSpace === 'v2') {
-      await brainTickIntent(currentSession, features);
-      return;
-    }
-    const index = brainEpsilon > 0 && Math.random() < brainEpsilon
-      ? Math.floor(Math.random() * policy.numActions)
-      : policy.greedy(features);
-    let actions = decodeAction(index, observation, selfName(), {
-      allowed: [targetName],
-      reach: brainReach(),
-    });
-    // 软约束：策略选了被禁的宏动作就在这里剔除（补 idle），不碰模型、不改变动作空间。
-    const softDropped = actions.filter((action) => softDropReason(action, soft) !== null).length;
-    if (softDropped > 0) {
-      actions = applySoftActions(actions, soft);
-      brainState.softDropped += softDropped;
-      if (brainState.softDropped === softDropped) {
-        console.log(`[soft] ${describeSoft(soft)}（被禁动作已改为 idle/位移）`);
+    const features = encodeObservation(observation, brainEncodeOptions(targetName, nowMs));
+    brainState.obsMs = Date.now() - frameStartedAt;
+    // G-721：编码完立刻自检「目标看不看得见」——这是 7–13/19–22 维静默 0 的唯一告警点。
+    recordBlindness(targetName, features, nowMs);
+    // G-721：把编码向量落盘，供与训练侧 `spaces.encode_observation` 逐维 diff。
+    // 采样而不是「前 40 帧」：刚登录的世界还没同步实体，前几帧的 `entities` 常为空，
+    // 只抓开头会把「启动竞态」误判成「编码错误」（2026-11-25 真机踩过）。
+    if (dumpObsPath && dumpObsCount < DUMP_OBS_LIMIT
+        && (brainState.tick % DUMP_OBS_EVERY === 1 || (observation.entities || []).length === 0)) {
+      dumpObsCount += 1;
+      try {
+        fs.appendFileSync(dumpObsPath, `${JSON.stringify({
+          t: nowMs,
+          tick: brainState.tick,
+          actionSpace: policy.actionSpace,
+          target: targetName,
+          distance: brainState.targetDistance ?? null,
+          opponentHealth: brainState.opponentHealth,
+          entityNames: (observation.entities || []).map((item) => `${item && item.kind}:${item && item.name}:${item && item.distance}`),
+          rawEntities: Object.keys(bot.entities || {}).length,
+          features: Array.from(features),
+        })}\n`, 'utf8');
+      } catch (error) {
+        console.warn(`[brain] 观测落盘失败：${error.message}`);
       }
     }
-    // 连续选 attack 说明已经贴身：按 1.8 的无敌帧（500ms）节流，别每 tick 刷空点击。
-    const choseAttack = actions.some((action) => action.type === 'attack');
-    brainState.attackStreak = choseAttack ? brainState.attackStreak + 1 : 0;
-    const throttled = choseAttack && shouldThrottleAttack({
-      streak: brainState.attackStreak,
-      lastAttackAt: brainState.lastAttackAt,
-      now: nowMs,
-      cooldownMs: softAttackCooldownMs,
-    });
-    if (throttled) {
-      // 只摘掉 attack，**不要**补 idle：`idle` 会清空前进/疾跑等控制状态，于是
-      // 「贴身时每秒被节流十几次」的 Bot 会被钉在原地（G-716 真机：不动也不出手）。
-      // 留空数组 = 这一帧什么都不发，既省动作预算，也保住正在按住的移动键。
-      actions = actions.filter((action) => action.type !== 'attack');
-      brainState.attacksThrottled += 1;
-      if (brainState.attacksThrottled === 1) {
-        console.log(`[brain] 敌人仍在无敌帧内，攻击节流到 ${softAttackCooldownMs}ms 一刀`
-          + '（只摘掉攻击，保留移动/朝向）');
-      }
-    } else if (choseAttack && needsSwordSwap(bot.heldItem)) {
-      // 手上不是剑就先切剑再打：直接 attack 只会空手挥（训练里模型看不到手持物）。
-      actions = [{ type: 'use', params: { item: 'sword', holdMs: 50 } }, ...actions];
-      brainState.swordSwaps += 1;
-    }
-    brainState.decisions += 1;
-    // G-711：v1 只维护两个帧计数（十头标签不适用 → prevAction 恒 null），
-    // 「有没有出手」按**最终下发**的动作算（节流/切剑之后），与训练侧口径一致。
-    brainCrossFrame.commit({
-      prevAction: null,
-      attacked: actions.some((action) => action.type === 'attack'),
-    });
-    for (const action of actions) {
-      brainState.seq += 1;
-      const result = await runBrainAction(action.type,
-        () => brainScheduler.run(brainState.seq, () => currentSession.dispatcher.dispatch(action)));
-      if (result && result.ok === false) {
-        brainState.actionFailures += 1;
-        if (brainState.actionFailures <= 5) {
-          console.warn(`[brain] 动作失败 ${action.type}: ${result.code || '?'} ${result.reason || ''}`);
-        }
-      } else if (result && result.code === 'OUT_OF_REACH_CHASED') {
-        // G-717-B：够不到先追一步是战术结果（ok=true），只在 --debug 下可见。
-        const distance = Number(result.distance);
-        debugLog(`[brain] 追击 ${action.type}`
-          + ` distance=${Number.isFinite(distance) ? distance.toFixed(2) : '?'}`);
-      }
-      if (action.type === 'attack') {
-        brainState.attacks += 1;
-        brainState.lastAttackAt = Date.now();
-      }
+    const plan = policy.actionSpace === 'v2'
+      ? buildIntentPlan(features)
+      : buildActionPlan(observation, features, targetName, nowMs);
+    if (plan) {
+      brainState.decisions += 1;
+      decisionRate.mark(nowMs);
+      enqueuePlan(plan);
     }
   } catch (error) {
     brainState.lastError = `决策失败: ${error?.message ?? error}`;
     console.warn(`[brain] 决策失败: ${error?.message ?? error}`);
   } finally {
+    // 注意：不要清 `lastAction`——它现在描述的是**执行侧**正在跑的那一步。
     brainState.busy = false;
-    brainState.lastAction = null;
+    brainState.lastFrameMs = Date.now() - frameStartedAt;
   }
+}
+
+/** 编码选项（v1/v2 共用，抽出来是为了让 buildActionPlan 也能复用同一份口径）。 */
+function brainEncodeOptions(targetName, nowMs) {
+  return {
+    username: selfName(),
+    stepFraction: 0,
+    opponentHealth: brainState.opponentHealth,
+    allowed: [targetName],
+    reach: brainReach(),
+    sinceAttack: brainState.lastAttackAt ? (nowMs - brainState.lastAttackAt) / 1000 : 5,
+    // G-711：25–36 维（上一帧十头动作 + 距上次出手/受伤帧数）。
+    // v1 下 `prevAction` 恒为 null（十头标签不适用），两个帧计数照常工作。
+    ...brainCrossFrame.options(),
+  };
 }
 
 function startBrain() {
@@ -926,13 +1322,38 @@ function startBrain() {
   brainState.targetDist = null;
   targetPresence.reset(targetPlayerArg);
   farChaseNotifier.reset();
+  // G-721：告警节流状态也随局复位（累计计数 `blind` 保留，用于看整场趋势）。
+  blindWatch.reset();
   const interval = Math.max(50, Math.floor(1000 / brainHz));
+  // G-735：**绝对时刻 + 漂移补偿**的调度器，而不是裸 `setInterval(50)`。
+  //
+  // 真机实测（Windows）：`setInterval(50)` 的实际周期是 **62.5ms**——Windows 的定时器
+  // 量化粒度是 15.625ms，50ms 被向上取整到 4 个粒度。于是 20Hz 的脑子只跑到 16Hz，
+  // 且误差逐帧累积（真机 decisions 81/5s）。这里改成「10ms 轮询 + 记住目标时刻」：
+  //   - 到点就跑，跑完把目标时刻 +50ms（不受本次迟到影响，误差不累积）；
+  //   - 迟到不足一个周期 → 下一次立刻补上；迟到超过一个周期（GC/长动作）→ 重同步，
+  //     丢掉落后的帧（补跑一串只会让动作扎堆，不会让状态更准）。
+  // 轮询间隔取 `interval/5`（50ms 时 = 10ms，≥5ms），CPU 代价可忽略。
+  const pollMs = Math.max(5, Math.min(20, Math.floor(interval / 5) || 5));
+  let nextAt = Date.now() + interval;
   brainState.timer = setInterval(() => {
-    brainTick().catch((error) => {
+    const now = Date.now();
+    if (now < nextAt) {
+      return;
+    }
+    if (now - nextAt > interval) {
+      nextAt = now + interval;              // 落后太多：重同步
+    } else {
+      nextAt += interval;                   // 正常：按绝对时刻推进（补偿本次迟到）
+    }
+    // G-735：决策是**同步**的（毫秒级），异常直接 try/catch，没有 promise 要接。
+    try {
+      brainDecide();
+    } catch (error) {
       brainState.lastError = `tick 异常: ${error?.message ?? error}`;
       console.warn(`[brain] tick 异常: ${error?.message ?? error}`);
-    });
-  }, interval);
+    }
+  }, pollMs);
   if (brainState.timer.unref) {
     brainState.timer.unref();
   }
@@ -969,6 +1390,11 @@ function stopBrain() {
     brainState.rcon.close();
     brainState.rcon = null;
   }
+  // G-735：停脑时把待执行的计划丢掉（否则断线后还在按旧计划挥刀），指标清零。
+  planExecutor.clear();
+  decisionRate.reset();
+  applyMean.reset();
+  brainState.busy = false;
 }
 
 /** 对局结束/退出时的机器可读汇总（Dashboard 直接读该行）。 */
@@ -1005,6 +1431,25 @@ function printMatchSummary(reason) {
 client.on('welcome', (payload) => {
   const uuid = payload.playerUuid || '(尚未绑定，等待 PlayerJoin)';
   console.log(`[gladiator] ready session=${payload.sessionId} playerUuid=${uuid}`);
+});
+
+/**
+ * 对局阶段帧（插件每秒最多一帧）：只更新状态与日志，动作抑制在 {@link planMatchPhase}。
+ *
+ * <p>阶段**变化**时才打一行；每秒重复的同一阶段不刷屏（`planMatchPhase` 里另有按秒递减的
+ * 准备期日志）。
+ */
+client.on('match-phase', (frame) => {
+  const previous = brainState.matchPhase ? brainState.matchPhase.phase : null;
+  brainState.matchPhase = frame;
+  if (frame.phase === previous) {
+    return;
+  }
+  brainState.countdownLoggedSecond = null;
+  brainState.endedLogged = false;
+  const seconds = remainingSeconds(frame);
+  console.log(`[brain] 阶段 ${frame.phase ?? '-'}（第 ${frame.round} 局`
+    + `${seconds >= 0 ? `，剩余 ${seconds}s` : ''}）`);
 });
 
 client.on('message', async (envelope) => {

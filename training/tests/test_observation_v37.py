@@ -80,7 +80,7 @@ APPENDED_FIELDS_V37 = tuple(f"prev_{head}" for head in ACTION_HEADS_V2) + (
     "frames_since_hit",
 )
 
-#: Node 侧对拍脚本：从 stdin 读 ``{observation, options}``，把 37 维向量打到 stdout。
+#: Node 侧对拍脚本：从 stdin 读 ``{observation, options}``，把观测向量打到 stdout。
 NODE_CROSSCHECK = """
 import { readFileSync } from 'node:fs';
 import { encodeObservation } from __FEATURES_URL__;
@@ -138,16 +138,18 @@ def rich_observation() -> dict:
 class LayoutV37Test(unittest.TestCase):
     """维度、字段顺序与常量。"""
 
-    def test_dim_is_37(self) -> None:
-        self.assertEqual(OBS_DIM, 37)
-        self.assertEqual(len(OBS_FIELDS), 37)
+    def test_dim_is_extended_not_rewritten(self) -> None:
+        # G-711 把观测做到 37；G-731 又追加了 37/38（朝向误差），所以这里断言
+        # 「≥37 且字段表同长、前 37 位不变」，而不是把维数写死。
+        self.assertGreaterEqual(OBS_DIM, 37)
         self.assertEqual(OBS_DIM, len(OBS_FIELDS))
+        self.assertEqual(tuple(OBS_FIELDS[:37]), FROZEN_FIELDS_V25 + APPENDED_FIELDS_V37)
 
     def test_first_25_fields_are_frozen(self) -> None:
         self.assertEqual(tuple(OBS_FIELDS[:25]), FROZEN_FIELDS_V25)
 
     def test_appended_fields_are_cross_frame(self) -> None:
-        self.assertEqual(tuple(OBS_FIELDS[25:]), APPENDED_FIELDS_V37)
+        self.assertEqual(tuple(OBS_FIELDS[25:37]), APPENDED_FIELDS_V37)
         # prev_* 的顺序必须与 ACTION_HEADS_V2 逐位一致（模型按这个顺序挂头）
         self.assertEqual(
             tuple(OBS_FIELDS[25:35]),
@@ -162,7 +164,7 @@ class LayoutV37Test(unittest.TestCase):
 
     def test_vector_length_and_dtype(self) -> None:
         vector = encode_observation(rich_observation(), "Glad_Bot_1")
-        self.assertEqual(vector.shape, (37,))
+        self.assertEqual(vector.shape, (OBS_DIM,))
         self.assertEqual(vector.dtype, np.float32)
         self.assertTrue(np.all(np.isfinite(vector)))
 
@@ -231,11 +233,12 @@ class OldPolicyV25AdoptionTest(unittest.TestCase):
             fresh = Policy(obs_dim=OBS_DIM, n_actions=1, hidden=16, seed=12, action_space="v2")
             adopt_weights(fresh, loaded)
 
-            self.assertEqual(fresh.obs_dim, 37)
-            self.assertEqual(fresh.params["W1"].shape, (16, 37))
+            self.assertEqual(fresh.obs_dim, OBS_DIM)
+            self.assertEqual(fresh.params["W1"].shape, (16, OBS_DIM))
             self.assertTrue(np.array_equal(
                 fresh.params["W1"][:, :25], np.asarray(old.params["W1"], dtype=np.float64)))
-            np.testing.assert_array_equal(fresh.params["W1"][:, 25:], np.zeros((16, 12)))
+            np.testing.assert_array_equal(
+                fresh.params["W1"][:, 25:], np.zeros((16, OBS_DIM - 25)))
 
     def test_new_columns_are_exactly_zero_not_random(self) -> None:
         """补零必须真的是 0：若被随机初始化，「旧模型续训」会在新维上凭空引入噪声。"""

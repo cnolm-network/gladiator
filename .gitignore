@@ -75,3 +75,6 @@ models/*.gmod
 !models/flash.gmod
 bot-runtime/tmp-*
 dashboard/var/
+server/var/console-*.err
+server/var/console-*.out
+server/var/*.log

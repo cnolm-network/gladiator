@@ -70,8 +70,8 @@ function baseObservation(overrides = {}) {
 }
 
 test('观测字段与 spaces.py 同序同长度', () => {
-  assert.equal(OBS_DIM, 37);
-  assert.equal(OBS_FIELDS_JS.length, 37);
+  assert.equal(OBS_DIM, 39);
+  assert.equal(OBS_FIELDS_JS.length, 39);
   assert.equal(OBS_FIELDS_JS[0], 'self_health');
   assert.equal(OBS_FIELDS_JS[18], 'self_gapples');
   assert.equal(OBS_FIELDS_JS[22], 'in_reach');
@@ -85,11 +85,14 @@ test('观测字段与 spaces.py 同序同长度', () => {
   ]);
   assert.equal(OBS_FIELDS_JS[35], 'frames_since_attack');
   assert.equal(OBS_FIELDS_JS[36], 'frames_since_hit');
+  // G-731：37/38 = 朝向误差的 sin/cos（37 之前一位不动）
+  assert.equal(OBS_FIELDS_JS[37], 'target_bearing_sin');
+  assert.equal(OBS_FIELDS_JS[38], 'target_bearing_cos');
   assert.equal(ACTION_NAMES.length, 11);
   assert.equal(ACTION_NAMES[2], 'attack');
 });
 
-test('编码 37 维：逐项对齐 spaces.encode_observation', () => {
+test('编码 39 维：逐项对齐 spaces.encode_observation', () => {
   const vector = encodeObservation(baseObservation(), {
     username: 'Glad_Bot_1',
     stepFraction: 0.5,
@@ -97,7 +100,7 @@ test('编码 37 维：逐项对齐 spaces.encode_observation', () => {
     sinceAttack: 2.0,
     attackCooldownRemaining: 0.25,
   });
-  assert.equal(vector.length, 37);
+  assert.equal(vector.length, 39);
   const near = (index, expected) => assert.ok(
     Math.abs(vector[index] - expected) < 1e-9,
     `第 ${index} 维 ${vector[index]} != ${expected}`,

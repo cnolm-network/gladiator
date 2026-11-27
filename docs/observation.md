@@ -170,12 +170,12 @@
 
 ---
 
-## 4. 训练用 37 维向量（`OBS_FIELDS` / `OBS_DIM = 37`）
+## 4. 训练用 39 维向量（`OBS_FIELDS` / `OBS_DIM = 39`）
 
-编码后为 `numpy.ndarray`，`shape=(37,)`，`dtype=float32`，最后统一 `np.clip(-5.0, 5.0)`。
+编码后为 `numpy.ndarray`，`shape=(39,)`，`dtype=float32`，最后统一 `np.clip(-5.0, 5.0)`。
 
 > 维度演进：19 → 23（P1：对手速度 / 出手间隔 / 能否打中）→ 25（G-702：自身竖直速度 / 出手冷却）
-> → **37**（G-711：上一帧十头动作 + 两个帧计数）。
+> → **39**（G-711：上一帧十头动作 + 两个帧计数；G-731：朝向误差 sin/cos）。
 > **新字段只在末尾追加**，索引 0–24 永不重排；旧模型右侧补零续训（`adopt_weights` → `W1[:, :25]` 逐位不变，
 > 新增 12 列严格为 0）。
 
@@ -218,7 +218,11 @@
 | 34 | `prev_sprint_reset` | 上一帧 `sprint_reset` 头 | `idx / 3` | 0.33 = `release_w`，0.67 = `block_hit` | 同上 → `0.0` |
 | 35 | `frames_since_attack` | 环境 `_frames_since_attack` | `clip(·, 0, 50) / 50` | **0 = 本帧刚出手**；1.0 = ≥50 帧（2.5s）没出手 | 缺省 → `1.0` |
 | 36 | `frames_since_hit` | 环境 `_frames_since_hit` | `clip(·, 0, 50) / 50` | **0 = 本帧刚挨打**；1.0 = ≥50 帧没受伤 | 缺省 → `1.0` |
+| 37 | `target_bearing_sin` | `sin(yawErr)`，`yawErr = wrap180(bearing - self_yaw)`、`bearing = atan2(-dx, dz)` | 原值（−1…1） | 0 且 38 也 0 = **不知道朝向**（无目标/无 yaw），不是「正对」 | 缺省 → `0.0` |
+| 38 | `target_bearing_cos` | `cos(yawErr)` | 原值（−1…1） | 与 37 合成单位向量；`(1,0)` = 正对目标 | 缺省 → `0.0` |
 
+> **G-731（2026-11-28）**：37/38 维是「目标相对我的方位角」的 sin/cos。没有它，v2 十头策略无法感知自己被击退后朝向偏了多少（`move` 是身体相对），真机表现为「只会横移/反跑」。
+> 约定：**无目标或无自身 yaw 时两维都写 0**（真实值恒满足 `sin²+cos²=1`，所以 `(0,0)` 是无歧义的「不知道」）。
 > **G-709 收口（2026-11-22，用户确认）**：`opponent_vertical_speed` 并非缺失字段——它在 P1 就已是索引 20，G-702/G-711 只在末尾追加，没有挪动它。因此本任务按「已满足、不扩维」关闭，**观测保持 37 维**，不要再追加第 38 维同名字段（会让 `OBS_FIELDS.index()` 与蒸馏标签取位产生歧义）。防回归测试：`training/tests/test_observation_g709.py`。
 
 ### 4.0 末尾两维的来历与原因（G-702）
@@ -270,7 +274,7 @@
    （新列权重为 0），所以「先续训再逐步学」是安全的；
 2. **v1 宏动作没有十头标签**：v1 策略下 25..34 恒为 0（`_prev_action = None`），
    这不是缺失而是事实——它不该被当成「上一帧选了 move=0」；
-3. **运行时也产这三组值**（否则 37 维模型的后 12 维恒为 0，训练/推理输入错位）：
+3. **运行时也产这三组值**（否则 39 维模型的后 14 维恒为 0，训练/推理输入错位）：
    产端在 `bot-runtime/src/brain-cross-frame.js`，见下一小节。
 
 #### 运行时如何算（G-711 生产端）
@@ -465,8 +469,8 @@ v1（11 宏动作）模型同样维护：`prevAction` 恒 `null`（十头标签�
 
 | 结论 | 出处 |
 |---|---|
-| 37 维字段名与顺序、`OBS_CLIP`、`ATTACK_COOLDOWN_S`、`MOVE_MS`、`NUM_ACTIONS`、`ACTION_NAMES` | `training/gladiator_env/spaces.py` L18–L100 |
-| 37 维逐维归一化与缺省值 | `spaces.py` `encode_observation`（含 G-711 的 25–36 维） |
+| 39 维字段名与顺序、`OBS_CLIP`、`ATTACK_COOLDOWN_S`、`MOVE_MS`、`NUM_ACTIONS`、`ACTION_NAMES` | `training/gladiator_env/spaces.py` L18–L100 |
+| 39 维逐维归一化与缺省值 | `spaces.py` `encode_observation`（含 G-711 的 25–36 维、G-731 的 37–38 维） |
 | 目标选择（玩家/排除自身/名单过滤/最近） | `spaces.py` `nearest_player` L77–L104 |
 | `look` 帧构造、`yaw_to_target`、`pitch_to_target` | `spaces.py` L175–L199 |
 | 11 动作 → 协议帧与退化规则 | `spaces.py` `decode_action` L202–L269 |

@@ -208,6 +208,27 @@ SPAWN_FAILED（L2 → L1）：
 
 `botId` 两端统一为 `glad-<小写用户名>`（`BotRegistry.botIdFor`），运行时必须使用同一公式，否则对不上请求。
 
+### 2.11 MATCH_PHASE（L1 → L2，对局阶段）
+
+板子声明阶段（`BoardContext#phase`）后，插件在**阶段变化时立刻**、并在倒计时/战斗中**每 1 秒**推一帧。
+只发给本场参与者里能查到 `BotHandle` 的 Bot（`RoundSpec.extras` 的 `player`/`bot`；真实玩家与 golem 假玩家跳过）。
+
+```json
+{ "type":"MATCH_PHASE", "payload": {
+  "phase":"countdown", "round":1, "seconds":5, "endsAt":1764198005123
+}}
+```
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `phase` | string | `starting`（已开赛但未摆位）/ `countdown`（准备期）/ `fighting`（战斗中）/ `ended`（本局或整场结束） |
+| `round` | int | 当前局号（1 起） |
+| `seconds` | int | 本阶段**剩余**秒数；`-1` = 插件不知道（`starting` 就看这个值） |
+| `endsAt` | long | 本阶段结束的墙钟时间（epoch 毫秒）；`0` = 未知 |
+
+运行时约定（`bot-runtime/src/match-phase.js`）：`countdown` 期间只允许「朝向对手 + idle」，不发任何进攻动作；
+`fighting` 起才放行 `attack`；`ended` 后全停。**没收到过 `MATCH_PHASE` 的旧服务端不做任何抑制**（保持原行为）。
+
 ## 3. 错误码
 
 | code | 方向 | 含义 | 运行时行为 |

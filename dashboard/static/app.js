@@ -2225,13 +2225,25 @@ function renderMatchBrainOptions(match) {
   const previous = select.value || (match && match.brain) || "";
   const models = (state.models || []).filter((model) => model.valid !== false);
   const options = ['<option value="">（不使用：Bot 站立）</option>'];
+  // 动作空间标签：v1（11 个宏动作）与 v2（10 个头）在真机表现差异很大，
+  // 下拉里必须一眼能分辨，否则会误选研究用的 v2 模型当陪练（用户 2026-11-28 踩过）。
   models.forEach((model) => {
+    const space = String(model.actionSpace || "v1");
     const suffix = model.kind === "gmod" ? " · 文件模型" : "";
-    options.push(`<option value="${escapeHtml(model.id)}">${escapeHtml(model.name || model.id)}${escapeHtml(suffix)}</option>`);
+    options.push(
+      `<option value="${escapeHtml(model.id)}">[${escapeHtml(space)}] `
+      + `${escapeHtml(model.name || model.id)}${escapeHtml(suffix)}</option>`,
+    );
   });
   select.innerHTML = options.join("");
   const valid = models.some((model) => model.id === previous);
-  select.value = valid ? previous : "";
+  if (valid) {
+    select.value = previous;
+    return;
+  }
+  // 没选过（或旧值已失效）时给一个能真正打的默认：主线 v1 模型 `dagger-1118b`。
+  const fallback = models.find((model) => model.id === "dagger-1118b");
+  select.value = fallback ? fallback.id : "";
 }
 
 function renderMatchHint(match) {

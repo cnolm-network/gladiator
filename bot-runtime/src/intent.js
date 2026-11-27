@@ -49,6 +49,9 @@ export const BLOCK_HIT_HOLD_MS = 300;
 export const INTENT_TICK_MS = 50;
 /** 单个 tick 允许的偏航增量上限（度）。表里最大 30°，这里兜住手写 intent。 */
 export const MAX_DYAWDEG_PER_TICK = 45;
+
+/** 出手允许的朝向误差（度）；超过就先把人转过去再打。 */
+export const FACE_TOLERANCE_DEG = 35;
 /** 单个 tick 允许的俯仰增量上限（度）。 */
 export const MAX_DPITCH_DEG_PER_TICK = 20;
 /** 意图停发后多久自动松键（毫秒）。略大于一个控制周期，避免「走一下停一下」。 */
@@ -482,6 +485,55 @@ export function nearestOpponent(bot) {
 }
 
 /**
+ * 把 Bot 转向目标（1.8 约定：yaw 0° = +Z，90° = −X，与 `arena` 的 `yawTowards` 同式）。
+ *
+ * <p>为什么要转：1.8 服务端完全不校验朝向，背身也能打中；但用户明确要求
+ * 「Bot 不应该背身攻击」。所以在动手前把朝向掰正，这属于执行层机制，
+ * 不进动作空间（ADR-020 允许「原语/机制」存在，组合权仍在模型）。
+ *
+ * @returns {Promise<{ok:boolean, yawErr?:number}>} ok=false 表示目标位置不可用
+ */
+async function faceTarget(bot, entity) {
+  const self = bot && bot.entity ? bot.entity.position : null;
+  const pos = entity && entity.position ? entity.position : null;
+  if (!self || !pos) {
+    return { ok: false, yawErr: null };
+  }
+  // 拿不到自身朝向就别校验（测试桩 / 刚 spawn 的实体）：宁可放行也不要吞掉攻击。
+  if (!bot.entity || !Number.isFinite(bot.entity.yaw)) {
+    return { ok: true };
+  }
+  const dx = pos.x - self.x;
+  const dz = pos.z - self.z;
+  const dy = (pos.y + 1.62) - (self.y + 1.62);
+  const horizontal = Math.hypot(dx, dz);
+  if (horizontal < 1e-6) {
+    return { ok: true };
+  }
+  const yaw = Math.atan2(-dx, dz);
+  const pitch = -Math.atan2(dy, horizontal);
+  let err = ((yaw - bot.entity.yaw) * 180) / Math.PI;
+  while (err > 180) err -= 360;
+  while (err < -180) err += 360;
+  if (Math.abs(err) <= FACE_TOLERANCE_DEG) {
+    // 已经面朝目标：不发多余的 look，保持按键/事件流与历史一致。
+    return { ok: true, yawErr: Math.round(err * 10) / 10 };
+  }
+  if (typeof bot.look === 'function') {
+    try {
+      await bot.look(yaw, pitch, true);
+      // mineflayer 的 yaw 要等下一个 physics tick 才落到 self 上，这里不能回读校验，
+      // 否则「转了也判定没转」→ 永远打不出去。
+      return { ok: true, yawErr: Math.round(err * 10) / 10, turned: true };
+    } catch {
+      // 转向失败：这一刀放弃，交给下一帧重新决定。
+      return { ok: false, yawErr: Math.round(err * 10) / 10 };
+    }
+  }
+  return { ok: Math.abs(err) <= FACE_TOLERANCE_DEG, yawErr: Math.round(err * 10) / 10 };
+}
+
+/**
  * 应用攻击头：先过 attack-guard（切剑 + 500ms 节流 + reach），再交给 dispatcher。
  *
  * <p>节流用 `streakLimit: 1`：`shouldThrottleAttack` 的默认实现要连续 3 次才生效，
@@ -506,6 +558,13 @@ async function applyAttack(bot, state, ctx) {
   const target = nearestOpponent(bot);
   if (!target) {
     return { attack: 'no-target' };
+  }
+  // 背身不许出手（用户 2026-11-28 实测：Bot 背对玩家也能打中）。
+  // 1.8 服务端不校验朝向，所以这是**机制层约束**：出手前先转向目标，
+  // 转不过去（目标已离开视野/位置无效）就放弃这一刀。
+  const facing = await faceTarget(bot, target.entity);
+  if (!facing.ok) {
+    return { attack: 'not-facing', yawErr: facing.yawErr };
   }
   const dispatcher = ctx.dispatcher;
   if (dispatcher && typeof dispatcher.attack === 'function') {

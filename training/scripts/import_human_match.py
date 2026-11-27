@@ -27,8 +27,22 @@
 因此这两类永远不产生标签——训练数据只覆盖可观测的 9 种动作。这一点是刻意的：
 宁可少标，也不要把「没观察到」硬猜成某个动作。
 
-观测向量直接复用 `gladiator_env.spaces.encode_observation`（当前 37 维，随 `OBS_DIM` 走），保证与在线
-运行时/训练环境逐位对齐：把每帧双方 stats 还原成一条 OBSERVATION 字典再编码。
+观测向量直接复用 `gladiator_env.spaces.encode_observation`（维度随 `OBS_DIM` 走，当前 39 维），
+保证与在线运行时/训练环境逐位对齐：把每帧双方 stats 还原成一条 OBSERVATION 字典再编码。
+
+**G-736：可选的权威伤害来源（`--records`）**。上面的 `rewards` 是「相邻两帧血量差」推的，
+10Hz 采样会把同一 tick 的多段伤害合并、也分不清谁打的。`arena` 会把每局导出到
+`server/plugins/Arena/records/<uuid>-<ts>.jsonl`，里面有逐条 `ENTITY_ATTACK` 伤害与 `KILL`，
+所以给了 `--records <目录|文件>` 就改用事件求和：
+
+- `rewards[i] = 我方打出的伤害 - 我方吃到的伤害`（局末击杀再加 `--win-bonus`）；
+- 额外产出 `damageDealt` / `damageTaken`（逐帧，供诊断与分对方统计）；
+- `meta.rewardSource` 标明本数据集用的是 `arena-record` 还是回退后的 `health-delta`；
+- 目录模式下会按「时间窗 + 参与者」自动挑出属于这一场的录制文件（多局对局 = 多个文件）。
+
+时间基准：`meta.boardSession`（形如 `flat-1v1-1795807974138`）末尾的毫秒时间戳就是
+**t=0 的绝对时刻**（实测比录制首个事件早 3ms）；只有它缺失时才退到 `meta.startedAt`
+（ISO、秒精度，最坏有 1 秒误差）。两者都没有就无法对齐，会告警并回退 `health-delta`。
 """
 
 from __future__ import annotations
@@ -79,8 +93,14 @@ IDLE = ACTION_NAMES.index("idle")
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="人机对战录制 → 训练数据集（可选 BC）")
-    parser.add_argument("record_dir", help="录制目录（含 frames.jsonl）")
-    parser.add_argument("--out", default=None, help="数据集输出路径（默认 <record_dir>/dataset.npz）")
+    parser.add_argument("record_dir", nargs="?", default=None,
+                        help="录制目录（含 frames.jsonl）")
+    #: G-736：兼容 `--record <dir>` 写法（README/任务书里都这么用），与位置参数二选一。
+    parser.add_argument("--record", dest="record_opt", default=None,
+                        help="同位置参数（--record <录制目录>）")
+    parser.add_argument("--out", default=None,
+                        help="数据集输出路径；给目录（或无扩展名的路径）则写 <dir>/dataset.npz"
+                             "（默认 <record_dir>/dataset.npz）")
     parser.add_argument("--bc", action="store_true", help="用数据集做一轮行为克隆")
     parser.add_argument("--base-model", default=None, help="BC 的起点策略（.npz）；缺省则随机初始化")
     parser.add_argument("--epochs", type=int, default=10, help="BC 轮数")
@@ -115,6 +135,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help="局末胜局额外加进 rewards 的量（默认 0 = 只用血量差；"
                              "想让 AWR 更看重「赢」可给正数）")
     # --- G-720：目标动作空间（v1 宏动作 / v2 十头） ---
+    # --- G-736：权威伤害来源（Arena Recorder） ---
+    parser.add_argument("--records", default=None,
+                        help="Arena 录制目录或单个 .jsonl；给了就用 ENTITY_ATTACK/KILL 事件"
+                             "求和作为 rewards（解析不出会告警并回退 health-delta）")
     parser.add_argument("--target-action-space", choices=["auto", "v1", "v2"], default="auto",
                         help="数据集的动作空间：auto = 跟 --base-model 走（无模型则 v1）；"
                              "v2 会把宏动作有损翻译成十头（见 macro_to_intent）")
@@ -371,7 +395,8 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
                   draw_weight: float = DRAW_WEIGHT, contact_range: float = CONTACT_RANGE,
                   contact_weight: float = CONTACT_WEIGHT,
                   far_weight: float = FAR_WEIGHT, win_bonus: float = 0.0,
-                  action_space: str = "v1") -> dict:
+                  action_space: str = "v1",
+                  arena: Optional[dict] = None) -> dict:
     """返回 ``{"obs","actions","times","rounds","weights","rewards"}``（obs 为 ``OBS_DIM`` 维）。
 
     ``actions`` 的形状取决于 ``action_space``：
@@ -385,8 +410,13 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
     (c) AWR 不在这里做：它需要模型的价值头，由 :func:`compose_awr_weights` 在
     ``--weighting awr`` 时叠加（见 ``docs/match.md`` §8.1）。
 
-    ``rewards`` 是**观测回报**，只由录制帧的血量差推出（不外挂 shaping）：
-    每步 ``(对手掉血 - 自己掉血)``，局末再加 ``win_bonus``（仅当该局赢，默认 0）。
+    ``rewards`` 是**观测回报**（不外挂 shaping）。两条来源，二选一：
+
+    - 默认：由录制帧的**血量差**推出，每步 ``(对手掉血 - 自己掉血)``，跨局时把
+      ``win_bonus`` 加到新局首帧（仅当上局赢，默认 0）；
+    - ``arena`` 非空（``--records`` 解析成功）：直接用 :func:`align_record_rewards`
+      按**伤害事件**逐帧求和的值，此时 ``damageDealt`` / ``damageTaken`` 也一并返回。
+
     它给 AWR 一个 ``A = R - V(s)`` 的 R；没有它时 AWR 只能退化成 ``A = -V``。
     """
     from gladiator_env.spaces import MULTI_DISCRETE_V2, ACTION_HEADS_V2
@@ -402,13 +432,21 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
     rounds: list[int] = []
     weights: list[float] = []
     rewards: list[float] = []
+    #: G-736：``--records`` 生效时按事件求和；否则留空（数据集里也不会出现这两个键）。
+    arena_mode = arena is not None
+    damage_dealt = np.asarray(arena["damageDealt"], dtype=np.float32) if arena_mode else None
+    damage_taken = np.asarray(arena["damageTaken"], dtype=np.float32) if arena_mode else None
+    if arena_mode and (len(damage_dealt) != len(frames) or len(damage_taken) != len(frames)):
+        raise ValueError("arena.damageDealt/damageTaken 长度与帧数不一致")
+    #: G-736：预对齐好的逐帧回报（含击杀 bonus）。
+    arena_rewards = np.asarray(arena["rewards"], dtype=np.float64) if arena_mode else None
     prev_bot_health: Optional[float] = None
     prev_player_health: Optional[float] = None
     prev_round: Optional[int] = None
     winners = winners or {}
     since_attack = 5.0
     previous: Optional[dict] = None
-    for frame in frames:
+    for frame_index, frame in enumerate(frames):
         player = frame.get("player") or {}
         t = _num(frame.get("t"))
         if previous is not None:
@@ -430,14 +468,18 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
         bot = frame.get("bot") or {}
         bot_health = _num(bot.get("health"), 20.0)
         player_health = _num(player.get("health"), 20.0)
-        reward = 0.0
-        if prev_bot_health is not None and prev_player_health is not None:
-            reward += max(0.0, prev_bot_health - bot_health)  # 打出去的伤害
-            reward -= max(0.0, prev_player_health - player_health)  # 吃到的伤害
-        if prev_round is not None and round_number != prev_round:
-            # 上一局的收尾帧：按局结果补 terminal（默认 0，等于不加）。
-            if winners.get(prev_round) == "player":
-                reward += win_bonus
+        if arena_mode:
+            # G-736：权威来源——伤害事件已经按帧求和，击杀 bonus 也落在末帧，这里不再算血量差。
+            reward = float(arena_rewards[frame_index])
+        else:
+            reward = 0.0
+            if prev_bot_health is not None and prev_player_health is not None:
+                reward += max(0.0, prev_bot_health - bot_health)  # 打出去的伤害
+                reward -= max(0.0, prev_player_health - player_health)  # 吃到的伤害
+            if prev_round is not None and round_number != prev_round:
+                # 上一局的收尾帧：按局结果补 terminal（默认 0，等于不加）。
+                if winners.get(prev_round) == "player":
+                    reward += win_bonus
         rewards.append(reward)
         prev_bot_health, prev_player_health, prev_round = bot_health, player_health, round_number
         weights.append(
@@ -457,7 +499,7 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
                         else np.zeros((0, len(MULTI_DISCRETE_V2)), np.int64))
     else:
         action_array = np.asarray(actions, dtype=np.int64)
-    return {
+    dataset = {
         "obs": obs,
         "actions": action_array,
         "times": np.asarray(times, dtype=np.float32),
@@ -468,6 +510,344 @@ def build_dataset(frames: list[dict], *, player_name: str, bot_name: str,
         "headSizes": list(ACTION_HEADS_V2.values()) if mode == "v2" else [],
         "macroActions": np.asarray(actions, dtype=np.int64),
     }
+    if arena_mode:
+        # 只在真正用事件来源时才加这两个键：不给 --records 时数据集结构与旧版逐位一致。
+        dataset["damageDealt"] = damage_dealt
+        dataset["damageTaken"] = damage_taken
+    return dataset
+
+
+# --- Arena Recorder（G-736）-------------------------------------------------
+#
+# 录制文件（每局一份，`arena` 的 `Recorder` 导出）是一行一条 JSONL：
+#
+#   {"seq":1,"at":1795807974138,"category":"event",
+#    "from":"EventHandler:...FlatManagerSimplified",
+#    "content":"victim=Glad_P9 attacker=Glad_M3 damage=1.5999999046325684 cause=ENTITY_ATTACK"}
+#
+# `at` 是 epoch 毫秒；`content` 是 `key=value` 的扁平文本（**不是** JSON，别用 json.loads）。
+# 我们只关心两类：带 `damage=` 的伤害事件、带 `cause=KILL` 的击杀事件。
+
+#: 录制目录的默认位置（只用于错误提示；实际路径由 `--records` 给）。
+DEFAULT_RECORDS_DIR = TRAINING_ROOT.parent / "server" / "plugins" / "Arena" / "records"
+#: 按时间窗挑录制文件时的前后容差（毫秒）。对局起止与文件首末事件本来就有几百毫秒差。
+RECORD_WINDOW_SLACK_MS = 2000
+
+
+def parse_record_content(content: str) -> dict[str, str]:
+    """把 `victim=A attacker=B damage=1.6 cause=ENTITY_ATTACK` 拆成字典。
+
+    只做最简单的 ``split(" ")`` + ``k=v``：录制内容里的值都是无空格标识符/数字。
+    没有 ``=`` 的碎片（例如消息里的自然语言）直接丢弃，**不要**因此报错——录制格式
+    以后加字段时，这里必须保持宽容。
+    """
+    fields: dict[str, str] = {}
+    for token in str(content or "").split():
+        if "=" not in token:
+            continue
+        key, _, value = token.partition("=")
+        if key:
+            fields[key] = value
+    return fields
+
+
+def load_record_events(path: Path) -> list[dict]:
+    """读一个 ``records/*.jsonl``，返回伤害 / 击杀事件（按文件顺序，即时间序）。
+
+    每条事件形如 ``{"at": 毫秒, "kind": "damage"|"kill", "victim": str,
+    "attacker": str, "damage": float, "cause": str}``。
+
+    ``attacker`` 只在伤害事件里可能缺失（摔伤/虚空等无攻击者的伤害）——保留为空字符串，
+    由调用方计入 ``unattributed``；击杀事件把 ``killer`` 当攻击者。
+    """
+    events: list[dict] = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict) or row.get("category") != "event":
+                continue
+            fields = parse_record_content(row.get("content"))
+            at = _num(row.get("at"), -1.0)
+            if at < 0:
+                continue
+            if "damage" in fields and "victim" in fields:
+                events.append({
+                    "at": at,
+                    "kind": "damage",
+                    "victim": fields.get("victim", ""),
+                    "attacker": fields.get("attacker", ""),
+                    "damage": _num(fields.get("damage")),
+                    "cause": fields.get("cause", ""),
+                })
+            elif fields.get("cause") == "KILL" and "victim" in fields:
+                events.append({
+                    "at": at,
+                    "kind": "kill",
+                    "victim": fields.get("victim", ""),
+                    # 录制里击杀写 `killer=`；没有 killer 的 KILL 是环境死亡（摔死/虚空）。
+                    "attacker": fields.get("killer", ""),
+                    "damage": 0.0,
+                    "cause": "KILL",
+                })
+    return events
+
+
+def resolve_record_origin(meta: dict) -> tuple[Optional[float], str]:
+    """解析「t=0」的绝对时刻（epoch 毫秒），返回 ``(origin_ms, 来源标签)``。
+
+    优先级（2026-11-28 真机核对，见模块 docstring）：
+
+    1. ``meta.boardSession`` = ``flat-1v1-<epochMs>``：**精确到毫秒**，且比录制首个事件只早 3ms；
+    2. ``meta.startedAt``：ISO 字符串，**只有秒精度**（最坏差 1 秒，对 850ms 的伤害节奏是灾难性的）；
+    3. 都没有 → ``(None, "missing")``，调用方必须告警并回退。
+
+    ``frames.jsonl`` 只有相对秒 ``t``，没有绝对时间，所以这里不能拿帧当基准。
+    """
+    session = str(meta.get("boardSession") or "").strip()
+    if session:
+        tail = session.rsplit("-", 1)[-1]
+        if tail.isdigit() and len(tail) >= 12:
+            return float(tail), "boardSession"
+
+    started = str(meta.get("startedAt") or "").strip()
+    if started:
+        for parser in (_parse_iso_local_ms, _parse_epoch_ms):
+            value = parser(started)
+            if value is not None:
+                return value, "startedAt"
+    return None, "missing"
+
+
+def _parse_iso_local_ms(text: str) -> Optional[float]:
+    """ISO 时间 → epoch 毫秒（无时区时按本地时间，与 ``startedAt`` 的写法一致）。"""
+    from datetime import datetime
+
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment.timestamp() * 1000.0
+
+
+def _parse_epoch_ms(text: str) -> Optional[float]:
+    """纯数字时间戳（秒或毫秒）→ 毫秒。"""
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    if value > 1e12:            # 已经是毫秒
+        return value
+    if value > 1e9:             # 秒
+        return value * 1000.0
+    return None
+
+
+def select_record_files(target: Path, events_by_file: dict[Path, list[dict]],
+                        *, origin_ms: float, end_ms: float,
+                        names: tuple[str, ...]) -> list[Path]:
+    """挑出属于这一场的录制文件（目录模式）。单文件模式由调用方直接给。
+
+    两个条件同时满足才算：
+
+    - **时间窗**：文件的首末事件与 ``[origin_ms, end_ms]`` 有交叠（前后各留 2 秒）；
+    - **参与者**：文件里出现过的 ``victim``/``attacker`` 至少命中一个 ``names``
+      （大小写不敏感）。多局对局会产出多个文件，按首个事件时间排序后返回。
+    """
+    wanted = {str(name).lower() for name in names if name}
+    lower_bound = origin_ms - RECORD_WINDOW_SLACK_MS
+    upper_bound = end_ms + RECORD_WINDOW_SLACK_MS
+    chosen: list[tuple[float, Path]] = []
+    for path, events in events_by_file.items():
+        if not events:
+            continue
+        first = min(event["at"] for event in events)
+        last = max(event["at"] for event in events)
+        if last < lower_bound or first > upper_bound:
+            continue
+        seen = set()
+        for event in events:
+            for key in ("victim", "attacker"):
+                value = str(event.get(key) or "").lower()
+                if value:
+                    seen.add(value)
+        if wanted and not (seen & wanted):
+            continue
+        chosen.append((first, path))
+    return [path for _first, path in sorted(chosen)]
+
+
+def align_record_rewards(frames: list[dict], events: list[dict], *,
+                         origin_ms: float, player_name: str, bot_name: str,
+                         win_bonus: float = 0.0) -> dict:
+    """把事件按时间对齐到帧，返回逐帧 ``rewards`` / ``damageDealt`` / ``damageTaken``。
+
+    对齐规则（任务书原话）：一帧覆盖 ``[t, t+dt)``，事件落在哪段就计入哪帧。
+    ``dt`` 用相邻帧差（10Hz 采样下约 0.1s）；最后一帧覆盖 ``[t_last, +∞)``，
+    首帧之前的事件钳到首帧——都不丢，但要分别计数，便于发现「时间基准整体偏了」。
+
+    伤害归属：``victim`` 是我方 → ``damageTaken`` + 伤害、``rewards`` − 伤害；
+    ``victim`` 是对手 → ``damageDealt`` + 伤害、``rewards`` + 伤害。
+    ``attacker`` 不是两者之一（或缺失）的伤害事件计入 ``unattributed``，**不进 rewards**。
+    """
+    import bisect
+
+    count = len(frames)
+    times = [_num(frame.get("t")) for frame in frames]
+    rounds = [int(_num(frame.get("round"), 1)) for frame in frames]
+    rewards = np.zeros(count, dtype=np.float64)
+    dealt = np.zeros(count, dtype=np.float64)
+    taken = np.zeros(count, dtype=np.float64)
+
+    player_key = player_name.strip().lower()
+    bot_key = bot_name.strip().lower()
+
+    #: 每局最后一帧的下标（击杀奖励落在这一帧）。
+    last_frame_of_round: dict[int, int] = {}
+    for index, round_number in enumerate(rounds):
+        last_frame_of_round[round_number] = index
+
+    stats = {
+        "damageEvents": 0,
+        "killEvents": 0,
+        "unattributed": 0,
+        "unattributedDamage": 0.0,
+        "unknownVictim": 0,
+        "beforeFirstFrame": 0,
+        "afterLastFrame": 0,
+        "killBonus": 0.0,
+        "causes": {},
+    }
+
+    for event in events:
+        relative = (_num(event.get("at")) - origin_ms) / 1000.0
+        index = bisect.bisect_right(times, relative) - 1
+        if index < 0:
+            index = 0
+            stats["beforeFirstFrame"] += 1
+        elif index >= count - 1:
+            index = count - 1
+            if relative > times[-1]:
+                stats["afterLastFrame"] += 1
+
+        if event["kind"] == "kill":
+            stats["killEvents"] += 1
+            killer = str(event.get("attacker") or "").strip().lower()
+            if killer == player_key and win_bonus:
+                target = last_frame_of_round.get(rounds[index], index)
+                rewards[target] += float(win_bonus)
+                stats["killBonus"] += float(win_bonus)
+            continue
+
+        stats["damageEvents"] += 1
+        cause = str(event.get("cause") or "?")
+        stats["causes"][cause] = stats["causes"].get(cause, 0) + 1
+        amount = float(event.get("damage") or 0.0)
+        victim = str(event.get("victim") or "").strip().lower()
+        attacker = str(event.get("attacker") or "").strip().lower()
+
+        if victim == player_key:
+            # 我方挨打：伤害来自对手才算「被对手打」。
+            if attacker != bot_key:
+                stats["unattributed"] += 1
+                stats["unattributedDamage"] += amount
+                continue
+            taken[index] += amount
+            rewards[index] -= amount
+        elif victim == bot_key:
+            if attacker != player_key:
+                stats["unattributed"] += 1
+                stats["unattributedDamage"] += amount
+                continue
+            dealt[index] += amount
+            rewards[index] += amount
+        else:
+            stats["unknownVictim"] += 1
+
+    stats["damageDealt"] = float(dealt.sum())
+    stats["damageTaken"] = float(taken.sum())
+    return {"rewards": rewards, "damageDealt": dealt, "damageTaken": taken, "stats": stats}
+
+
+def _warn(message: str) -> None:
+    """``[records]`` 前缀的告警（统一走 stderr，便于测试与 CI 抓取）。"""
+    print(f"[records] {message}", file=sys.stderr)
+
+
+def load_arena_records(target: str | Path, *, frames: list[dict], meta: dict,
+                       player_name: str, bot_name: str, win_bonus: float = 0.0,
+                       warn=_warn) -> Optional[dict]:
+    """总入口：``--records`` 给了路径时调用；解析不出可用事件就告警并返回 ``None``（调用方回退）。
+
+    返回 ``{"rewards","damageDealt","damageTaken","stats","files","origin","originSource"}``。
+    **绝不静默产出全 0**：只要一条可归属的伤害都没有，就当解析失败。
+    """
+    path = Path(target)
+    origin_ms, origin_source = resolve_record_origin(meta)
+    if origin_ms is None:
+        warn(f"meta 里没有可用的时间基准（boardSession / startedAt 都缺），"
+             f"无法把录制对齐到帧；回退 health-delta（{path}）")
+        return None
+    if not path.exists():
+        warn(f"录制路径不存在: {path}；回退 health-delta")
+        return None
+
+    candidates = [path] if path.is_file() else sorted(path.glob("*.jsonl"))
+    if not candidates:
+        warn(f"目录里没有 *.jsonl 录制文件: {path}；回退 health-delta")
+        return None
+
+    events_by_file: dict[Path, list[dict]] = {}
+    for candidate in candidates:
+        try:
+            events_by_file[candidate] = load_record_events(candidate)
+        except OSError as exc:
+            warn(f"读不了录制文件 {candidate}: {exc}")
+            events_by_file[candidate] = []
+
+    times = [_num(frame.get("t")) for frame in frames]
+    end_ms = origin_ms + (times[-1] if times else 0.0) * 1000.0
+    if path.is_dir():
+        chosen = select_record_files(path, events_by_file, origin_ms=origin_ms,
+                                     end_ms=end_ms, names=(player_name, bot_name))
+        if not chosen:
+            warn(f"{path} 里没有与本场（{player_name} vs {bot_name}，"
+                 f"{len(frames)} 帧）匹配的录制文件；回退 health-delta")
+            return None
+    else:
+        chosen = [path]
+
+    events: list[dict] = []
+    for item in chosen:
+        events.extend(events_by_file.get(item, []))
+    events.sort(key=lambda event: event["at"])
+    if not events:
+        warn(f"录制文件里没有解析出伤害/击杀事件: {', '.join(str(p) for p in chosen)}；"
+             "回退 health-delta")
+        return None
+
+    aligned = align_record_rewards(
+        frames, events, origin_ms=origin_ms,
+        player_name=player_name, bot_name=bot_name, win_bonus=win_bonus)
+    stats = aligned["stats"]
+    attributed = stats["damageDealt"] + stats["damageTaken"]
+    if attributed <= 0.0:
+        warn(f"解析出 {stats['damageEvents']} 条伤害事件，但没有一条能归属到 "
+             f"{player_name} / {bot_name}（unattributed={stats['unattributed']}）；"
+             "回退 health-delta")
+        return None
+
+    aligned.update({
+        "files": [str(item) for item in chosen],
+        "origin": float(origin_ms),
+        "originSource": origin_source,
+    })
+    return aligned
 
 
 # --- BC ---------------------------------------------------------------------
@@ -566,7 +946,11 @@ def _resolve_action_space(target: str, base_model: Optional[str]) -> str:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
-    record_dir = Path(args.record_dir).resolve()
+    record_arg = args.record_dir or args.record_opt
+    if not record_arg:
+        print("缺少录制目录（位置参数或 --record）", file=sys.stderr)
+        return 2
+    record_dir = Path(record_arg).resolve()
     if not record_dir.is_dir():
         print(f"录制目录不存在: {record_dir}", file=sys.stderr)
         return 2
@@ -587,6 +971,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     action_space = _resolve_action_space(args.target_action_space, args.base_model)
 
+    arena = None
+    if args.records:
+        arena = load_arena_records(
+            args.records, frames=frames, meta=meta,
+            player_name=player_name, bot_name=bot_name, win_bonus=args.win_bonus)
     dataset = build_dataset(
         frames, player_name=player_name, bot_name=bot_name, round_seconds=round_seconds,
         winners=load_round_winners(record_dir),
@@ -597,7 +986,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         far_weight=1.0 if args.weighting == "round" else args.far_weight,
         win_bonus=args.win_bonus,
         action_space=action_space,
+        arena=arena,
     )
+    reward_source = "arena-record" if arena else "health-delta"
     if args.no_prefer_wins:
         dataset["weights"] = np.ones_like(dataset["weights"])
     weight_rules: dict[str, Any] = {
@@ -647,6 +1038,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                   "别拿它当「人类比模型强」的证据；要真开 AWR 得让数据里带 rewards",
                   file=sys.stderr)
     out_path = Path(args.out) if args.out else record_dir / "dataset.npz"
+    #: G-736：`--out` 给目录（含「无扩展名」的路径）时写 <dir>/dataset.npz——
+    #: 任务书/README 里都是 `--out ..\training\artifacts\tmp-g736` 这种写法。
+    if args.out and (out_path.is_dir() or out_path.suffix == ""):
+        out_path = out_path / "dataset.npz"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     macro = dataset.get("macroActions")
     if macro is None:
@@ -662,6 +1057,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         weights=dataset["weights"],
         rewards=dataset["rewards"],
         macroActions=np.asarray(macro, dtype=np.int64),
+        **({"damageDealt": dataset["damageDealt"],
+            "damageTaken": dataset["damageTaken"]} if arena else {}),
         meta=np.array(json.dumps({
             "schema": "gladiator.human-match-dataset/v1",
             "recordDir": str(record_dir),
@@ -676,6 +1073,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             "labelRules": "见 import_human_match.py 模块 docstring",
             "preferWins": not args.no_prefer_wins,
             "weightRules": weight_rules,
+            "rewardSource": reward_source,
+            "arenaRecord": None if not arena else {
+                "files": arena["files"],
+                "origin": arena["origin"],
+                "originSource": arena["originSource"],
+                "stats": arena["stats"],
+            },
         }, ensure_ascii=False)),
     )
 
@@ -698,6 +1102,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         "frames": len(frames),
         "samples": int(len(dataset["actions"])),
         "actions": counts,
+        "rewardSource": reward_source,
+        "rewards": {
+            "sum": float(np.sum(dataset["rewards"])),
+            "nonZeroFrames": int(np.count_nonzero(dataset["rewards"])),
+        },
+        "arenaRecord": None if not arena else {
+            "files": arena["files"],
+            "originSource": arena["originSource"],
+            "stats": arena["stats"],
+        },
         "bc": bc_report,
     }, ensure_ascii=False))
     return 0

@@ -30,17 +30,20 @@ from . import reward_presets
 from .shaping import ShapingReward, ShapingWeights
 from .spaces import (
     ACTION_NAMES,
-    ATTACK_COOLDOWN_S,
     FRAMES_NORMALIZER,
     MULTI_DISCRETE_V2,
     MOVE_MS,
     NUM_ACTIONS,
     OBS_DIM,
+    GroundEstimator,
     action_mask,
+    attack_cooldown_remaining,
     decode_action,
     decode_intent,
     encode_observation,
+    episode_fraction,
     nearest_player,
+    self_yaw_of,
 )
 from .items import default_table
 
@@ -424,6 +427,11 @@ class GladiatorEnv(gym.Env):
         #: G-711：距上次出手 / 上次受伤的帧数（0 = 本帧刚发生；饱和值见 ``_CROSS_FRAME_CAP``）。
         self._frames_since_attack: dict[str, int] = {}
         self._frames_since_hit: dict[str, int] = {}
+        #: G-731：上一帧编码时「自身朝向读没读到」（观测 37/38 是否有效）。
+        #: 缺 yaw 时那两维写 (0,0)，这里留痕，便于「模型学不会转向」时先看数据而不是先怀疑模型。
+        self._yaw_available: dict[str, bool] = {}
+        #: G-731：缺 yaw 的告警只打一次（每 200ms 一帧，绝不能每帧刷）。
+        self._yaw_warned = False
         #: 重生后的「观察档」：这段时间内代码驱动的对手只观察不出手（旧坐标会被传送打飞）。
         self._respawn_grace: dict[str, int] = {}
         #: 对手「出手前先确认」：本 tick 判到 attack 但还没确认时记 1，下一 tick 复核后才真出手。
@@ -446,6 +454,10 @@ class GladiatorEnv(gym.Env):
         self._control_hz = float(control_hz or 0.0)
         self._steps = 0
         self._raw: list[dict] = []
+        #: 逐 Bot 的「对手是否着地」推断器（``spaces.GroundEstimator``）。
+        #: 协议里的 ``entities[].onGround`` 是 prismarine-entity 的构造默认值（恒 true），
+        #: 不可信，所以只能从 vy + y 自行推；每个 Bot 一个实例，因为它吃的是各自那份观测。
+        self._ground = [GroundEstimator() for _ in self.bots]
 
         self._link_factory = link_factory
         if links is not None:
@@ -520,6 +532,10 @@ class GladiatorEnv(gym.Env):
         }
         self._opp_next_attack_tick = {bot.username: 0 for bot in self.bots}
         self._steps = 0
+        # 新回合：着地推断的「上一帧 y / 连续帧计数」也不能跨局残留
+        # （上一局临死前的 y 会让首帧误判，进而污染 ``target_on_ground``）。
+        for estimator in self._ground:
+            estimator.reset()
         # 新回合：动作确认状态与补装确认都不该跨回合残留。
         self._opponent_hold.clear()
         self._opponent_target.clear()
@@ -754,6 +770,15 @@ class GladiatorEnv(gym.Env):
     def raw_observations(self) -> list[dict]:
         """最近一次 step 的原始观测（复盘用）。"""
         return list(self._raw)
+
+    @property
+    def yaw_available(self) -> dict[str, bool]:
+        """G-731 诊断：上一帧编码时各 Bot 的 ``self.yaw`` 是否读到了。
+
+        ``False`` 说明观测 37/38 恒为 ``(0,0)``——此时「模型学不会转向」不是模型的问题，
+        而是协议里没有朝向。训练报告与排障先看这个。
+        """
+        return dict(self._yaw_available)
 
     @property
     def opponent_mode_label(self) -> str:
@@ -1038,7 +1063,7 @@ class GladiatorEnv(gym.Env):
                            if target is not None and target < len(self._raw) else None)
         last_attack = self._opponent_last_attack_at.get(bot.username)
         since_attack = 5.0 if last_attack is None else max(0.0, time.monotonic() - last_attack)
-        fraction = self._steps / float(self.max_steps) if self.max_steps else 0.0
+        fraction = episode_fraction(self._steps, self.max_steps)
         vector = encode_observation(
             raw,
             bot.username,
@@ -1051,6 +1076,10 @@ class GladiatorEnv(gym.Env):
             prev_action=self._prev_action.get(bot.username),
             frames_since_attack=self._frames_since_attack.get(bot.username),
             frames_since_hit=self._frames_since_hit.get(bot.username),
+            # 着地推断与学习方同源：同一 step 的 frame 幂等（先到者推进，后到者只读），
+            # 所以这里既可能推进、也可能直接拿到 _encode_all 已经算好的结果。
+            opponent_ground=self._ground[index].update(raw.get("entities") or [],
+                                                       frame=self._steps),
         )
         explore = float(self.np_random.random()) < self.opponent_epsilon
         try:
@@ -1772,7 +1801,9 @@ class GladiatorEnv(gym.Env):
 
     def _encode_all(self) -> dict[str, np.ndarray]:
         encoded = {}
-        fraction = self._steps / float(self.max_steps) if self.max_steps else 0.0
+        # 口径 = 本局已过时间 / 本局时长上限（训练里步长固定，等价于 steps / max_steps）。
+        # 运行时按 elapsed / roundSeconds 算同一个量，见 spaces.episode_fraction。
+        fraction = episode_fraction(self._steps, self.max_steps)
         for index, bot in enumerate(self.bots):
             opponent = self._opponent_index(index)
             opponent_health = self_health(self._raw[opponent]) if opponent is not None and opponent < len(self._raw) else None
@@ -1784,7 +1815,19 @@ class GladiatorEnv(gym.Env):
             self_velocity_y = ((raw.get("self") or {}).get("velocity") or {}).get("y")
             # G-702：出手冷却剩多少秒到 0.5s。与 index 21 用**同一个** since_attack，
             # 避免两个时钟（monotonic 与 tick 计数）在掉帧时给出互相矛盾的读数。
-            cooldown_remaining = max(0.0, ATTACK_COOLDOWN_S - since_attack)
+            cooldown_remaining = attack_cooldown_remaining(since_attack)
+            # 着地推断：推进本观测者这一帧的推断状态（`frame` 保证同一 step 只推进一次，
+            # 因为对手策略的观测也在同一 step 内编码）。
+            opponent_ground = self._ground[index].update(raw.get("entities") or [],
+                                                         frame=self._steps)
+            # G-731：自身朝向（弧度）。协议里 self.yaw 由运行时从 mineflayer 的
+            # bot.entity.yaw 补上；缺失时编码成 (0,0)（= 不知道），并在 _yaw_available 留痕。
+            yaw_value = self_yaw_of(raw)
+            self._yaw_available[bot.username] = yaw_value is not None
+            if yaw_value is None and not self._yaw_warned:
+                self._yaw_warned = True
+                self._log("观测缺 self.yaw：target_bearing_sin/cos 将恒为 0（模型学不会转向）"
+                          "——检查运行时的 OBSERVATION.self.yaw")
             encoded[self._key(index)] = encode_observation(
                 self._raw[index],
                 bot.username,
@@ -1799,6 +1842,9 @@ class GladiatorEnv(gym.Env):
                 prev_action=self._prev_action.get(bot.username),
                 frames_since_attack=self._frames_since_attack.get(bot.username),
                 frames_since_hit=self._frames_since_hit.get(bot.username),
+                opponent_ground=opponent_ground,
+                # G-731：朝向误差（索引 37/38）。
+                self_yaw=yaw_value,
             )
         return encoded
 

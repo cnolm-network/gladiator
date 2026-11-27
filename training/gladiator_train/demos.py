@@ -56,7 +56,8 @@ from typing import Any, Callable, Iterable, List, Mapping, Optional, Sequence
 import numpy as np
 
 from gladiator_env.spaces import (
-    ACTION_HEADS_V2, ACTION_NAMES, LOOK_PITCH_V2, LOOK_YAW_V2, MULTI_DISCRETE_V2,
+    ACTION_HEADS_V2, ACTION_NAMES, BEARING_COS_INDEX, BEARING_SIN_INDEX,
+    LOOK_PITCH_V2, LOOK_YAW_V2, MULTI_DISCRETE_V2,
     MOVE_VALUES_V2, OBS_DIM, OBS_FIELDS, SPRINT_RESET_VALUES_V2, USE_VALUES_V2,
     decode_intent,
 )
@@ -1566,6 +1567,12 @@ TEACHER_V4_FRAME_SECONDS = 0.2
 #: 热键栏槽位：训练套件的剑在第 0 格，因此固定 ``slot=0`` 等价于「不换槽」。
 TEACHER_V4_SLOT = 0
 
+#: G-731：朝向误差死区（度）。小于它就不动 look 头——正对着还每帧微调只会让朝向抖。
+TEACHER_V4_YAW_DEADZONE_DEG = 20.0
+#: G-731：单帧最多修正多少度。``LOOK_YAW_V2`` 最大档本来只有 ±30°，
+#: 这里再钉一个上限，保证「背身 180°」也是分几帧慢慢转（一帧转半圈会像瞬移）。
+TEACHER_V4_YAW_CLAMP_DEG = 45.0
+
 #: 各头在 10 头向量里的下标（按 ``ACTION_HEADS_V2`` 的声明顺序查，不写死数字）。
 _V4_HEADS = list(ACTION_HEADS_V2)
 _V4_IDX = {name: index for index, name in enumerate(_V4_HEADS)}
@@ -1593,6 +1600,35 @@ def _v4_action(*, move: str = "idle", attack: bool = False, jump: bool = False,
     action[_V4_IDX["slot"]] = max(0, min(8, int(slot)))
     action[_V4_IDX["sprint_reset"]] = SPRINT_RESET_VALUES_V2.index(reset)
     return action
+
+
+def _v4_look_yaw_head(obs: np.ndarray) -> int:
+    """G-731：按观测 37/38（朝向误差）选一个 ``look_yaw`` 分档，返回**头下标**。
+
+    为什么不直接用连续角度：动作空间里 ``look_yaw`` 只有 7 档（−30/−10/−3/0/3/10/30 度），
+    老师只能从中挑最接近的一档。取值顺序：
+
+    1. 无目标（``has_target=0``）→ 0 档（不转）；
+    2. 37/38 都是 0（= 没有朝向信息：旧 37 维向量、或协议没带 ``self.yaw``）→ 0 档；
+    3. ``|yawErr| ≤ 20°`` → 0 档（已经基本正对，别抖）；
+    4. 否则把 ``yawErr``（度）夹到 ±45° 后取最近的一档。背身 180° 时也只能转 ±30°，
+       靠后续帧逐帧收敛——一帧转半圈是瞬移，不是走位。
+
+    ``yawErr`` 的符号与 ``LOOK_YAW_V2`` 同向（都是「yaw 增量」：正 = 逆时针 = 朝向 −X），
+    所以「朝目标转」就是取与 ``yawErr`` 同号的那一档。
+    """
+    if _get(obs, IDX_HAS_TARGET) < 0.5:
+        return _V4_LOOK_NEUTRAL[0]
+    sin_v = _get(obs, BEARING_SIN_INDEX)
+    cos_v = _get(obs, BEARING_COS_INDEX)
+    if abs(sin_v) < 1e-9 and abs(cos_v) < 1e-9:
+        # (0,0) 是「不知道」的哨兵（真实值恒满足 sin²+cos²=1），不是「正对」。
+        return _V4_LOOK_NEUTRAL[0]
+    yaw_err_deg = math.degrees(math.atan2(sin_v, cos_v))
+    if abs(yaw_err_deg) <= TEACHER_V4_YAW_DEADZONE_DEG:
+        return _V4_LOOK_NEUTRAL[0]
+    wanted = max(-TEACHER_V4_YAW_CLAMP_DEG, min(TEACHER_V4_YAW_CLAMP_DEG, yaw_err_deg))
+    return min(range(len(LOOK_YAW_V2)), key=lambda i: (abs(LOOK_YAW_V2[i] - wanted), i))
 
 
 def v4_intent_of(action: Sequence[int]) -> dict:
@@ -1704,6 +1740,26 @@ def _v4_finish(state: TeacherV4State, action: list[int], *, reason: str) -> tupl
 
 
 def _decide_v4(obs: np.ndarray, options: dict) -> tuple[list[int], dict]:
+    """v4 的决策：先按招式表出招（:func:`_decide_v4_base`），再补上朝向修正。
+
+    朝向修正是 G-731 加的**后处理**而不是第 8 条规则：招式表决定「做什么」，
+    朝向决定「面朝哪」，两者正交——把 ``look_yaw`` 塞进每一条 return 里只会让招式表变脏，
+    而且容易漏（v4 有十几处 return）。
+    """
+    action, info = _decide_v4_base(obs, options)
+    yaw_head = _v4_look_yaw_head(obs)
+    if yaw_head != _V4_LOOK_NEUTRAL[0]:
+        action[_V4_IDX["look_yaw"]] = yaw_head
+        # 动作改了，诊断里的 intent 与 state.last_action 必须同步，否则复盘会看到旧朝向。
+        info["intent"] = decode_intent(list(action))
+        info["yawTurn"] = LOOK_YAW_V2[yaw_head]
+        state = options.get("state")
+        if isinstance(state, TeacherV4State):
+            state.last_action = list(action)
+    return action, info
+
+
+def _decide_v4_base(obs: np.ndarray, options: dict) -> tuple[list[int], dict]:
     """v4 的决策核心：严格按 ``pvp-1.8-mechanics.md`` §3 的招式表。
 
     判定顺序（顺序即优先级）::

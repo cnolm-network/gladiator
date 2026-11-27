@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -60,6 +61,10 @@ BOARD_PHASES = ("idle", "starting", "countdown", "fighting", "ended")
 
 #: 对局板子的 id（服务器侧 `Board#id()`，见 `arena/src/.../FlatBoard.java`）。
 BOARD_ID = "flat-1v1"
+
+# Arena 侧导出的原始事件流（伤害/KILL/位置）；对局结束时由 `_harvest_arena_record` 拷进录制
+# 目录，赛后导入优先用它做奖励来源（比 10Hz 血量差准，且能分辨「谁打谁」）。
+ARENA_RECORD_NAME = "arena-record.jsonl"
 
 #: status 轮询周期（秒）：契约规定 500ms。同一节奏写一帧 frames.jsonl（≈2Hz）。
 STATUS_PERIOD = 0.5
@@ -480,10 +485,18 @@ class BoardTracker:
 def build_import_command(python_exe: str, script: Path, record_dir: Path,
                          *, bc: bool, base_model: Optional[str],
                          dataset: Optional[Path] = None) -> list[str]:
-    """赛后导入训练的命令行（纯函数，单测直接断言参数）。"""
+    """赛后导入训练的命令行（纯函数，单测直接断言参数）。
+
+    录制目录里有 `arena-record.jsonl`（{@link _harvest_arena_record} 拷进来的 Arena 原始
+    事件流）时，把 `--records` 指到**这个文件**：伤害来源改用 ENTITY_ATTACK 事件求和，
+    比 10Hz 血量差更准，也避免把玩家掉血和 Bot 掉血混成一个标量。
+    """
     command = [str(python_exe), str(script), str(record_dir)]
     if dataset is not None:
         command.extend(["--out", str(dataset)])
+    events = Path(record_dir) / ARENA_RECORD_NAME
+    if events.is_file():
+        command.extend(["--records", str(events)])
     if bc:
         command.append("--bc")
         if base_model:
@@ -934,6 +947,8 @@ class MatchRunner:
             self._log(match, f"对局结束：玩家 {score['player']} : {score['bot']} Bot"
                              f"（平 {score['draws']}）")
             if plan.train_after:
+                # 先确保 Arena 录制到位，否则导入会退回「血量差」奖励来源。
+                self._ensure_arena_record(match)
                 self._start_import(match, plan)
         except _Cancelled:
             self._board_stop(match, conn)
@@ -1316,8 +1331,64 @@ class MatchRunner:
         except OSError:
             pass
 
+    def _harvest_arena_record(self, match: dict) -> None:
+        """把 Arena 的 `records/*.jsonl` 拷进录制目录，供赛后导入按伤害事件对齐。
+
+        板子的 `Recorder` 在对局结束时会自动导出到 `server/plugins/Arena/records/`，
+        文件名是 `<uuid>-<yyyyMMdd-HHmmss>.jsonl`。这里取「本场开始之后生成的最新一份」，
+        复制成 `arena-record.jsonl`，并在 summary 里记一笔；取不到就静默跳过（不影响对局）。
+        """
+        directory = match["snapshot"].get("recordDir")
+        if not directory:
+            return
+        records_dir = self.cfg.server_dir / "plugins" / "Arena" / "records"
+        if not records_dir.is_dir():
+            return
+        started = match.get("started_at") or 0
+        newest = None
+        for candidate in records_dir.glob("*.jsonl"):
+            try:
+                if candidate.stat().st_mtime + 1.0 < started:
+                    continue
+            except OSError:
+                continue
+            if newest is None or candidate.stat().st_mtime > newest.stat().st_mtime:
+                newest = candidate
+        if newest is None:
+            return
+        target = Path(directory) / ARENA_RECORD_NAME
+        try:
+            shutil.copyfile(newest, target)
+        except OSError as exc:
+            self._log(match, f"复制 Arena 录制失败（忽略）：{exc}", ok=False)
+            return
+        match["arena_record"] = str(target)
+
+    def _ensure_arena_record(self, match: dict, *, attempts: int = 8,
+                             delay: float = 0.5) -> bool:
+        """等 Arena 把录制写完再交给赛后导入（最多约 4 秒）。
+
+        真机踩过：板子的 `Recorder` 在 `onMatchEnd` 里才落盘，而 `_write_summary` 紧跟着就
+        跑——第一次 harvest 常常扑空，导致导入退回「血量差」奖励。这里在导入前重试，
+        拿到文件就返回 True（并回写一次 summary，让 `summary.json` 也记上路径）。
+        """
+        if match.get("arena_record"):
+            return True
+        for index in range(max(1, attempts)):
+            self._harvest_arena_record(match)
+            if match.get("arena_record"):
+                if index:
+                    self._log(match, f"Arena 录制第 {index + 1} 次重试后拿到",
+                              ok=True)
+                return True
+            if index + 1 < attempts:
+                time.sleep(delay)
+        self._log(match, "没等到 Arena 录制，赛后导入将退回血量差奖励", ok=False)
+        return False
+
     def _write_summary(self, match: dict) -> None:
         self._close_recording(match)
+        self._harvest_arena_record(match)
         directory = match["snapshot"].get("recordDir")
         if not directory:
             return
@@ -1362,7 +1433,10 @@ class MatchRunner:
                     "output": "", "dataset": str(dataset)}
         with self._lock:
             match["training"] = training
-        self._log(match, "赛后导入开始：" + " ".join(command[-6:]))
+        self._log(match, "赛后导入开始：" + " ".join(command))
+        self._log(match, "导入输入的 Arena 录制："
+                         + str(match.get("arena_record")) + " 存在="
+                         + str((Path(directory) / ARENA_RECORD_NAME).is_file()))
 
         def run() -> None:
             try:

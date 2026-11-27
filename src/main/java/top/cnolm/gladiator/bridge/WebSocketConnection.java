@@ -119,11 +119,22 @@ final class WebSocketConnection {
         return value == null ? "" : value.toLowerCase(Locale.ROOT);
     }
 
+    /** 建连后未发任何字节即断开（端口探活），不算错误。 */
+    static final class SilentHandshakeClose extends EOFException {
+        SilentHandshakeClose() {
+            super("silent close");
+        }
+    }
+
     private static byte[] readHeader(InputStream in) throws IOException {
         ByteArrayOutputStream buffer = new ByteArrayOutputStream();
         while (true) {
             int c = in.read();
             if (c < 0) {
+                if (buffer.size() == 0) {
+                    // 端口探活：只建 TCP、一个字节都不发就断开（dashboard 的 is_port_open）。
+                    throw new SilentHandshakeClose();
+                }
                 throw new EOFException("connection closed during handshake");
             }
             buffer.write(c);

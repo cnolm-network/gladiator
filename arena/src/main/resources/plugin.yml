@@ -8,4 +8,4 @@ depend: [Gladiator]
 commands:
   arena:
     description: 板子管理命令
-    usage: /arena <start|quit|stop|status>
+    usage: /arena <start|quit|stop|status|record dump [文件名]>

@@ -7,6 +7,7 @@ import org.bukkit.entity.Item;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 import top.cnolm.arena.simplify.FlatManagerSimplified;
+import top.cnolm.arena.simplify.Recorder;
 import top.cnolm.arena.status.ArenaTeam;
 import top.cnolm.gladiator.api.board.Board;
 import top.cnolm.gladiator.api.board.BoardContext;
@@ -35,6 +36,14 @@ final class FlatBoard implements Board {
 
     /** 局间缓冲：等客户端死亡界面/重生动画走完，再开下一局。 */
     private static final long ROUND_GAP_TICKS = 40L;
+    /** G-721：开局后补发摆位的间隔与次数（bot 登录窗口内的 tp 会被客户端位置预测吃掉）。 */
+    private static final int REASSERT_TICKS = 10;
+    private static final int REASSERT_TIMES = 6;
+    /** G-725：单次 teleport 允许的最大位移（格）；超过就分段传送，见 {@link #placeGradually}。 */
+    private static final double STAGED_TELEPORT_DISTANCE = 48.0D;
+    /** G-723：收尾回位的补发次数与间隔（同开局摆位）。 */
+    private static final int RESTORE_TICKS = 10;
+    private static final int RESTORE_TIMES = 3;
     /** 没给出生点时，双方沿 X 轴相对站位；单位格。 */
     private static final double DEFAULT_OFFSET = 4.0D;
     /** 开下一局前等待双方复活：每次重试间隔与最大次数（10 秒）。 */
@@ -82,6 +91,19 @@ final class FlatBoard implements Board {
     /** 本场对局是否已收尾（供 /arena status 判断「进行中」还是「上一场已结束」）。 */
     boolean isFinished() {
         return ctx == null || finished;
+    }
+
+    /** 当前（或最近一局）的录像记录器；本场还没开过局时为 {@code null}。 */
+    Recorder recorder() {
+        return simplified == null ? null : simplified.getRecorder();
+    }
+
+    /** 最近一局的 arena matchId（导出文件名要用），没有则 {@code null}。 */
+    String recordMatchId() {
+        if (simplified == null || simplified.getLastMatchId() == null) {
+            return null;
+        }
+        return simplified.getLastMatchId().toString();
     }
 
     @Override
@@ -133,6 +155,19 @@ final class FlatBoard implements Board {
         if (ctx == null || !roundActive || finished) {
             return;
         }
+        // G-728：开局阶段参与者掉线（运行时被杀/被判离线）时，对局必须收尾。
+        // 否则会话永远停在 phase=starting，下一次 /gladiator board start 会被
+        // 「已有一场对局在进行中」挡住（真机 23:50 复现）。
+        if (manager == null && "starting".equals(ctx.phase())) {
+            Player alivePlayer = ctx.player(player);
+            Player aliveBot = ctx.player(bot);
+            if (alivePlayer == null || aliveBot == null) {
+                finishRound(alivePlayer == null
+                        ? RoundOutcome.bot("player-offline")
+                        : RoundOutcome.player("bot-offline"));
+                return;
+            }
+        }
         if (manager != null) {
             // 阶段由板子声明：倒计时 → 战斗；外部（命令/dashboard）靠它判断现在能不能算伤害。
             if (manager.isFighting()) {
@@ -176,12 +211,22 @@ final class FlatBoard implements Board {
 
     /** 对局结束后的归位；玩家已离线就跳过（不清空记录，交给下一场覆盖）。 */
     private void restorePosition(Player target, Location home, String label) {
+        restorePosition(target, home, label, true);
+    }
+
+    /**
+     * 归位（可静默）。
+     *
+     * <p>`announce=false` 用于「补发」的重复调用——真机上补发 3 次是对的（客户端重生流程会
+     * 吃掉第一次 teleport），但日志没必要打三遍，否则一场对局结束刷 6 行同样的消息。
+     */
+    private void restorePosition(Player target, Location home, String label, boolean announce) {
         if (target == null || home == null || !target.isOnline()) {
             return;
         }
         target.teleport(home);
         target.setBedSpawnLocation(home, true);
-        if (ctx != null) {
+        if (announce && ctx != null) {
             ctx.log("已把 " + label + " 送回开局位置");
         }
     }
@@ -200,16 +245,25 @@ final class FlatBoard implements Board {
         }
         final Location homeP = playerStart;
         final Location homeB = botStart;
-        plugin.getServer().getScheduler().runTaskLater(plugin, new Runnable() {
-            @Override
-            public void run() {
-                if (ctx != session) {
-                    return;
+        // G-723：收尾回位同样会撞上「客户端还没走出重生流程」的窗口，单发一次会被吃掉，
+        // 于是双方在客户端眼里继续停在原地、互相看不见（真机表现为 raw=1 / seen=0）。
+        // 与开局摆位同一套办法：隔 10 tick 补发 3 次。
+        for (int index = 1; index <= RESTORE_TIMES; index += 1) {
+            final int attempt = index;
+            plugin.getServer().getScheduler().runTaskLater(plugin, new Runnable() {
+                @Override
+                public void run() {
+                    if (ctx != session) {
+                        return;
+                    }
+                    restorePosition(ctx.player(player), homeP, player, attempt == 1);
+                    restorePosition(ctx.player(bot), homeB, bot, attempt == 1);
+                    if (attempt == RESTORE_TIMES) {
+                        plugin.getLogger().info("[flat] 收尾回位已补发 " + attempt + " 次");
+                    }
                 }
-                restorePosition(ctx.player(player), homeP, player);
-                restorePosition(ctx.player(bot), homeB, bot);
-            }
-        }, 20L);
+            }, 20L + RESTORE_TICKS * attempt);
+        }
     }
 
     /** 清掉中心周围 48 格内的地面掉落物（死亡掉落的套件）。 */
@@ -232,6 +286,19 @@ final class FlatBoard implements Board {
     // ------------------------------------------------------------------ 回合
 
     private void startRound() {
+        try {
+            doStartRound();
+        } catch (RuntimeException error) {
+            // G-727：之前这里没有任何兜底，一旦抛异常（例如 1.8 某些 Location 操作在
+            // 非主线程/未加载区块上抛），对局就永远停在 phase=starting，外部只能看到
+            // 「开始了但一局都不打」。现在至少把栈打出来并把这一局判成平局收尾。
+            plugin.getLogger().log(java.util.logging.Level.SEVERE,
+                    "[flat] 开局异常，判本局平局（draw/start-error）", error);
+            finishRound(RoundOutcome.draw("start-error"));
+        }
+    }
+
+    private void doStartRound() {
         if (ctx == null || finished) {
             return;
         }
@@ -286,6 +353,12 @@ final class FlatBoard implements Board {
         // 走用户的简化 API：它负责套件/免伤/摆位/录制/事件，本类只管「一局何时开始与结束」。
         manager = startSimplifiedMatch(p, b, playerSpawn, botSpawn, kitId);
         manager.setResultListener(this::onRoundResult);
+        // 朝向必须在**简化 API 摆位之后**校正：`startMatch` 内部会用队伍出生点
+        // 重新 teleport 一次，之前的朝向会被覆盖（2026-11-25 真机：`Glad_T1 yaw=0`）。
+        // 动作空间 v2 的 `look_yaw` 是「每帧转多少度」，BC 策略几乎不主动转头，
+        // 而真机出生方位随机 → 选 `move=forward` 会朝反方向跑开（G-721）。
+        // 只修正出生朝向，不替模型做动作选择（ADR-020）。
+        faceEachOther(p, b);
         ctx.log("第 " + ctx.round() + " 局套件已发：" + manager.kitId());
     }
 
@@ -316,7 +389,76 @@ final class FlatBoard implements Board {
                 .team(playerTeam, botTeam)
                 .recordPeriod(RECORD_PERIOD_TICKS);
         simplified.start(params, kitId, ctx.spec().getShieldSeconds());
+        // G-721：Bot 刚登录时客户端还没完成世界同步，此时下发的 tp 会被客户端位置预测吃掉
+        // ——服务端坐标已经是出生点，客户端仍停在原地，双方互相看不见（观测里 entities 为空，
+        // 策略在「盲」状态决策）。这里在开局后再补发几次（与真人链路 RESPAWN_PLACE_REFRESH 同思路）。
+        reassertPositions(p, b, playerSpawn, botSpawn);
         return simplified.getFlatMatchManager();
+    }
+
+    /**
+     * 重复下发摆位，直到客户端跟上（每 {@link #REASSERT_TICKS} tick 一次、最多
+     * {@link #REASSERT_TIMES} 次）。只发 tp 与朝向，不碰装备与状态。
+     */
+    private void reassertPositions(final Player p, final Player b,
+                                   final Location playerSpawn, final Location botSpawn) {
+        for (int index = 1; index <= REASSERT_TIMES; index += 1) {
+            final int attempt = index;
+            plugin.getServer().getScheduler().runTaskLater(plugin, new Runnable() {
+                @Override
+                public void run() {
+                    if (finished || !roundActive) {
+                        return;
+                    }
+                    // G-725：一次 tp 跨上千格时，客户端来不及流式加载区块，mineflayer 的
+                    // `entities` 会只剩自己（真机 22:11 的 Glad_D5 就是登录点离场地 1000+ 格）。
+                    // 这里按「分段逼近」：先落到距目标不超过 STAGED_TELEPORT_DISTANCE 的位置，
+                    // 最后一段才精确落点，给客户端时间把区块与实体表建起来。
+                    placeGradually(p, playerSpawn, attempt);
+                    placeGradually(b, botSpawn, attempt);
+                    // G-723：朝向必须在**最后一次**摆位之后再校正——`teleport(Location)` 会用
+                    // 传入 Location 的 yaw 覆盖角色朝向，先摆位后校朝向才是有效的。
+                    if (attempt == REASSERT_TIMES) {
+                        faceEachOther(p, b);
+                        plugin.getLogger().info("[flat] 摆位已补发 " + attempt + " 次并校正朝向（客户端可能仍在同步世界）");
+                    }
+                }
+            }, REASSERT_TICKS * attempt);
+        }
+    }
+
+    /**
+     * 分段摆位：距离超过 {@link #STAGED_TELEPORT_DISTANCE} 时，先传送到「朝目标前进
+     * {@link #STAGED_TELEPORT_DISTANCE} 格」的位置；只有最后一次尝试才精确落点。
+     *
+     * <p>为什么要这样：1.8 客户端收到跨区块大跳的 `S08PacketPlayerPosLook` 后，会以自己
+     * 的位置为基准重建实体表，期间服务端推来的 spawn 包会被丢弃，mineflayer 侧表现为
+     * 「`bot.entities` 只剩自己、目标永远看不见」（真机 G-721/G-723 的间歇失明）。
+     * 分两段（甚至多段）传送把单次位移压到实体追踪范围内，客户端每次都能正常加载。
+     */
+    private void placeGradually(Player target, Location spawn, int attempt) {
+        if (target == null || spawn == null || !target.isOnline()) {
+            return;
+        }
+        Location from = target.getLocation();
+        if (from.getWorld() == null || !from.getWorld().equals(spawn.getWorld())) {
+            target.teleport(spawn);
+            return;
+        }
+        double distance = from.distance(spawn);
+        if (attempt >= REASSERT_TIMES || distance <= STAGED_TELEPORT_DISTANCE) {
+            target.teleport(spawn);
+            return;
+        }
+        double ratio = STAGED_TELEPORT_DISTANCE / distance;
+        Location step = new Location(
+                spawn.getWorld(),
+                from.getX() + (spawn.getX() - from.getX()) * (1.0 - ratio),
+                spawn.getY(),
+                from.getZ() + (spawn.getZ() - from.getZ()) * (1.0 - ratio),
+                spawn.getYaw(),
+                spawn.getPitch());
+        target.teleport(step);
     }
 
     /** arena 的结算回流：赢家队伍 → Gladiator 的 RoundOutcome。 */
@@ -365,13 +507,21 @@ final class FlatBoard implements Board {
         }, ROUND_GAP_TICKS);
     }
 
-    /** 出生点：优先用 RoundSpec 给的坐标，否则以双方当前位置为基准左右分开。 */
+    /**
+     * 出生点：优先用 RoundSpec 给的坐标；否则以**世界出生点**为场地中心左右分开。
+     *
+     * <p>G-725（真机 22:11 / 23:40 两次）：原先用「双方各自当前位置 ±offset」，当两个 Bot
+     * 的登录点相隔上千格时（1.8 的登录点由世界出生点决定，机器人重启一次就换一个地方），
+     * 两侧出生点会各自留在原地 → 双方相距 1000+ 格，一局打不到人、只能超时平局。
+     * 改用世界出生点做锚点后，无论从哪里登录，双方都会被摆到同一块场地；
+     * 配合 {@link #placeGradually} 的分段传送，客户端也能正常建起实体表。
+     */
     private Location spawnFor(Player target, double[] spawn, double offset) {
         if (spawn != null) {
             return new Location(target.getWorld(), spawn[0], spawn[1], spawn[2],
                     target.getLocation().getYaw(), target.getLocation().getPitch());
         }
-        Location base = target.getLocation().clone();
+        Location base = target.getWorld().getSpawnLocation().clone();
         base.setX(base.getX() + offset);
         return base;
     }
@@ -379,5 +529,37 @@ final class FlatBoard implements Board {
     /** 1.8 没有「服务端设置重生点」的 API，只能让客户端下一次重生落在原地。 */
     private void anchorRespawn(Player target, Location spawn) {
         target.setBedSpawnLocation(spawn, true);
+    }
+
+    /**
+     * 把双方摆成面对面（只改朝向，不动位置）。
+     *
+     * <p>1.8 的 yaw 定义：0 = 朝 +Z，90 = 朝 -X，180 = 朝 -Z，-90 = 朝 +X。
+     * pitch 取 0（平视），避免策略的 `look_pitch` 头被出生俯仰带偏。
+     */
+    private void faceEachOther(Player p, Player b) {
+        Location pLoc = p.getLocation();
+        Location bLoc = b.getLocation();
+        if (pLoc.getWorld() == null || bLoc.getWorld() == null
+                || !pLoc.getWorld().equals(bLoc.getWorld())) {
+            return;
+        }
+        float playerYaw = yawTowards(pLoc, bLoc);
+        float botYaw = yawTowards(bLoc, pLoc);
+        Location playerTo = pLoc.clone();
+        playerTo.setYaw(playerYaw);
+        playerTo.setPitch(0.0F);
+        p.teleport(playerTo);
+        Location botTo = bLoc.clone();
+        botTo.setYaw(botYaw);
+        botTo.setPitch(0.0F);
+        b.teleport(botTo);
+    }
+
+    /** 从 {@code from} 看向 {@code to} 的 yaw（1.8 约定：0=+Z、90=-X、180=-Z、-90=+X）。 */
+    private float yawTowards(Location from, Location to) {
+        double dx = to.getX() - from.getX();
+        double dz = to.getZ() - from.getZ();
+        return (float) Math.toDegrees(Math.atan2(-dx, dz));
     }
 }

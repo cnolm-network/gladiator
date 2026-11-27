@@ -14,6 +14,7 @@ import top.cnolm.gladiator.bridge.LinkHandler;
 import top.cnolm.gladiator.bridge.LinkServer;
 import top.cnolm.gladiator.bridge.SessionRegistry;
 import top.cnolm.gladiator.command.GladiatorCommand;
+import top.cnolm.gladiator.core.BotHandle;
 import top.cnolm.gladiator.core.BotSpawnService;
 import top.cnolm.gladiator.core.BotSpawner;
 import top.cnolm.gladiator.core.SpectatorService;
@@ -53,6 +54,10 @@ public final class GladiatorMain extends JavaPlugin {
     private SpectatorService spectatorService;
     private top.cnolm.gladiator.core.board.BoardRegistryImpl boardRegistry;
     private LinkServer linkServer;
+
+    /** 只用来在前 6 帧打诊断日志，避免每局每秒刷屏。 */
+    private static final java.util.concurrent.atomic.AtomicInteger MATCH_PHASE_LOGS =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     @Override
     public void onEnable() {
@@ -98,6 +103,7 @@ public final class GladiatorMain extends JavaPlugin {
 
         getCommand("gladiator").setExecutor(new GladiatorCommand(this));
         startLink();
+        attachMatchPhaseSink(botRegistry);
         service.markReady();
 
         getLogger().info("Gladiator " + getDescription().getVersion() + " enabled"
@@ -202,6 +208,44 @@ public final class GladiatorMain extends JavaPlugin {
                 GolemBootstrap.shutdown(attached);
             }
         };
+    }
+
+    /**
+     * 把 {@code MATCH_PHASE} 的下发接到通道 A（对局阶段 → 本场参与 Bot）。
+     *
+     * <p>为什么接在这里：{@code BoardSessionImpl#phase()} 只知道「阶段变了」，发帧要
+     * {@link LinkServer} 与 {@code BotRegistry}，两者都只有本类同时持有；注册表那边只留一个
+     * {@code MatchPhaseSink} 接口，桥模块照旧不引用 Bukkit。
+     *
+     * <p>过滤规则：用户名查不到 {@code BotHandle}（真实玩家、golem 假玩家）或链路没起来时
+     * 直接跳过——不报错、不打日志，否则每局每秒都会刷一条。
+     *
+     * @param botRegistry 已就绪 Bot 的三向索引（用户名 → botId / UUID / handle）
+     */
+    private void attachMatchPhaseSink(final top.cnolm.gladiator.core.BotRegistry botRegistry) {
+        boardRegistry.attachMatchPhaseSink(new top.cnolm.gladiator.core.board.MatchPhaseSink() {
+            @Override
+            public void sendMatchPhase(String username, String phase, int round, int seconds, long endsAt) {
+                // botRegistry 在 golem 降级/未装配时可能为 null：那时没有通道 A 的 Bot，直接跳过。
+                BotHandle handle = botRegistry == null ? null : botRegistry.findByUsername(username);
+                LinkServer link = linkServer;
+                if (handle == null || link == null) {
+                    return;
+                }
+                JsonObject payload = new JsonObject();
+                payload.addProperty("phase", phase);
+                payload.addProperty("round", Integer.valueOf(round));
+                payload.addProperty("seconds", Integer.valueOf(seconds));
+                payload.addProperty("endsAt", Long.valueOf(endsAt));
+                boolean sent = link.send(handle.getBotId(), "MATCH_PHASE", payload, null);
+            int seen = MATCH_PHASE_LOGS.incrementAndGet();
+            if (seen <= 6) {
+                getLogger().info("[board] MATCH_PHASE -> " + username + " " + phase
+                        + " round=" + round + " seconds=" + seconds + " botId=" + handle.getBotId()
+                        + " sent=" + sent);
+            }
+            }
+        });
     }
 
     /** 从 config.yml 读取链路参数；绑定失败只降级，不阻止插件启用。 */

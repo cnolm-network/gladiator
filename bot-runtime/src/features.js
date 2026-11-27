@@ -1,5 +1,5 @@
 /**
- * 37 维特征编码 + 离散动作解码（`spaces.py` 的 JS 镜像）。
+ * 39 维特征编码 + 离散动作解码（`spaces.py` 的 JS 镜像）。
  *
  * <p>**必须与 `training/gladiator_env/spaces.py::encode_observation` 逐项一致**：
  * 字段顺序、默认值、归一化尺度、clip 全部照抄。任何一侧改了观测定义，另一侧必须同步，
@@ -13,7 +13,7 @@
 
 import { HEAD_SIZES_V2 } from './action-space-v2.js';
 
-export const OBS_DIM = 37;
+export const OBS_DIM = 39;
 export const NUM_ACTIONS = 11;
 
 /** G-711：跨帧特征在观测里的起始下标与分母（与 spaces.py 的 PREV_ACTION_OFFSET / FRAMES_NORMALIZER 一致）。 */
@@ -90,7 +90,14 @@ export const OBS_FIELDS_JS = Object.freeze([
   'prev_sprint_reset',      // 34 上一帧 sprint_reset 头 / 3
   'frames_since_attack',    // 35 距上次 attack 的帧数，clip(0,50) 后 /50
   'frames_since_hit',       // 36 距上次受伤的帧数，clip(0,50) 后 /50
+  // --- G-731：朝向误差（37/38），sin/cos 由「指向对手的 bearing − 自身 yaw」得来 ---
+  'target_bearing_sin',     // 37 sin(yawErr)：正值 = 对手在自己左手边（1.8 yaw 逆时针）
+  'target_bearing_cos',     // 38 cos(yawErr)：1 = 正对对手，-1 = 完全背对
 ]);
+
+/** G-731：朝向误差 sin/cos 的下标（与 spaces.py 的 BEARING_SIN_INDEX / BEARING_COS_INDEX 一致）。 */
+export const BEARING_SIN_INDEX = 37;
+export const BEARING_COS_INDEX = 38;
 
 /** 动作名（spaces.py:49 ACTION_NAMES），下标即离散动作编号。 */
 export const ACTION_NAMES = Object.freeze([
@@ -121,6 +128,49 @@ function clamp(value, low, high) {
     return low;
   }
   return value > high ? high : value;
+}
+
+/**
+ * G-731：把弧度角归一到 `[-π, π)`（`spaces.py::wrap_pi` 的镜像）。
+ *
+ * `(x + π) % 2π - π` 与 Python 的 `%` 同语义（JS 的 `%` 对负数返回负余数，
+ * 但这里先 `+π` 再取模，操作数恒为正，所以两边逐位一致）。
+ */
+export function wrapPi(angle) {
+  const twoPi = 2 * Math.PI;
+  return ((Number(angle) + Math.PI) % twoPi) - Math.PI;
+}
+
+/** G-731：角度制版本的 `wrapPi`，结果落在 `[-180, 180)`。 */
+export function wrap180(angle) {
+  return (wrapPi((Number(angle) * Math.PI) / 180) * 180) / Math.PI;
+}
+
+/**
+ * G-731：指向目标的 bearing 与自身 yaw 之差（弧度，已折返）。
+ *
+ * `bearing = atan2(-dx, +dz)` 是 1.8 的 yaw 约定（0 = +Z、+90° = −X、−90° = +X），
+ * 与 `index.js::describeFacing` 的 `bearing` 同口径（注意**不是** `yawToTarget` 的
+ * `atan2(-dx,-dz)`——那个是另一套符号，别混）。
+ */
+export function yawError(dx, dz, selfYaw) {
+  return wrapPi(Math.atan2(-dx, dz) - Number(selfYaw));
+}
+
+/** G-731：朝向误差的 `(sin, cos)`（观测 37/38）。 */
+export function bearingSinCos(dx, dz, selfYaw) {
+  const error = yawError(dx, dz, selfYaw);
+  return [Math.sin(error), Math.cos(error)];
+}
+
+/** 宽容转 number；非数/NaN/Inf/空值返回 `null`（与 Python `_float_or_none` 同义）。 */
+function optionalNum(value) {
+  // `Number(null) === 0`、`Number('') === 0`：不先挡掉会把「没有」读成「0 度」。
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 /**
@@ -214,7 +264,7 @@ export function entityHealth(entity) {
 }
 
 /**
- * 编码一帧观测为 37 维特征（`spaces.py encode_observation`）。
+ * 编码一帧观测为 39 维特征（`spaces.py encode_observation`）。
  *
  * @param {object} observation `buildObservation()` 的输出
  * @param {object} options
@@ -230,7 +280,9 @@ export function entityHealth(entity) {
  *   `observation.crossFrame.prevAction`，都没有则 10 维全 0 = 「不知道」）
  * @param {number|null} [options.framesSinceAttack] 距上次出手的帧数（G-711；缺省 1.0 = 很久以前）
  * @param {number|null} [options.framesSinceHit] 距上次受伤的帧数（G-711；同上）
- * @returns {Float64Array} 长度 37
+ * @param {number|null} [options.selfYaw] 自身朝向（弧度，G-731；缺省回落读 `observation.self.yaw`，
+ *   两边都没有 → 37/38 写 (0,0) = 「不知道」）
+ * @returns {Float64Array} 长度 39
  *
  * <p>返回 float64（numpy 那边是 float32，逐项差 ≤1e-7，属 float32 舍入；
  * 策略前向一律按 float64 算，所以对最终概率无可见影响）。
@@ -249,6 +301,7 @@ export function encodeObservation(observation, {
   prevAction,
   framesSinceAttack,
   framesSinceHit,
+  selfYaw,
 } = {}) {
   const selfPayload = (observation && observation.self) || {};
   const pos = selfPayload.pos || {};
@@ -257,6 +310,11 @@ export function encodeObservation(observation, {
   const sz = num(pos.z);
   const yaw = num(selfPayload.yaw);
   const pitch = num(selfPayload.pitch);
+  // G-731：「朝向读没读到」要单独判——0.0 是合法角度（面向 +Z），不能用真假值区分。
+  // 与 Python 同义：传了就用传的，没传（undefined/null）回落到帧里的 self.yaw。
+  const knownYaw = selfYaw === undefined || selfYaw === null
+    ? optionalNum(selfPayload.yaw)
+    : optionalNum(selfYaw);
   const target = nearestPlayer(observation, username, allowed);
   const state = String((observation && observation.state) ?? 'Alive');
 
@@ -342,6 +400,14 @@ export function encodeObservation(observation, {
     vector[19] = clamp(Math.sqrt(vx * vx + vz * vz), 0.0, 10.0) / 10.0; // spaces.py:179
     vector[20] = clamp(vy, -5.0, 5.0) / 5.0;                 // spaces.py:180
     vector[22] = horizontal <= num(reach, DEFAULT_REACH) ? 1.0 : 0.0;  // spaces.py:183
+    // G-731（index 37/38）：朝向误差。4/5 只说「朝哪」，7–9 只说「对手在哪」，
+    // 模型因此学不出「先转向再走」；这里给两者之差的 sin/cos。
+    if (knownYaw !== null) {
+      const [bearingSin, bearingCos] = bearingSinCos(dx, dz, knownYaw);
+      vector[BEARING_SIN_INDEX] = bearingSin;
+      vector[BEARING_COS_INDEX] = bearingCos;
+    }
+    // 无 yaw（协议没带）或无目标：保持 (0,0) = 「不知道」，不假装正对。
   }
 
   for (let index = 0; index < OBS_DIM; index += 1) {

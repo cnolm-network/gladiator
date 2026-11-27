@@ -49,9 +49,11 @@ def frame_with_opponent_vy(vy: float) -> dict:
 class G709LayoutTest(unittest.TestCase):
     """维度与字段位置：G-709 是「已满足」，不是「加一维」。"""
 
-    def test_obs_dim_stays_37(self) -> None:
-        self.assertEqual(OBS_DIM, 37)
+    def test_obs_dim_matches_fields(self) -> None:
+        # 具体维数由后续里程碑决定（G-731 起是 39）；本用例只钉「维数与字段表同长」，
+        # 以及「opponent_vertical_speed 没有被追加第二次」。
         self.assertEqual(len(OBS_FIELDS), OBS_DIM)
+        self.assertGreaterEqual(OBS_DIM, 37)
 
     def test_opponent_vy_is_at_frozen_index_20(self) -> None:
         self.assertEqual(OBS_FIELDS[OPP_VY_INDEX], OPP_VY_FIELD)

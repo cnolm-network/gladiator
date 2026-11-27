@@ -332,6 +332,9 @@ class ModelStore:
         item.setdefault("hasPolicy", False)
         item.setdefault("sizeBytes", 0)
         item.setdefault("training", self.training_stats(item["id"]))
+        # 动作空间：前端下拉要靠它区分 v1（11 宏动作）与 v2（10 头），
+        # 否则研究用的 v2 模型会被误选成陪练（2026-11-28 用户实测踩过）。
+        item.setdefault("actionSpace", item.get("actionSpace") or "v1")
         source = dict(item.get("source") or {})
         source["type"] = "builtin" if item["id"] == DEFAULT_ID else "policy"
         item["source"] = source
@@ -923,6 +926,7 @@ class ModelStore:
             "updatedAt": data.get("updatedAt"),
             "source": data.get("source") if isinstance(data.get("source"), dict) else {},
             "obsDim": data.get("obsDim"),
+            "actionSpace": data.get("actionSpace"),
             "numActions": data.get("numActions"),
             "hidden": data.get("hidden"),
             "episodes": data.get("episodes"),
