@@ -293,6 +293,40 @@ class SelfPlayLoopTest(unittest.TestCase):
                 )
         self.assertTrue(vec.closed, "训练异常时也要 close_all")
 
+    def test_pfsp_pool_samples_opponents_and_collects_win_rates(self) -> None:
+        from gladiator_train.pfsp import OpponentPool
+
+        policy = Policy(obs_dim=OBS_DIM, n_actions=NUM_ACTIONS, hidden=8, seed=9)
+        built: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = OpponentPool(os.path.join(tmp, "pool"))
+            os.makedirs(pool.root, exist_ok=True)
+            seeded = os.path.join(pool.root, "seed.npz")
+            with open(seeded, "wb") as handle:
+                handle.write(b"seed")
+            pool.add(seeded)
+
+            result = run_selfplay(
+                policy, rounds=2, episodes_per_round=2, snapshot_dir=os.path.join(tmp, "snaps"),
+                build_vec=lambda opponent: (built.append(opponent), FakeVec())[1],
+                train=lambda vec, episodes: [{"episodes": 2, "wins": 1, "steps": 12}],
+                evaluate=lambda current: {},
+                pool=pool, log=lambda message: None,
+            )
+
+            records = result["rounds"]
+            self.assertEqual(len(records), 2)
+            # 池里已有对手 → 每轮都从池里采样，而不是链式的「上一轮快照」
+            self.assertEqual([item["opponentSource"] for item in records], ["pfsp", "pfsp"])
+            self.assertTrue(all(os.path.basename(path) == "seed.npz" for path in built))
+            # 批次胜率回流到池子（2 局 1 胜 = 0.5），新快照也进了池
+            self.assertAlmostEqual(pool.win_rates()[seeded], 0.5)
+            self.assertEqual(len(pool.paths()), 3)
+            self.assertEqual(result["pool"]["size"], 3)
+            self.assertEqual(records[0]["pfsp"]["wins"], 1)
+            self.assertEqual(records[0]["pfsp"]["losses"], 1)
+            self.assertIsNotNone(records[0]["pfsp"]["opponentWeight"])
+
     def test_argument_validation(self) -> None:
         policy = Policy(obs_dim=OBS_DIM, n_actions=NUM_ACTIONS, hidden=8, seed=7)
         with tempfile.TemporaryDirectory() as tmp:

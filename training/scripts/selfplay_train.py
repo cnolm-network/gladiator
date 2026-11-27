@@ -73,6 +73,7 @@ def run_selfplay(
     train: Callable[[Any, int], list],
     evaluate: Callable[[Any], dict],
     init_policy: Optional[str] = None,
+    pool: Optional[Any] = None,
     log: Callable[[str], None] = print,
 ) -> dict:
     """跑 ``rounds`` 轮「存快照 → 用上一轮快照当对手训练 → 评估」。
@@ -83,6 +84,10 @@ def run_selfplay(
     - 第 k 轮（k ≥ 1）的对手是 ``round{k-1}.npz`` —— learner 已经在往前走，
       对手落后一轮，这正是自博弈想要的「稳定的、稍弱的靶子」；
     - 每轮结束前都会 ``vec.close_all()``（异常也关），不会把连接泄漏到下一轮。
+
+    传入 ``pool``（`gladiator_train.pfsp.OpponentPool`）时切换成 **PFSP**：每轮的对手从历史快照池里
+    按「还没打过 / 打不过」加权采样，而不是固定用上一轮；当轮打完把批次胜率回流进池子，
+    池里再收录这一轮的新快照。池为空时退回链式行为（避免首轮没有对手可选）。
     """
     if rounds < 1:
         raise ValueError("rounds 必须 ≥ 1")
@@ -98,12 +103,20 @@ def run_selfplay(
             "round": index,
             "opponent": previous_snapshot or init_policy,
         })
-        if index == 0:
+        sampled = pool.sample(_pool_rng(pool)) if pool is not None else None
+        if sampled:
+            opponent = sampled
+            opponent_source = "pfsp"
+        elif index == 0:
             opponent = init_policy or snapshot_path
+            opponent_source = "init-policy" if init_policy else "self"
         else:
             opponent = previous_snapshot or snapshot_path
+            opponent_source = "previous-snapshot"
+        if pool is not None and index == 0 and init_policy:
+            pool.add(init_policy)
         log(f"[selfplay] 第 {index + 1}/{rounds} 轮：快照 {os.path.basename(snapshot_path)}，"
-            f"对手 {os.path.basename(str(opponent))}")
+            f"对手 {os.path.basename(str(opponent))}（{opponent_source}）")
         vec = None
         started = time.time()
         try:
@@ -121,8 +134,7 @@ def run_selfplay(
             "snapshot": snapshot_path,
             "snapshotSha256": _sha256(snapshot_path),
             "opponent": str(opponent),
-            "opponentSource": ("init-policy" if index == 0 and init_policy
-                               else ("previous-snapshot" if index > 0 else "self")),
+            "opponentSource": opponent_source,
             "episodes": int(episodes_per_round),
             "batches": len(history or []),
             "trainWinRate": _train_win_rate(history),
@@ -138,8 +150,56 @@ def run_selfplay(
                 f"{overall.get('wins', 0)}/{record['evalEpisodes']} 胜 "
                 f"({record['evalWinRate']:.1%}，"
                 f"CI {format_interval(overall.get('winRateCI', (0.0, 1.0)))})")
+        if pool is not None:
+            wins, losses = _win_loss(history)
+            pool.record(str(opponent), wins, losses)
+            pool.add(snapshot_path)
+            record["pfsp"] = {"wins": wins, "losses": losses,
+                              "poolSize": len(pool.paths()),
+                              "opponentWeight": _pool_weight(pool, str(opponent))}
         previous_snapshot = snapshot_path
-    return {"rounds": records}
+    result = {"rounds": records}
+    if pool is not None:
+        result["pool"] = pool.summary()
+    return result
+
+
+def _pool_rng(pool: Any) -> Any:
+    """池里只用来采样，独立随机源即可；保持可复现（按池大小派生种子）。"""
+    import numpy as np
+
+    state = getattr(pool, "_pfsp_rng", None)
+    if state is None:
+        state = np.random.default_rng(20261128 + len(pool.paths()))
+        setattr(pool, "_pfsp_rng", state)
+    return state
+
+
+def _pool_weight(pool: Any, path: str) -> Optional[float]:
+    """取某个对手当前的采样权重（只用于写报告，取不到就 None）。"""
+    summary = pool.summary() if hasattr(pool, "summary") else {}
+    for row in summary.get("opponents", []):
+        if row.get("name") == os.path.basename(path):
+            return row.get("weight")
+    return None
+
+
+def _win_loss(history: list) -> tuple:
+    """从逐批结果里数胜负。
+
+    训练侧每批回报的是汇总字段 `{"episodes": N, "wins": M, ...}`（不是逐局明细），
+    所以这里用 `episodes - wins` 补出负场；字段缺失就当 0，不抛错。
+    """
+    wins = 0
+    losses = 0
+    for batch in history or []:
+        if not isinstance(batch, dict):
+            continue
+        count = int(batch.get("episodes", 0) or 0)
+        won = int(batch.get("wins", 0) or 0)
+        wins += max(0, min(won, count))
+        losses += max(0, count - won)
+    return wins, losses
 
 
 def _train_win_rate(history: list) -> Optional[float]:
@@ -194,6 +254,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--center", default="0.5,4,0.5", help="第 0 个场地的中心 x,y,z")
     p.add_argument("--init-policy", default="", help="初始策略 npz（同时充当第 0 轮对手）")
     p.add_argument("--snapshot-dir", default="", help="快照目录（默认 artifacts/selfplay/<时间>）")
+    p.add_argument("--pfsp-pool", default="",
+                   help="PFSP 对手池目录（给出则改为按历史快照加权采样对手，默认关闭=链式自博弈）")
+    p.add_argument("--pfsp-exponent", type=float, default=2.0,
+                   help="PFSP 权重指数 w ∝ (1 - winRate)^p，越大越偏向打不过的对手（默认 2.0）")
     p.add_argument("--save-dir", default="", help="run 目录（默认 artifacts/runs/<时间>-selfplay-<tag>）")
     p.add_argument("--max-steps", type=int, default=400, help="每局最多步数")
     p.add_argument("--eval-episodes", type=int, default=4, help="每轮评估：每个对手几局")
@@ -406,6 +470,15 @@ def main(argv: list | None = None) -> int:
         return {"rows": rows, "summary": summarize(rows),
                 "config": eval_config.to_dict()}
 
+    pool = None
+    if args.pfsp_pool:
+        from gladiator_train.pfsp import OpponentPool  # noqa: PLC0415  (只有开了 PFSP 才需要)
+
+        pool = OpponentPool(args.pfsp_pool, exponent=float(args.pfsp_exponent))
+        os.makedirs(args.pfsp_pool, exist_ok=True)
+        found = pool.discover()
+        print(f"[selfplay] PFSP 对手池 {args.pfsp_pool}：已有 {len(found)} 个快照，p={args.pfsp_exponent}")
+
     started = time.time()
     result = run_selfplay(
         policy,
@@ -416,6 +489,7 @@ def main(argv: list | None = None) -> int:
         train=train,
         evaluate=evaluate,
         init_policy=args.init_policy or None,
+        pool=pool,
     )
     duration = time.time() - started
 
@@ -439,6 +513,7 @@ def main(argv: list | None = None) -> int:
         "arenas": [spec.to_dict() for spec in specs],
         "initPolicy": args.init_policy or None,
         "finalPolicy": final_path,
+        "pfspPool": result.get("pool"),
         "rounds": [
             {key: item[key] for key in
              ("round", "snapshot", "snapshotSha256", "opponent", "opponentSource",
