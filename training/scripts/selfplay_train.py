@@ -515,10 +515,10 @@ def main(argv: list | None = None) -> int:
         "finalPolicy": final_path,
         "pfspPool": result.get("pool"),
         "rounds": [
-            {key: item[key] for key in
+            {key: item.get(key) for key in
              ("round", "snapshot", "snapshotSha256", "opponent", "opponentSource",
               "episodes", "batches", "trainWinRate", "evalWinRate", "evalEpisodes",
-              "durationSeconds")}
+              "durationSeconds", "pfsp")}
             for item in records
         ],
         "config": {

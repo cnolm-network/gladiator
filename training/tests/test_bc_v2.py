@@ -504,6 +504,31 @@ class TrainCliV2Test(unittest.TestCase):
                              "--bc-teacher", "v2")
         self.assertEqual(code, 2)
 
+    def test_v2_dagger_with_v4_runs_end_to_end(self) -> None:
+        """G-745：v2 + DAgger + teacher v4 必须能跑（不是 exit 2）。
+
+        v2 的十头标签只有 v4 能给，所以门禁对「非 v4」拒绝、对 v4 放行；
+        DAgger 与 BC 共用同一条门禁，这里钉住「放行」那一半——否则研究轨根本起不来。
+        """
+        with tempfile.TemporaryDirectory() as folder:
+            code = self._run(Path(folder), "--action-space", "v2", "--bc-teacher", "v4",
+                             "--bc-episodes", "1", "--bc-epochs", "1",
+                             "--dagger-rounds", "1", "--dagger-episodes", "1",
+                             "--dagger-epochs", "1", "--dagger-max-steps", "3",
+                             "--episodes", "0", "--eval-epochs", "0")
+            self.assertEqual(code, 0, "v2 + DAgger + v4 应被放行")
+            report = json.loads((self.run_dir / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["config"]["actionSpace"], "v2")
+            self.assertEqual(report["config"]["daggerRounds"], 1)
+            self.assertEqual(report["config"]["daggerEpisodes"], 1)
+            rounds = report["dagger"]
+            # 第 0 轮是 BC 基线，第 1 轮才是真正的 DAgger 采样。
+            self.assertEqual(len(rounds), 2)
+            self.assertEqual(rounds[0]["round"], 0)
+            self.assertGreater(rounds[1]["samples"], 0, "DAgger 轮必须采到样本")
+            self.assertEqual(len(rounds[1]["perHeadAccuracy"]), N_HEADS,
+                             "DAgger 轮也要记十头明细")
+
     def test_v2_bc_with_v4_runs_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             code = self._run(Path(folder), "--action-space", "v2", "--bc-teacher", "v4",
